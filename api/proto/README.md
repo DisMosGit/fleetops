@@ -36,15 +36,18 @@ contracts are the source of truth, and regeneration restores canonical output ov
 The workflow (from the repository root):
 
 ```sh
-make proto-tools   # install the pinned protoc-gen-go and protoc-gen-go-grpc into GOPATH/bin
+make proto-tools   # install the pinned protoc-gen-go, protoc-gen-go-grpc, and goimports
 make proto         # regenerate every client and server stub under api/proto/
 ```
 
 `make proto-tools` installs exactly the generator versions pinned in the Makefile's tool block, so
-the same contract files produce byte-identical output on every machine. Both targets fail with a
-message naming the missing tool when `protoc` or a plugin is unavailable. `protoc` itself is a
-prerequisite (install it from the protobuf releases, with its `include/` tree); the Go plugins are
-installed by the pinned `proto-tools` target.
+the same contract files produce byte-identical output on every machine. `make proto` finishes by
+formatting its output with the pinned `goimports` — protoc's raw import blocks are not goimports
+shape, and without this pass the generation and the Definition of Done's `goimports -w .` would
+rewrite each other's output forever. Both targets fail with a message naming the missing tool when
+`protoc` or a plugin is unavailable. `protoc` itself is a prerequisite (install it from the
+protobuf releases, with its `include/` tree); the Go plugins are installed by the pinned
+`proto-tools` target.
 
 After regenerating, run `make proto` a second time and expect no diff — a dirty tree means
 generator version skew or a hand edit.

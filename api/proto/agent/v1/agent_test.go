@@ -172,7 +172,7 @@ func TestMessageRoundTrip(t *testing.T) {
 		},
 		{
 			name: "report response",
-			msg: &agentv1.ReportResponse{Accepted: true},
+			msg:  &agentv1.ReportResponse{Accepted: true},
 		},
 	}
 
