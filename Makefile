@@ -11,7 +11,12 @@ export PATH := $(shell go env GOPATH)/bin:$(PATH)
 GO ?= go
 PROTO_FILES := $(shell find api/proto -name '*.proto' -print)
 
-.PHONY: help build vet lint test check proto up down
+# Generator toolchain pins: the exact protoc plugin versions `make proto` compiles with, so the
+# same contracts produce byte-identical stubs on every machine. Bump a pin here and nowhere else.
+PROTOC_GEN_GO_VERSION := v1.36.12
+PROTOC_GEN_GO_GRPC_VERSION := v1.6.2
+
+.PHONY: help build vet lint test check proto proto-tools up down
 
 help: ## Show this help: every target with its documented command
 	@grep -E '^[a-zA-Z0-9_-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "}; {printf "  %-8s %s\n", $$1, $$2}'
@@ -35,10 +40,16 @@ check: ## Definition of Done: goimports -w . && go vet ./... && golangci-lint ru
 	golangci-lint run
 	$(GO) test -race -count=1 ./...
 
-proto: ## Regenerate Go from api/proto: protoc --go_out=... --go-grpc_out=... api/proto/*.proto
-	@command -v protoc >/dev/null || { echo "make proto: protoc not found (install protoc and the Go protoc plugins)" >&2; exit 1; }
-	@[ -n "$(PROTO_FILES)" ] || { echo "make proto: no .proto contracts under api/proto yet (delivered at stage 1)" >&2; exit 1; }
+proto: ## Regenerate Go client and server stubs from api/proto: protoc --go_out=... --go-grpc_out=... api/proto/**/*.proto
+	@command -v protoc >/dev/null || { echo "make proto: protoc not found (install protoc and its include/ tree)" >&2; exit 1; }
+	@command -v protoc-gen-go >/dev/null || { echo "make proto: protoc-gen-go not found (run 'make proto-tools')" >&2; exit 1; }
+	@command -v protoc-gen-go-grpc >/dev/null || { echo "make proto: protoc-gen-go-grpc not found (run 'make proto-tools')" >&2; exit 1; }
+	@[ -n "$(PROTO_FILES)" ] || { echo "make proto: no .proto contracts under api/proto" >&2; exit 1; }
 	protoc -I api/proto --go_out=paths=source_relative:api/proto --go-grpc_out=paths=source_relative:api/proto $(PROTO_FILES)
+
+proto-tools: ## Install pinned protoc-gen-go@$(PROTOC_GEN_GO_VERSION) + protoc-gen-go-grpc@$(PROTOC_GEN_GO_GRPC_VERSION) via go install
+	$(GO) install google.golang.org/protobuf/cmd/protoc-gen-go@$(PROTOC_GEN_GO_VERSION)
+	$(GO) install google.golang.org/grpc/cmd/protoc-gen-go-grpc@$(PROTOC_GEN_GO_GRPC_VERSION)
 
 up: ## Bring up the local stack: kubectl apply -f deploy/
 	@command -v kubectl >/dev/null || { echo "make up: kubectl not found (install the k3d/kubectl toolchain)" >&2; exit 1; }
