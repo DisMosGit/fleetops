@@ -112,6 +112,10 @@ the same `make proto` entry point.
 `go build` and `go test` never require `protoc`. Regeneration is idempotent (same contracts +
 pinned plugins ⇒ byte-identical output), which makes "run `make proto`, expect no diff" a review
 check. Hand edits are overwritten by the next regeneration and forbidden by the engineering rules.
+The pipeline ends with the pinned `goimports` normalizing the generated output (user decision at
+implementation time): protoc's raw import blocks are not goimports shape, so without this pass
+`make proto` and the Definition of Done's `goimports -w .` would rewrite each other's output and
+the tree could never be clean under both.
 
 ### D9: Dependencies justified one line each
 `google.golang.org/protobuf` (runtime for generated messages) and `google.golang.org/grpc` (client
