@@ -61,16 +61,18 @@ production (out of scope — this is a local demo).
 
 ## Repository map
 
-Planned layout — paths appear as their delivery stage lands (see status below):
+The directory skeleton exists now (with honest placeholders); each directory's working content
+lands with its delivery stage (see status below):
 
 ```
-cmd/<binary>/      thin entrypoints: control plane, workers, agent emulator
-internal/agent/    device-agent emulator: heartbeat, stream client, firmware apply
-internal/temporal/ DeviceWorkflow, RolloutWorkflow, FirmwareWorkflow + activities
+cmd/<binary>/       thin entrypoints: control plane, workers, agent emulator
+internal/agent/     device-agent emulator: heartbeat, stream client, firmware apply
+internal/temporal/  DeviceWorkflow, RolloutWorkflow, FirmwareWorkflow + activities
 internal/telemetry/ RabbitMQ publisher/consumers, idempotent ingestion, DLQ
-api/proto/         Protobuf contracts + generated Go
-deploy/            k3d/compose manifests
-web/               React + Vite frontend
+api/proto/          Protobuf contracts + generated Go
+deploy/             k3d/compose manifests + MongoDB data-model bootstrap
+dashboards/         Grafana dashboards
+web/                React + Vite frontend (git submodule placeholder)
 ```
 
 Engineering rules for this layout live in [AGENTS.md](AGENTS.md).
