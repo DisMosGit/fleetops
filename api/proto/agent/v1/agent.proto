@@ -1,0 +1,254 @@
+// FleetOps agent <-> control-plane wire contract, v1.
+//
+// One long-lived AgentService.Connect stream per agent carries heartbeats and requests
+// inbound and commands and responses outbound; AgentService.Report delivers the terminal
+// result of one command over a unary call that accepts an idempotency key.
+//
+// v1 freezes when it lands: evolve by adding fields, messages, and RPCs only. Never
+// renumber, reuse, or rewrite an existing field.
+syntax = "proto3";
+
+package fleetops.agent.v1;
+
+option go_package = "github.com/DisMosGit/fleetops/api/proto/agent/v1;agentv1";
+
+import "google/protobuf/timestamp.proto";
+
+// AgentService is the control-plane surface every device agent speaks: one bidirectional
+// stream for the live conversation (heartbeats up, commands down) and one unary call for
+// command results that must survive stream loss.
+service AgentService {
+  // Connect is one long-lived bidirectional stream per agent. AgentEnvelope carries
+  // registration, heartbeats, and the agent-initiated request/response exchanges;
+  // ControlEnvelope carries their responses and the commands. Both directions are
+  // correlated instead of ordered: responses echo the correlation id of their request so
+  // concurrent exchanges on one stream cannot be mismatched after a reconnect.
+  rpc Connect(stream AgentEnvelope) returns (stream ControlEnvelope);
+
+  // Report delivers the terminal result of one command. It carries an idempotency key in
+  // addition to the command id because a retried report must never re-trigger the
+  // command's effects: a key already seen is accepted again with no second effect, and a
+  // report without a key is rejected as INVALID_ARGUMENT.
+  rpc Report(ReportRequest) returns (ReportResponse);
+}
+
+// AgentEnvelope is one message from agent to control plane on the Connect stream. The
+// correlation id is set on requests that expect a response and left empty on fire-and-forget
+// messages such as heartbeats.
+message AgentEnvelope {
+  // Correlation id echoed by the response to this request; empty for heartbeats.
+  string correlation_id = 1;
+
+  // The carried message; exactly one payload per envelope.
+  oneof payload {
+    // Registration of a device behind this agent; expects a RegisterDeviceResponse.
+    RegisterDeviceRequest register_device = 2;
+    // Fire-and-forget device heartbeat; no response is sent.
+    Heartbeat heartbeat = 3;
+    // Firmware binary pull; expects chunked FirmwareDownloadResponse messages.
+    FirmwareDownloadRequest firmware_download = 4;
+    // Firmware update progress report; expects an UpdateStatusResponse.
+    UpdateStatusRequest update_status = 5;
+  }
+}
+
+// ControlEnvelope is one message from control plane to agent on the Connect stream. It
+// carries either the response to an agent request (under the request's correlation id) or a
+// command (under its own command id).
+message ControlEnvelope {
+  // Correlation id of the request being answered; empty for commands.
+  string correlation_id = 1;
+
+  // The carried message; exactly one payload per envelope.
+  oneof payload {
+    // Acceptance decision for a registration.
+    RegisterDeviceResponse register_device = 2;
+    // One chunk (or the end marker) of a firmware transfer.
+    FirmwareDownloadResponse firmware_download = 3;
+    // Acknowledgment of an update status report.
+    UpdateStatusResponse update_status = 4;
+    // A command for a device behind this agent.
+    Command command = 5;
+  }
+}
+
+// RegisterDeviceRequest enrols a device on the stream before commands may target it. Its
+// identity fields mirror the device record so ingestion is a mapping, not a translation.
+message RegisterDeviceRequest {
+  // Stable device identity; the key of the device record.
+  string device_id = 1;
+  // Device model, part of the rollout target group.
+  string model = 2;
+  // Device region, part of the rollout target group.
+  string region = 3;
+  // Firmware version the device currently runs (current_fw).
+  string current_fw = 4;
+}
+
+// RegisterDeviceResponse answers a registration with the control plane's decision. A
+// rejection never creates a device record; reason is operator-safe detail only.
+message RegisterDeviceResponse {
+  // Whether the device was accepted into the fleet.
+  bool accepted = 1;
+  // Identity echoed so the agent can match the answer to its request.
+  string device_id = 2;
+  // Resulting device status after the decision.
+  string status = 3;
+  // Operator-safe reason set when accepted is false.
+  string reason = 4;
+}
+
+// Heartbeat is one liveness and health sample from a device. Its fields are exactly one
+// telemetry event plus the device-state fields, and event_id makes redelivery after a
+// reconnect idempotent for ingestion.
+message Heartbeat {
+  // Unique id of this heartbeat event; a redelivery reuses the same id.
+  string event_id = 1;
+  // Device the sample belongs to.
+  string device_id = 2;
+  // Firmware version the device currently runs (current_fw).
+  string current_fw = 3;
+  // Reported device status.
+  string status = 4;
+  // Sample time, keyed as ts in telemetry storage.
+  google.protobuf.Timestamp ts = 5;
+  // CPU utilisation sample.
+  double cpu = 6;
+  // Memory utilisation sample.
+  double mem = 7;
+  // Health score sample driving wave gates.
+  double health = 8;
+}
+
+// FirmwareDownloadRequest pulls a firmware binary by id. The agent issues it after a
+// StartUpdate command and assembles the chunks returned on the same correlation id.
+message FirmwareDownloadRequest {
+  // Device that will apply the firmware.
+  string device_id = 1;
+  // Firmware identity to fetch.
+  string firmware_id = 2;
+}
+
+// FirmwareDownloadResponse carries one bounded chunk of a firmware binary. Metadata and the
+// checksum are present independently of the chunk stream so the agent can verify what it
+// assembles; transfer ends when eof is true.
+message FirmwareDownloadResponse {
+  // Firmware identity being transferred.
+  string firmware_id = 1;
+  // Firmware version being transferred.
+  string version = 2;
+  // Checksum of the complete binary, for the agent to verify the assembly.
+  string checksum = 3;
+  // One bounded-size piece of the binary; empty on a metadata-only or eof message.
+  bytes chunk = 4;
+  // Byte offset of this chunk within the complete binary.
+  int64 offset = 5;
+  // End-of-transfer marker: true on the final message of the download.
+  bool eof = 6;
+}
+
+// UpdateStatusRequest reports firmware-update progress for one device. Fine-grained and
+// frequent, it travels on the stream; the terminal command result goes through Report.
+message UpdateStatusRequest {
+  // Device whose update is progressing.
+  string device_id = 1;
+  // Firmware being applied.
+  string firmware_id = 2;
+  // Phase the device has reached.
+  UpdatePhase phase = 3;
+  // Completion of the current update, 0-100.
+  int32 progress_percent = 4;
+  // Operator-safe failure detail; set when phase is UPDATE_PHASE_FAILED.
+  string detail = 5;
+}
+
+// UpdateStatusResponse acknowledges an update status report on its correlation id.
+message UpdateStatusResponse {
+  // Whether the report was accepted for recording.
+  bool accepted = 1;
+}
+
+// UpdatePhase names where a device is in the firmware update lifecycle, including the two
+// terminal failure paths the rollout saga acts on.
+enum UpdatePhase {
+  // Unset; rejected by the control plane as an invalid phase.
+  UPDATE_PHASE_UNSPECIFIED = 0;
+  // Firmware binary is being downloaded and verified.
+  UPDATE_PHASE_DOWNLOADING = 1;
+  // Firmware is being applied to the device.
+  UPDATE_PHASE_APPLYING = 2;
+  // Device is rebooting into the new firmware.
+  UPDATE_PHASE_REBOOTING = 3;
+  // Update finished and the device runs the new firmware.
+  UPDATE_PHASE_COMPLETED = 4;
+  // Update failed; detail on the request names why.
+  UPDATE_PHASE_FAILED = 5;
+  // Device was rolled back to its previous firmware.
+  UPDATE_PHASE_ROLLED_BACK = 6;
+}
+
+// Command is one imperative from the control plane to a device, delivered on the stream.
+// The device answers with its terminal result through Report, referencing command_id.
+message Command {
+  // Unique id of this command; referenced by the Report that concludes it.
+  string command_id = 1;
+  // Device the command targets; one agent may front several devices.
+  string device_id = 2;
+
+  // The commanded action; exactly one per command.
+  oneof kind {
+    // Begin the download-and-apply cycle for a firmware version.
+    StartUpdate start_update = 3;
+    // Stop a running update.
+    AbortUpdate abort_update = 4;
+  }
+}
+
+// StartUpdate commands a device to download (per FirmwareDownloadRequest) and apply the
+// named firmware. A rollback downgrade is the same command for the older version.
+message StartUpdate {
+  // Firmware identity to download and apply.
+  string firmware_id = 1;
+  // Firmware version expected after the update.
+  string version = 2;
+  // Checksum the downloaded binary must match before applying.
+  string checksum = 3;
+}
+
+// AbortUpdate commands a device to stop a running update at a safe point.
+message AbortUpdate {
+  // Operator-safe reason for the abort.
+  string reason = 1;
+}
+
+// ReportRequest carries the terminal result of one command. The idempotency key makes
+// redelivery of the same result a no-op rather than a second effect.
+message ReportRequest {
+  // Idempotency key; identical for every redelivery of this result. Required.
+  string idempotency_key = 1;
+  // Command being concluded.
+  string command_id = 2;
+  // Device that executed the command.
+  string device_id = 3;
+  // Terminal outcome of the command.
+  CommandOutcome outcome = 4;
+  // Operator-safe failure detail; set when outcome is COMMAND_OUTCOME_FAILED.
+  string detail = 5;
+}
+
+// ReportResponse states whether the command result was accepted. A report repeating a seen
+// idempotency key is accepted too, but produces no second effect.
+message ReportResponse {
+  // Whether the result was accepted for processing.
+  bool accepted = 1;
+}
+
+// CommandOutcome names the terminal state of one command, as reported through Report.
+enum CommandOutcome {
+  // Unset; rejected by the control plane as an invalid outcome.
+  COMMAND_OUTCOME_UNSPECIFIED = 0;
+  // Command completed; the device reached the commanded state.
+  COMMAND_OUTCOME_SUCCEEDED = 1;
+  // Command did not complete; detail on the request names why.
+  COMMAND_OUTCOME_FAILED = 2;
+}
