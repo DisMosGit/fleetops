@@ -7,6 +7,10 @@
 simulation:
   # Simulated devices one agent emulator process runs.
   fleet_size: 100
+  # Simulated duration of one firmware application (Go duration string).
+  apply_delay: "1s"
+  # Probability a simulated firmware application succeeds, in [0, 1].
+  apply_success_rate: 1.0
 
 grpc:
   # Control plane AgentService listen address.

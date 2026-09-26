@@ -51,6 +51,16 @@ func TestLoad(t *testing.T) {
 			},
 		},
 		{
+			name: "apply stub knobs override defaults",
+			file: "simulation:\n" +
+				"  apply_delay: 250ms\n" +
+				"  apply_success_rate: 0.25\n",
+			mutate: func(c *Config) {
+				c.Simulation.ApplyDelay = Duration{Duration: 250 * time.Millisecond}
+				c.Simulation.ApplySuccessRate = 0.25
+			},
+		},
+		{
 			name: "partial file keeps other defaults",
 			file: "temporal:\n  namespace: fleetops-dev\n",
 			mutate: func(c *Config) {

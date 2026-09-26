@@ -43,6 +43,10 @@ type Config struct {
 type Simulation struct {
 	// FleetSize is the number of simulated devices one agent emulator process runs.
 	FleetSize int `yaml:"fleet_size"`
+	// ApplyDelay is the simulated duration of one firmware application.
+	ApplyDelay Duration `yaml:"apply_delay"`
+	// ApplySuccessRate is the probability a simulated firmware application succeeds, in [0, 1].
+	ApplySuccessRate float64 `yaml:"apply_success_rate"`
 }
 
 // GRPC configures the agent-facing gRPC transport.
@@ -113,9 +117,13 @@ type Observability struct {
 // values documented in deploy/config.yaml.
 func Defaults() Config {
 	return Config{
-		Simulation: Simulation{FleetSize: 100},
-		GRPC:       GRPC{ListenAddr: ":9090", ControlPlaneAddr: "localhost:9090"},
-		MongoDB:    MongoDB{URI: "mongodb://localhost:27017", Database: "fleetops"},
+		Simulation: Simulation{
+			FleetSize:        100,
+			ApplyDelay:       Duration{Duration: time.Second},
+			ApplySuccessRate: 1.0,
+		},
+		GRPC:    GRPC{ListenAddr: ":9090", ControlPlaneAddr: "localhost:9090"},
+		MongoDB: MongoDB{URI: "mongodb://localhost:27017", Database: "fleetops"},
 		Liveness: Liveness{
 			OfflineThreshold: Duration{Duration: 30 * time.Second},
 			SweepInterval:    Duration{Duration: 10 * time.Second},

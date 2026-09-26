@@ -22,6 +22,11 @@ func (c Config) Validate() error {
 	if c.Simulation.FleetSize <= 0 {
 		add("simulation.fleet_size", fmt.Sprintf("must be positive, got %d", c.Simulation.FleetSize))
 	}
+	validateDuration(add, "simulation.apply_delay", c.Simulation.ApplyDelay)
+	if !(c.Simulation.ApplySuccessRate >= 0 && c.Simulation.ApplySuccessRate <= 1) {
+		// The closed-range check rejects NaN along with every out-of-range rate.
+		add("simulation.apply_success_rate", "must be in [0, 1]")
+	}
 	validateHostPort(add, "grpc.listen_addr", c.GRPC.ListenAddr)
 	validateHostPort(add, "grpc.control_plane_addr", c.GRPC.ControlPlaneAddr)
 	validateScheme(add, "mongodb.uri", c.MongoDB.URI, "mongodb", "mongodb+srv")

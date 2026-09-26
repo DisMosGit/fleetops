@@ -24,6 +24,18 @@ func TestValidate(t *testing.T) {
 		{name: "negative fleet size", mutate: func(c *Config) {
 			c.Simulation.FleetSize = -1
 		}, wantErrs: []string{"simulation.fleet_size"}},
+		{name: "zero apply delay", mutate: func(c *Config) {
+			c.Simulation.ApplyDelay = Duration{}
+		}, wantErrs: []string{"simulation.apply_delay"}},
+		{name: "unparseable apply delay", mutate: func(c *Config) {
+			c.Simulation.ApplyDelay = Duration{invalid: true}
+		}, wantErrs: []string{"simulation.apply_delay"}},
+		{name: "apply success rate above one", mutate: func(c *Config) {
+			c.Simulation.ApplySuccessRate = 1.5
+		}, wantErrs: []string{"simulation.apply_success_rate"}},
+		{name: "negative apply success rate", mutate: func(c *Config) {
+			c.Simulation.ApplySuccessRate = -0.1
+		}, wantErrs: []string{"simulation.apply_success_rate"}},
 		{name: "listen addr without port", mutate: func(c *Config) {
 			c.GRPC.ListenAddr = "localhost"
 		}, wantErrs: []string{"grpc.listen_addr"}},
