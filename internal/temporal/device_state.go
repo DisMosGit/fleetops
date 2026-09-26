@@ -10,8 +10,9 @@ import (
 
 // carryVersion is the schema version stamped on every carried-over state. A run refuses a
 // state it cannot understand instead of guessing at a foreign shape. Version 2 added the
-// identity attributes, the liveness status, and the settings to the carried state.
-const carryVersion = 2
+// identity attributes, the liveness status, and the settings to the carried state; version 3
+// added the update status.
+const carryVersion = 3
 
 // Bounds of the dedup memory carried across continuations. The rings are the fast path of
 // signal idempotency; the structural guards in the apply methods are the backstop.
@@ -45,6 +46,33 @@ const (
 	// OutcomeFailed means the command did not complete.
 	OutcomeFailed CommandOutcome = "failed"
 )
+
+// UpdatePhase names where a device is in the firmware update lifecycle.
+type UpdatePhase string
+
+// The update phases an update status signal reports.
+const (
+	// PhaseDownloading is the phase where the firmware binary is downloaded and verified.
+	PhaseDownloading UpdatePhase = "downloading"
+	// PhaseApplying is the phase where the firmware is applied to the device.
+	PhaseApplying UpdatePhase = "applying"
+	// PhaseRebooting is the phase where the device reboots into the new firmware.
+	PhaseRebooting UpdatePhase = "rebooting"
+	// PhaseCompleted is the terminal phase: the update finished and the device runs the new
+	// firmware.
+	PhaseCompleted UpdatePhase = "completed"
+	// PhaseFailed is the terminal failure phase; detail names why.
+	PhaseFailed UpdatePhase = "failed"
+	// PhaseRolledBack is the terminal phase: the device was rolled back to its previous
+	// firmware.
+	PhaseRolledBack UpdatePhase = "rolled_back"
+)
+
+// terminal reports whether the phase ends the update lifecycle — the phases worth persisting
+// immediately instead of riding the periodic snapshot.
+func (p UpdatePhase) terminal() bool {
+	return p == PhaseCompleted || p == PhaseFailed || p == PhaseRolledBack
+}
 
 // HeartbeatSignal is the heartbeat signal payload: one liveness sample keyed by the event id
 // that redeliveries reuse. Timestamp is the device's sample time — identical on every
@@ -110,6 +138,34 @@ type ConfigChangedSignal struct {
 	Snapshot json.RawMessage `json:"snapshot,omitempty"`
 }
 
+// UpdateStatusSignal is the update_status signal payload: one firmware-update progress report
+// for a device. Progress reports carry no delivery key: they apply in arrival order, the
+// latest wins, and none of them concludes a command — that stays with the command result.
+type UpdateStatusSignal struct {
+	// DeviceID is the device whose update is progressing.
+	DeviceID string `json:"device_id"`
+	// FirmwareID is the firmware being applied.
+	FirmwareID string `json:"firmware_id"`
+	// Phase is the phase the device reported reaching.
+	Phase UpdatePhase `json:"phase"`
+	// ProgressPercent is the completion of the current update, 0-100.
+	ProgressPercent int32 `json:"progress_percent"`
+	// Detail is operator-safe failure detail; set on PhaseFailed.
+	Detail string `json:"detail,omitempty"`
+}
+
+// UpdateStatus is the latest firmware-update progress a device reported.
+type UpdateStatus struct {
+	// FirmwareID is the firmware being applied.
+	FirmwareID string `json:"firmware_id"`
+	// Phase is the phase the device reported reaching.
+	Phase UpdatePhase `json:"phase"`
+	// ProgressPercent is the completion of the current update, 0-100.
+	ProgressPercent int32 `json:"progress_percent"`
+	// Detail is operator-safe failure detail; set on PhaseFailed.
+	Detail string `json:"detail,omitempty"`
+}
+
 // PendingCommand is a command the workflow has accepted and not yet concluded, with its
 // delivery state.
 type PendingCommand struct {
@@ -155,6 +211,9 @@ type State struct {
 	LastHeartbeatAt time.Time `json:"last_heartbeat_at"`
 	// Pending is the outstanding command, or nil when none is outstanding.
 	Pending *PendingCommand `json:"pending,omitempty"`
+	// Update is the latest firmware-update progress the device reported, or nil when none
+	// was reported.
+	Update *UpdateStatus `json:"update_status,omitempty"`
 	// Config is the configuration snapshot and its version.
 	Config ConfigSnapshot `json:"config"`
 }
@@ -181,6 +240,9 @@ type deviceState struct {
 	LastHeartbeatAt time.Time `json:"last_heartbeat_at"`
 	// Pending is the outstanding command, or nil when none is outstanding.
 	Pending *PendingCommand `json:"pending,omitempty"`
+	// Update is the latest firmware-update progress the device reported, or nil when none
+	// was reported.
+	Update *UpdateStatus `json:"update_status,omitempty"`
 	// Config is the configuration snapshot and its version.
 	Config ConfigSnapshot `json:"config"`
 	// Settings are the configured knobs the entity's decisions depend on.
@@ -229,9 +291,10 @@ func newDeviceState(deviceID string, settings DeviceSettings) deviceState {
 }
 
 // transitions reports which meaningful changes one applied signal performed: identity or
-// firmware adoption, a pending-command lifecycle change (set, superseded, or concluded), or a
-// configuration apply. It is the workflow's scheduling input: needsSnapshot names the changes
-// worth persisting immediately, and the fields document what the state machine actually did.
+// firmware adoption, a pending-command lifecycle change (set, superseded, or concluded), an
+// update status reaching a terminal phase, or a configuration apply. It is the workflow's
+// scheduling input: needsSnapshot names the changes worth persisting immediately, and the
+// fields document what the state machine actually did.
 type transitions struct {
 	// Identity is set when the region or model was adopted.
 	Identity bool
@@ -239,13 +302,18 @@ type transitions struct {
 	Firmware bool
 	// Pending is set when the pending command was set, superseded, or concluded.
 	Pending bool
+	// Update is set when an update status reached a terminal phase — the change worth
+	// persisting immediately. Intermediate progress rides the periodic snapshot.
+	Update bool
 	// Config is set when a configuration snapshot was applied.
 	Config bool
 }
 
 // needsSnapshot reports whether the change is one the workflow persists immediately instead of
 // waiting for the periodic snapshot.
-func (t transitions) needsSnapshot() bool { return t.Firmware || t.Pending || t.Config }
+func (t transitions) needsSnapshot() bool {
+	return t.Firmware || t.Pending || t.Update || t.Config
+}
 
 // validate checks the carried-over state a run was started from. A state from a newer schema
 // fails loudly instead of being half-understood, and so does a state whose settings no
@@ -282,6 +350,10 @@ func (s deviceState) view() State {
 	if s.Pending != nil {
 		pending := *s.Pending
 		out.Pending = &pending
+	}
+	if s.Update != nil {
+		update := *s.Update
+		out.Update = &update
 	}
 	return out
 }
@@ -373,4 +445,20 @@ func (s *deviceState) applyConfigChanged(c ConfigChangedSignal) transitions {
 	}
 	s.Config = ConfigSnapshot{Version: c.Version, Data: c.Snapshot}
 	return transitions{Config: true}
+}
+
+// applyUpdateStatus folds one update_status signal into the state: the latest reported
+// progress replaces the recorded one, so reports apply in arrival order and the newest one
+// wins. An update status concludes nothing — the pending command stays pending until its
+// command result arrives. Intermediate progress rides the periodic snapshot; only a terminal
+// phase is a meaningful transition worth persisting immediately.
+func (s *deviceState) applyUpdateStatus(u UpdateStatusSignal) transitions {
+	s.SignalsApplied++
+	s.Update = &UpdateStatus{
+		FirmwareID:      u.FirmwareID,
+		Phase:           u.Phase,
+		ProgressPercent: u.ProgressPercent,
+		Detail:          u.Detail,
+	}
+	return transitions{Update: u.Phase.terminal()}
 }

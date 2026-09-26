@@ -486,7 +486,8 @@ func TestDeviceWorkflowRollingContinuation(t *testing.T) {
 // without processing any of them, then drains them into one state and returns it — the exact
 // handoff the rolling continuation performs before it continues as new.
 func bufferedSignalsWorkflow(ctx workflow.Context) (deviceState, error) {
-	heartbeat, issued, result, config := workflow.NewBufferedChannel(ctx, 8),
+	heartbeat, issued, result, config, update := workflow.NewBufferedChannel(ctx, 8),
+		workflow.NewBufferedChannel(ctx, 8),
 		workflow.NewBufferedChannel(ctx, 8),
 		workflow.NewBufferedChannel(ctx, 8),
 		workflow.NewBufferedChannel(ctx, 8)
@@ -506,7 +507,11 @@ func bufferedSignalsWorkflow(ctx workflow.Context) (deviceState, error) {
 	config.Send(ctx, ConfigChangedSignal{
 		DeviceID: "dev-1", Version: 7, Snapshot: json.RawMessage(`{"a":1}`),
 	})
-	chans := signalChannels{heartbeat: heartbeat, issued: issued, result: result, config: config}
+	update.Send(ctx, UpdateStatusSignal{
+		DeviceID: "dev-1", FirmwareID: "fw-3",
+		Phase: PhaseFailed, ProgressPercent: 20, Detail: "checksum mismatch",
+	})
+	chans := signalChannels{heartbeat: heartbeat, issued: issued, result: result, config: config, update: update}
 	state := newDeviceState("dev-1", testSettings())
 	chans.drainAll(&state)
 	return state, nil
@@ -535,6 +540,9 @@ func TestDrainAllAppliesBufferedSignals(t *testing.T) {
 			CommandID: "cmd-1", DeviceID: "dev-1", Kind: CommandKindUpdate,
 			FirmwareID: "fw-3", Version: "fw-3",
 		}},
+		Update: &UpdateStatus{
+			FirmwareID: "fw-3", Phase: PhaseFailed, ProgressPercent: 20, Detail: "checksum mismatch",
+		},
 		Config: ConfigSnapshot{Version: 7, Data: json.RawMessage(`{"a":1}`)},
 	}
 	if diff := cmp.Diff(want, got.view()); diff != "" {

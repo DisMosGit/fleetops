@@ -28,6 +28,8 @@ const (
 	CommandResultSignalName = "command_result"
 	// ConfigChangedSignalName carries a ConfigChangedSignal.
 	ConfigChangedSignalName = "config_changed"
+	// UpdateStatusSignalName carries an UpdateStatusSignal.
+	UpdateStatusSignalName = "update_status"
 )
 
 // maxSignalsPerRun bounds one run's event history. Every delivered signal adds history
@@ -43,14 +45,14 @@ func DeviceWorkflowID(deviceID string) string {
 }
 
 // DeviceWorkflow is the long-lived per-device entity: it owns the device's authoritative
-// state (current firmware, last heartbeat, pending command, configuration snapshot) and
-// folds in signals — heartbeat, command_issued, command_result, config_changed — exactly
-// once per delivery key. It keeps the outside world in step with that state: search
-// attributes mirror it for the Temporal UI, and a snapshot activity projects it into the
-// fleet database periodically and on every meaningful transition. The state is the
-// workflow's only mutable data and travels whole across rolling continuations, so the
-// entity outlives any run while its history stays bounded. The state argument is the empty
-// state of a new device on first start and the carried-over state on every continuation.
+// state (current firmware, last heartbeat, pending command, update status, configuration
+// snapshot) and folds in signals — heartbeat, command_issued, command_result, config_changed,
+// and update_status — exactly once per delivery key. It keeps the outside world in step with
+// that state: search attributes mirror it for the Temporal UI, and a snapshot activity
+// projects it into the fleet database periodically and on every meaningful transition. The
+// state is the workflow's only mutable data and travels whole across rolling continuations,
+// so the entity outlives any run while its history stays bounded. The state argument is the
+// empty state of a new device on first start and the carried-over state on every continuation.
 func DeviceWorkflow(ctx workflow.Context, state deviceState) error {
 	if err := state.validate(); err != nil {
 		return err
@@ -66,6 +68,7 @@ func DeviceWorkflow(ctx workflow.Context, state deviceState) error {
 		issued:    workflow.GetSignalChannel(ctx, CommandIssuedSignalName),
 		result:    workflow.GetSignalChannel(ctx, CommandResultSignalName),
 		config:    workflow.GetSignalChannel(ctx, ConfigChangedSignalName),
+		update:    workflow.GetSignalChannel(ctx, UpdateStatusSignalName),
 	}
 	dispatchCtx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
 		StartToCloseTimeout: 10 * time.Second,
@@ -176,6 +179,11 @@ func DeviceWorkflow(ctx workflow.Context, state deviceState) error {
 			c.Receive(ctx, &change)
 			applied = state.applyConfigChanged(change)
 		})
+		sel.AddReceive(signals.update, func(c workflow.ReceiveChannel, _ bool) {
+			var u UpdateStatusSignal
+			c.Receive(ctx, &u)
+			applied = state.applyUpdateStatus(u)
+		})
 		if dispatch != nil {
 			sel.AddFuture(dispatch, func(f workflow.Future) {
 				if err := f.Get(ctx, nil); err != nil {
@@ -219,9 +227,9 @@ func DeviceWorkflow(ctx workflow.Context, state deviceState) error {
 	}
 }
 
-// signalChannels are the four signal channels of one device workflow run.
+// signalChannels are the five signal channels of one device workflow run.
 type signalChannels struct {
-	heartbeat, issued, result, config workflow.ReceiveChannel
+	heartbeat, issued, result, config, update workflow.ReceiveChannel
 }
 
 // drainAll folds every buffered signal into state and returns once the channels are empty. A
@@ -261,6 +269,14 @@ func (ch signalChannels) drainAll(state *deviceState) {
 				break
 			}
 			state.applyConfigChanged(change)
+			drained = true
+		}
+		for {
+			var u UpdateStatusSignal
+			if !ch.update.ReceiveAsync(&u) {
+				break
+			}
+			state.applyUpdateStatus(u)
 			drained = true
 		}
 		if !drained {

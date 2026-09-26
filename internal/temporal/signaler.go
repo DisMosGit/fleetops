@@ -78,6 +78,36 @@ func (s *Signaler) SignalCommandResult(ctx context.Context, res *agentv1.ReportR
 	})
 }
 
+// SignalUpdateStatus delivers one firmware-update progress report to its device's workflow.
+// It implements the agentserver.DeviceSignaler seam.
+func (s *Signaler) SignalUpdateStatus(ctx context.Context, req *agentv1.UpdateStatusRequest) error {
+	var phase UpdatePhase
+	switch req.GetPhase() {
+	case agentv1.UpdatePhase_UPDATE_PHASE_DOWNLOADING:
+		phase = PhaseDownloading
+	case agentv1.UpdatePhase_UPDATE_PHASE_APPLYING:
+		phase = PhaseApplying
+	case agentv1.UpdatePhase_UPDATE_PHASE_REBOOTING:
+		phase = PhaseRebooting
+	case agentv1.UpdatePhase_UPDATE_PHASE_COMPLETED:
+		phase = PhaseCompleted
+	case agentv1.UpdatePhase_UPDATE_PHASE_FAILED:
+		phase = PhaseFailed
+	case agentv1.UpdatePhase_UPDATE_PHASE_ROLLED_BACK:
+		phase = PhaseRolledBack
+	default:
+		return fmt.Errorf("signal update status %s: phase %q not supported",
+			req.GetDeviceId(), req.GetPhase())
+	}
+	return s.signalWithStart(ctx, req.GetDeviceId(), UpdateStatusSignalName, UpdateStatusSignal{
+		DeviceID:        req.GetDeviceId(),
+		FirmwareID:      req.GetFirmwareId(),
+		Phase:           phase,
+		ProgressPercent: req.GetProgressPercent(),
+		Detail:          req.GetDetail(),
+	})
+}
+
 // SignalCommandIssued delivers a command to its device's workflow, which records it as the
 // pending command and dispatches it to the agent. Its callers arrive with the rollout stage.
 func (s *Signaler) SignalCommandIssued(ctx context.Context, cmd CommandIssuedSignal) error {

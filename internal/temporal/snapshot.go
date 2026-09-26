@@ -80,5 +80,13 @@ func snapshotRecord(snap Snapshot) (devices.Snapshot, error) {
 			Dispatched: snap.Pending.Dispatched,
 		}
 	}
+	if snap.Update != nil {
+		out.Update = &devices.SnapshotUpdate{
+			FirmwareID:      snap.Update.FirmwareID,
+			Phase:           string(snap.Update.Phase),
+			ProgressPercent: snap.Update.ProgressPercent,
+			Detail:          snap.Update.Detail,
+		}
+	}
 	return out, nil
 }

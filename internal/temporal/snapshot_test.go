@@ -44,6 +44,9 @@ func TestSnapshotActivityPayload(t *testing.T) {
 			},
 			Dispatched: true,
 		}
+		s.Update = &UpdateStatus{
+			FirmwareID: "fw-2", Phase: PhaseApplying, ProgressPercent: 60,
+		}
 		s.Config = ConfigSnapshot{Version: 7, Data: json.RawMessage(`{"interval":"5s","n":3}`)}
 
 		store := &fakeSnapshotter{}
@@ -68,6 +71,9 @@ func TestSnapshotActivityPayload(t *testing.T) {
 				Version:    "fw-2",
 				Checksum:   "sum",
 				Dispatched: true,
+			},
+			Update: &devices.SnapshotUpdate{
+				FirmwareID: "fw-2", Phase: string(PhaseApplying), ProgressPercent: 60,
 			},
 			Config:     devices.SnapshotConfig{Version: 7, Data: map[string]any{"interval": "5s", "n": float64(3)}},
 			SnapshotAt: decided,
