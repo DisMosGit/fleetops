@@ -3,6 +3,8 @@ package agentserver_test
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"log/slog"
 	"math/rand"
 	"net"
@@ -18,6 +20,7 @@ import (
 	"github.com/DisMosGit/fleetops/internal/agent"
 	"github.com/DisMosGit/fleetops/internal/agentserver"
 	"github.com/DisMosGit/fleetops/internal/devices"
+	"github.com/DisMosGit/fleetops/internal/firmware"
 )
 
 // recordingSink is a hand-written HeartbeatSink double recording routed heartbeats.
@@ -48,6 +51,19 @@ func (nopSignaler) SignalHeartbeat(context.Context, devices.Record, *agentv1.Hea
 }
 
 func (nopSignaler) SignalCommandResult(context.Context, *agentv1.ReportRequest) error { return nil }
+
+func (nopSignaler) SignalUpdateStatus(context.Context, *agentv1.UpdateStatusRequest) error {
+	return nil
+}
+
+// nopFirmware is a hand-written FirmwareReader double with nothing stored: the e2e path under
+// test is stream routing, not firmware delivery.
+type nopFirmware struct{}
+
+// Open reports every firmware as not found.
+func (nopFirmware) Open(context.Context, string) (firmware.Record, io.ReadCloser, error) {
+	return firmware.Record{}, nil, fmt.Errorf("open firmware: %w", firmware.ErrNotFound)
+}
 
 func (s *recordingSink) count() int {
 	s.mu.Lock()
@@ -143,7 +159,7 @@ func TestFleetEndToEnd(t *testing.T) {
 	server := grpc.NewServer(
 		append(agentserver.ServerOptions(slog.New(slog.DiscardHandler)), grpc.ChainStreamInterceptor(killAfter(4)))...,
 	)
-	agentv1.RegisterAgentServiceServer(server, agentserver.NewServer(hub, nopRegistry{}, nopSignaler{}, slog.New(slog.DiscardHandler)))
+	agentv1.RegisterAgentServiceServer(server, agentserver.NewServer(hub, nopRegistry{}, nopSignaler{}, nopFirmware{}, slog.New(slog.DiscardHandler)))
 
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

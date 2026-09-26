@@ -3,6 +3,8 @@ package agentserver
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"sync"
@@ -18,6 +20,7 @@ import (
 
 	agentv1 "github.com/DisMosGit/fleetops/api/proto/agent/v1"
 	"github.com/DisMosGit/fleetops/internal/devices"
+	"github.com/DisMosGit/fleetops/internal/firmware"
 )
 
 // fakeSink is a hand-written HeartbeatSink double recording what it receives.
@@ -75,6 +78,7 @@ type fakeSignaler struct {
 	mu         sync.Mutex
 	heartbeats []signaled
 	reports    []*agentv1.ReportRequest
+	updates    []*agentv1.UpdateStatusRequest
 	err        error
 }
 
@@ -105,6 +109,16 @@ func (s *fakeSignaler) SignalCommandResult(_ context.Context, res *agentv1.Repor
 	return nil
 }
 
+func (s *fakeSignaler) SignalUpdateStatus(_ context.Context, req *agentv1.UpdateStatusRequest) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.err != nil {
+		return s.err
+	}
+	s.updates = append(s.updates, req)
+	return nil
+}
+
 func (s *fakeSignaler) signaledHeartbeats() []signaled {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -117,13 +131,42 @@ func (s *fakeSignaler) signaledResults() []*agentv1.ReportRequest {
 	return append([]*agentv1.ReportRequest(nil), s.reports...)
 }
 
+func (s *fakeSignaler) signaledUpdates() []*agentv1.UpdateStatusRequest {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]*agentv1.UpdateStatusRequest(nil), s.updates...)
+}
+
+// unavailableFirmware is a hand-written FirmwareReader double with nothing stored: tests that
+// do not exercise downloads pass it as the server's firmware seam.
+type unavailableFirmware struct{}
+
+// Open reports every firmware as not found.
+func (unavailableFirmware) Open(context.Context, string) (firmware.Record, io.ReadCloser, error) {
+	return firmware.Record{}, nil, fmt.Errorf("open firmware: %w", firmware.ErrNotFound)
+}
+
 // startServer serves hub over an in-memory listener with the production server options and
-// returns a connection to it.
+// returns a connection to it. Downloads have nothing to serve from; startServerWith wires a
+// firmware seam.
 func startServer(t *testing.T, hub *Hub, registry DeviceRegistry, signals DeviceSignaler) *grpc.ClientConn {
+	t.Helper()
+	return startServerWith(t, hub, registry, signals, unavailableFirmware{})
+}
+
+// startServerWith serves hub over an in-memory listener with the production server options and
+// the given firmware seam, and returns a connection to it.
+func startServerWith(
+	t *testing.T,
+	hub *Hub,
+	registry DeviceRegistry,
+	signals DeviceSignaler,
+	firmware FirmwareReader,
+) *grpc.ClientConn {
 	t.Helper()
 	lis := bufconn.Listen(1 << 20)
 	server := grpc.NewServer(ServerOptions(slog.New(slog.DiscardHandler))...)
-	agentv1.RegisterAgentServiceServer(server, NewServer(hub, registry, signals, slog.New(slog.DiscardHandler)))
+	agentv1.RegisterAgentServiceServer(server, NewServer(hub, registry, signals, firmware, slog.New(slog.DiscardHandler)))
 	go func() {
 		_ = server.Serve(lis) // ends at Stop
 	}()

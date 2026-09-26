@@ -41,7 +41,7 @@ func TestPersistencePathEndToEnd(t *testing.T) {
 
 	hub := agentserver.NewHub(ingest, log)
 	server := grpc.NewServer(agentserver.ServerOptions(log)...)
-	agentv1.RegisterAgentServiceServer(server, agentserver.NewServer(hub, store, nopSignaler{}, log))
+	agentv1.RegisterAgentServiceServer(server, agentserver.NewServer(hub, store, nopSignaler{}, nopFirmware{}, log))
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)

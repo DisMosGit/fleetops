@@ -16,4 +16,7 @@ type DeviceSignaler interface {
 	// SignalCommandResult delivers the terminal result of one command to its device's
 	// workflow.
 	SignalCommandResult(ctx context.Context, res *agentv1.ReportRequest) error
+	// SignalUpdateStatus delivers one firmware-update progress report to its device's
+	// workflow.
+	SignalUpdateStatus(ctx context.Context, req *agentv1.UpdateStatusRequest) error
 }

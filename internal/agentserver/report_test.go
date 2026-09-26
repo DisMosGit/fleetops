@@ -15,7 +15,7 @@ import (
 // newReportServer wires a Server with fakes for direct Report calls.
 func newReportServer(signals DeviceSignaler) *Server {
 	log := slog.New(slog.DiscardHandler)
-	return NewServer(NewHub(&fakeSink{}, log), &fakeRegistry{}, signals, log)
+	return NewServer(NewHub(&fakeSink{}, log), &fakeRegistry{}, signals, unavailableFirmware{}, log)
 }
 
 func TestReportValidation(t *testing.T) {

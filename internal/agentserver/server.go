@@ -20,26 +20,30 @@ const sessionQueueBound = 32
 
 // Server is the control-plane side of AgentService: it accepts agent streams, completes the
 // registration exchange and records its device in the registry, routes heartbeats to the hub
-// and on to the device workflow, lets the hub push commands back over the same stream, and
-// accepts command results through Report.
+// and on to the device workflow, lets the hub push commands back over the same stream, accepts
+// command results through Report and update progress through UpdateStatus, and serves firmware
+// binaries over the DownloadFirmware stream.
 type Server struct {
 	agentv1.UnimplementedAgentServiceServer
 
 	hub      *Hub
 	registry DeviceRegistry
 	signals  DeviceSignaler
+	firmware FirmwareReader
 	log      *slog.Logger
 }
 
 // NewServer returns an AgentService server backed by hub, recording accepted devices in
-// registry, and signaling the device workflow through signals.
+// registry, signaling the device workflow through signals, and serving firmware downloads
+// from firmware.
 func NewServer(
 	hub *Hub,
 	registry DeviceRegistry,
 	signals DeviceSignaler,
+	firmware FirmwareReader,
 	log *slog.Logger,
 ) *Server {
-	return &Server{hub: hub, registry: registry, signals: signals, log: log}
+	return &Server{hub: hub, registry: registry, signals: signals, firmware: firmware, log: log}
 }
 
 // Connect serves one agent stream end to end: registrations enroll devices, heartbeats route
@@ -112,9 +116,9 @@ func (s *Server) handle(
 	case *agentv1.AgentEnvelope_Heartbeat:
 		return s.heartbeat(ctx, sess, payload.Heartbeat)
 	case *agentv1.AgentEnvelope_FirmwareDownload:
-		return status.Error(codes.Unimplemented, "firmware download is not served yet")
+		return status.Error(codes.Unimplemented, "firmware downloads use the DownloadFirmware method")
 	case *agentv1.AgentEnvelope_UpdateStatus:
-		return status.Error(codes.Unimplemented, "update status is not served yet")
+		return s.updateStatus(ctx, sess, env.CorrelationId, payload.UpdateStatus)
 	default:
 		return status.Error(codes.InvalidArgument, "envelope carries no payload")
 	}
