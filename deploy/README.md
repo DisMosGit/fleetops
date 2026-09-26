@@ -72,7 +72,10 @@ Indexes: `_id_` (unique, device identity), `idx_region_model {region, model}`, `
 |---|---|---|
 | `_id` | string | firmware id (unique) |
 | `version` | string | firmware version (required, unique) |
-| `checksum` | string | binary checksum (required) |
+| `models` | string[] | target device models the upload declared (required, non-empty) |
+| `checksum` | string | lowercase hex SHA-256 of the binary (required) |
+| `size` | number | size of the stored binary in bytes (required) |
+| `created_at` | date | time the upload was recorded (required) |
 | `gridfs_id` | string | reference to the binary in GridFS (required) |
 
 Metadata never holds the payload itself — binaries live in GridFS and persist exactly as long as

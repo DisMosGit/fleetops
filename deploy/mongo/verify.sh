@@ -56,7 +56,7 @@ function requiredOf(name) {
 const expectedRequired = {
   devices: ["model", "region", "current_fw", "status", "last_heartbeat"],
   device_state_snapshots: ["region", "model", "current_fw", "online", "last_heartbeat", "config", "snapshot_at"],
-  firmware: ["version", "checksum", "gridfs_id"],
+  firmware: ["version", "models", "checksum", "size", "created_at", "gridfs_id"],
   rollouts: ["firmware_id", "status", "temporal_wf_id", "region", "model"],
   waves: ["rollout_id", "percent", "status", "success_rate"],
 };

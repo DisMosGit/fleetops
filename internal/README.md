@@ -11,6 +11,8 @@ capability:
   (stage 2)
 - `telemetry/` — RabbitMQ publisher/consumers, idempotent ingestion, DLQ handling (stage 3)
 - `config/` — the single YAML configuration file: loading, defaults, validation (landed)
+- `firmware/` — firmware registry: GridFS binaries with metadata-only records, upload
+  validation, and the `POST /api/firmwares` upload endpoint (landed)
 - `health/` — liveness/readiness probes and dependency connectivity checks (landed)
 
 `temporal` and `telemetry` still carry only their doc comments; their code lands with the stage

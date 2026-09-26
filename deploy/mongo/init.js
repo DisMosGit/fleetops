@@ -89,16 +89,21 @@ fleet.device_state_snapshots.createIndex({ region: 1, model: 1 }, { name: "idx_r
 fleet.device_state_snapshots.createIndex({ online: 1 }, { name: "idx_online" });
 
 // firmware: metadata only, _id = firmware id; the binary lives in GridFS (see gridfs_id).
+// models are the target device models the upload declared, checked against the devices
+// registry at upload time; size and created_at record what the upload stored.
 ensureCollection("firmware", {
   validationAction: "error",
   validationLevel: "strict",
   validator: {
     $jsonSchema: {
       bsonType: "object",
-      required: ["version", "checksum", "gridfs_id"],
+      required: ["version", "models", "checksum", "size", "created_at", "gridfs_id"],
       properties: {
         version: { bsonType: "string" },
+        models: { bsonType: "array", items: { bsonType: "string" }, minItems: 1 },
         checksum: { bsonType: "string" },
+        size: { bsonType: ["int", "long"] },
+        created_at: { bsonType: "date" },
         gridfs_id: { bsonType: "string" },
       },
     },
