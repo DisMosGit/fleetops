@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 )
@@ -55,6 +56,34 @@ func TestLoad(t *testing.T) {
 			mutate: func(c *Config) {
 				c.Temporal.Namespace = "fleetops-dev"
 			},
+		},
+		{
+			name: "liveness and telemetry absent keep defaults",
+			file: "simulation:\n  fleet_size: 250\n",
+			mutate: func(c *Config) {
+				c.Simulation.FleetSize = 250
+			},
+		},
+		{
+			name: "liveness and telemetry override defaults",
+			file: "liveness:\n  offline_threshold: 2m\n  sweep_interval: 5s\n" +
+				"telemetry:\n  batch_size: 100\n  flush_interval: 250ms\n",
+			mutate: func(c *Config) {
+				c.Liveness.OfflineThreshold = Duration{Duration: 2 * time.Minute}
+				c.Liveness.SweepInterval = Duration{Duration: 5 * time.Second}
+				c.Telemetry.BatchSize = 100
+				c.Telemetry.FlushInterval = Duration{Duration: 250 * time.Millisecond}
+			},
+		},
+		{
+			name:    "malformed duration is rejected by field name",
+			file:    "liveness:\n  offline_threshold: soon\n",
+			wantErr: "liveness.offline_threshold",
+		},
+		{
+			name:    "non-string duration is rejected by field name",
+			file:    "telemetry:\n  flush_interval: 30\n",
+			wantErr: "telemetry.flush_interval",
 		},
 		{
 			name:    "unknown key is rejected",

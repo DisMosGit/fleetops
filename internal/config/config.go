@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"time"
 
 	"go.yaml.in/yaml/v3"
 )
@@ -24,6 +25,10 @@ type Config struct {
 	GRPC GRPC `yaml:"grpc"`
 	// MongoDB configures the fleet database.
 	MongoDB MongoDB `yaml:"mongodb"`
+	// Liveness configures heartbeat-staleness detection.
+	Liveness Liveness `yaml:"liveness"`
+	// Telemetry configures heartbeat ingestion.
+	Telemetry Telemetry `yaml:"telemetry"`
 	// RabbitMQ configures the telemetry broker.
 	RabbitMQ RabbitMQ `yaml:"rabbitmq"`
 	// Temporal configures the orchestration backend.
@@ -52,6 +57,22 @@ type MongoDB struct {
 	URI string `yaml:"uri"`
 	// Database is the fleet database name.
 	Database string `yaml:"database"`
+}
+
+// Liveness configures heartbeat-staleness detection for the device fleet.
+type Liveness struct {
+	// OfflineThreshold is the silence after which a device is marked offline.
+	OfflineThreshold Duration `yaml:"offline_threshold"`
+	// SweepInterval is how often the offline-staleness sweep runs.
+	SweepInterval Duration `yaml:"sweep_interval"`
+}
+
+// Telemetry configures heartbeat ingestion.
+type Telemetry struct {
+	// BatchSize is the number of heartbeat events per batched telemetry write.
+	BatchSize int `yaml:"batch_size"`
+	// FlushInterval is the longest time a heartbeat waits for its write batch.
+	FlushInterval Duration `yaml:"flush_interval"`
 }
 
 // RabbitMQ configures the telemetry broker.
@@ -87,8 +108,16 @@ func Defaults() Config {
 		Simulation: Simulation{FleetSize: 100},
 		GRPC:       GRPC{ListenAddr: ":9090", ControlPlaneAddr: "localhost:9090"},
 		MongoDB:    MongoDB{URI: "mongodb://localhost:27017", Database: "fleetops"},
-		RabbitMQ:   RabbitMQ{URL: "amqp://guest:guest@localhost:5672/"},
-		Temporal:   Temporal{Address: "localhost:7233", Namespace: "default", TaskQueue: "fleetops"},
+		Liveness: Liveness{
+			OfflineThreshold: Duration{Duration: 30 * time.Second},
+			SweepInterval:    Duration{Duration: 10 * time.Second},
+		},
+		Telemetry: Telemetry{
+			BatchSize:     500,
+			FlushInterval: Duration{Duration: time.Second},
+		},
+		RabbitMQ: RabbitMQ{URL: "amqp://guest:guest@localhost:5672/"},
+		Temporal: Temporal{Address: "localhost:7233", Namespace: "default", TaskQueue: "fleetops"},
 		Observability: Observability{
 			OTelEndpoint: "localhost:4317",
 			MetricsAddr:  ":9091",

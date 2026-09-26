@@ -20,6 +20,18 @@ mongodb:
   # Fleet database name.
   database: "fleetops"
 
+liveness:
+  # Silence after which a device is marked offline (Go duration string).
+  offline_threshold: "30s"
+  # How often the offline-staleness sweep runs (Go duration string).
+  sweep_interval: "10s"
+
+telemetry:
+  # Heartbeat events per batched telemetry write.
+  batch_size: 500
+  # Longest time a heartbeat waits for its write batch (Go duration string).
+  flush_interval: "1s"
+
 rabbitmq:
   # Connection URL (amqp:// or amqps://).
   url: "amqp://guest:guest@localhost:5672/"

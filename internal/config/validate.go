@@ -26,6 +26,12 @@ func (c Config) Validate() error {
 	validateHostPort(add, "grpc.control_plane_addr", c.GRPC.ControlPlaneAddr)
 	validateScheme(add, "mongodb.uri", c.MongoDB.URI, "mongodb", "mongodb+srv")
 	validateNonEmpty(add, "mongodb.database", c.MongoDB.Database)
+	validateDuration(add, "liveness.offline_threshold", c.Liveness.OfflineThreshold)
+	validateDuration(add, "liveness.sweep_interval", c.Liveness.SweepInterval)
+	if c.Telemetry.BatchSize <= 0 {
+		add("telemetry.batch_size", fmt.Sprintf("must be positive, got %d", c.Telemetry.BatchSize))
+	}
+	validateDuration(add, "telemetry.flush_interval", c.Telemetry.FlushInterval)
 	validateScheme(add, "rabbitmq.url", c.RabbitMQ.URL, "amqp", "amqps")
 	validateHostPort(add, "temporal.address", c.Temporal.Address)
 	validateNonEmpty(add, "temporal.namespace", c.Temporal.Namespace)
@@ -79,5 +85,16 @@ func validateScheme(add func(field, reason string), field, value string, allowed
 func validateNonEmpty(add func(field, reason string), field, value string) {
 	if strings.TrimSpace(value) == "" {
 		add(field, "must not be empty")
+	}
+}
+
+// validateDuration reports field unless value is a parsed, positive duration. Reasons are
+// fixed strings: an invalid duration never echoes the configured value.
+func validateDuration(add func(field, reason string), field string, value Duration) {
+	switch {
+	case value.invalid:
+		add(field, "must be a Go duration string")
+	case value.Duration <= 0:
+		add(field, "must be positive")
 	}
 }

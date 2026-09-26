@@ -3,6 +3,7 @@ package config
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestValidate(t *testing.T) {
@@ -44,6 +45,24 @@ func TestValidate(t *testing.T) {
 		{name: "blank database", mutate: func(c *Config) {
 			c.MongoDB.Database = "  "
 		}, wantErrs: []string{"mongodb.database"}},
+		{name: "zero offline threshold", mutate: func(c *Config) {
+			c.Liveness.OfflineThreshold = Duration{}
+		}, wantErrs: []string{"liveness.offline_threshold"}},
+		{name: "negative sweep interval", mutate: func(c *Config) {
+			c.Liveness.SweepInterval = Duration{Duration: -time.Second}
+		}, wantErrs: []string{"liveness.sweep_interval"}},
+		{name: "unparseable duration", mutate: func(c *Config) {
+			c.Liveness.OfflineThreshold = Duration{invalid: true}
+		}, wantErrs: []string{"liveness.offline_threshold"}},
+		{name: "zero batch size", mutate: func(c *Config) {
+			c.Telemetry.BatchSize = 0
+		}, wantErrs: []string{"telemetry.batch_size"}},
+		{name: "negative batch size", mutate: func(c *Config) {
+			c.Telemetry.BatchSize = -1
+		}, wantErrs: []string{"telemetry.batch_size"}},
+		{name: "zero flush interval", mutate: func(c *Config) {
+			c.Telemetry.FlushInterval = Duration{}
+		}, wantErrs: []string{"telemetry.flush_interval"}},
 		{name: "rabbitmq url with wrong scheme", mutate: func(c *Config) {
 			c.RabbitMQ.URL = "https://localhost:5672/"
 		}, wantErrs: []string{"rabbitmq.url"}},
