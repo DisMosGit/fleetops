@@ -32,6 +32,10 @@ telemetry:
   # Longest time a heartbeat waits for its write batch (Go duration string).
   flush_interval: "1s"
 
+snapshots:
+  # Cadence of periodic device-workflow state snapshots (Go duration string).
+  interval: "1m"
+
 rabbitmq:
   # Connection URL (amqp:// or amqps://).
   url: "amqp://guest:guest@localhost:5672/"

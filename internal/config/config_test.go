@@ -76,9 +76,28 @@ func TestLoad(t *testing.T) {
 			},
 		},
 		{
+			name: "snapshots section absent keeps defaults",
+			file: "simulation:\n  fleet_size: 250\n",
+			mutate: func(c *Config) {
+				c.Simulation.FleetSize = 250
+			},
+		},
+		{
+			name: "snapshots interval overrides default",
+			file: "snapshots:\n  interval: 30s\n",
+			mutate: func(c *Config) {
+				c.Snapshots.Interval = Duration{Duration: 30 * time.Second}
+			},
+		},
+		{
 			name:    "malformed duration is rejected by field name",
 			file:    "liveness:\n  offline_threshold: soon\n",
 			wantErr: "liveness.offline_threshold",
+		},
+		{
+			name:    "malformed snapshots interval is rejected by field name",
+			file:    "snapshots:\n  interval: soon\n",
+			wantErr: "snapshots.interval",
 		},
 		{
 			name:    "non-string duration is rejected by field name",

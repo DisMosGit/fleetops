@@ -32,6 +32,7 @@ func (c Config) Validate() error {
 		add("telemetry.batch_size", fmt.Sprintf("must be positive, got %d", c.Telemetry.BatchSize))
 	}
 	validateDuration(add, "telemetry.flush_interval", c.Telemetry.FlushInterval)
+	validateDuration(add, "snapshots.interval", c.Snapshots.Interval)
 	validateScheme(add, "rabbitmq.url", c.RabbitMQ.URL, "amqp", "amqps")
 	validateHostPort(add, "temporal.address", c.Temporal.Address)
 	validateNonEmpty(add, "temporal.namespace", c.Temporal.Namespace)

@@ -29,6 +29,8 @@ type Config struct {
 	Liveness Liveness `yaml:"liveness"`
 	// Telemetry configures heartbeat ingestion.
 	Telemetry Telemetry `yaml:"telemetry"`
+	// Snapshots configures device-workflow state persistence.
+	Snapshots Snapshots `yaml:"snapshots"`
 	// RabbitMQ configures the telemetry broker.
 	RabbitMQ RabbitMQ `yaml:"rabbitmq"`
 	// Temporal configures the orchestration backend.
@@ -75,6 +77,12 @@ type Telemetry struct {
 	FlushInterval Duration `yaml:"flush_interval"`
 }
 
+// Snapshots configures device-workflow state persistence to the fleet database.
+type Snapshots struct {
+	// Interval is the cadence of periodic device-workflow state snapshots.
+	Interval Duration `yaml:"interval"`
+}
+
 // RabbitMQ configures the telemetry broker.
 type RabbitMQ struct {
 	// URL is the RabbitMQ connection URL (amqp:// or amqps://).
@@ -116,8 +124,9 @@ func Defaults() Config {
 			BatchSize:     500,
 			FlushInterval: Duration{Duration: time.Second},
 		},
-		RabbitMQ: RabbitMQ{URL: "amqp://guest:guest@localhost:5672/"},
-		Temporal: Temporal{Address: "localhost:7233", Namespace: "default", TaskQueue: "fleetops"},
+		Snapshots: Snapshots{Interval: Duration{Duration: time.Minute}},
+		RabbitMQ:  RabbitMQ{URL: "amqp://guest:guest@localhost:5672/"},
+		Temporal:  Temporal{Address: "localhost:7233", Namespace: "default", TaskQueue: "fleetops"},
 		Observability: Observability{
 			OTelEndpoint: "localhost:4317",
 			MetricsAddr:  ":9091",

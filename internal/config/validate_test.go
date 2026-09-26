@@ -63,6 +63,12 @@ func TestValidate(t *testing.T) {
 		{name: "zero flush interval", mutate: func(c *Config) {
 			c.Telemetry.FlushInterval = Duration{}
 		}, wantErrs: []string{"telemetry.flush_interval"}},
+		{name: "zero snapshot interval", mutate: func(c *Config) {
+			c.Snapshots.Interval = Duration{}
+		}, wantErrs: []string{"snapshots.interval"}},
+		{name: "negative snapshot interval", mutate: func(c *Config) {
+			c.Snapshots.Interval = Duration{Duration: -time.Minute}
+		}, wantErrs: []string{"snapshots.interval"}},
 		{name: "rabbitmq url with wrong scheme", mutate: func(c *Config) {
 			c.RabbitMQ.URL = "https://localhost:5672/"
 		}, wantErrs: []string{"rabbitmq.url"}},
