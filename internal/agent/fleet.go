@@ -73,9 +73,22 @@ func NewFleet(n int, opts FleetOptions) (*Fleet, error) {
 func (f *Fleet) Identities() []Identity {
 	ids := make([]Identity, len(f.devices))
 	for i, d := range f.devices {
-		ids[i] = d.Identity
+		ids[i] = d.snapshot()
 	}
 	return ids
+}
+
+// SetFirmware adopts version as the current firmware of the named device — the outcome of a
+// successful firmware apply — so the device's subsequent heartbeats report it. An unknown
+// device fails: a command for one is a mismatch the caller must see, not silently absorb.
+func (f *Fleet) SetFirmware(deviceID, version string) error {
+	for _, d := range f.devices {
+		if d.Identity.ID == deviceID {
+			d.SetFirmware(version)
+			return nil
+		}
+	}
+	return fmt.Errorf("set firmware of %s: unknown device", deviceID)
 }
 
 // Run emits heartbeats from every device into out until ctx is cancelled: one goroutine per

@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -23,7 +24,9 @@ type Identity struct {
 }
 
 // Device is one simulated IoT device: its identity plus the emission loop that turns the
-// simulated condition into heartbeats.
+// simulated condition into heartbeats. The identity fields except the firmware version are
+// fixed at construction; the firmware version moves when a firmware apply adopts one, under
+// the device's lock.
 type Device struct {
 	// Identity is the device identity reported at registration and in every heartbeat.
 	Identity Identity
@@ -35,6 +38,31 @@ type Device struct {
 	IDs *IDGen
 	// Now returns the heartbeat sample timestamp; nil selects time.Now.
 	Now func() time.Time
+
+	mu sync.RWMutex
+}
+
+// Firmware reports the firmware version the device currently runs.
+func (d *Device) Firmware() string {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.Identity.Firmware
+}
+
+// snapshot returns the device identity as it stands, taken under the lock that guards the
+// firmware version.
+func (d *Device) snapshot() Identity {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.Identity
+}
+
+// SetFirmware adopts version as the firmware the device runs: every subsequent heartbeat
+// reports it, which is how a successful firmware apply becomes visible to the control plane.
+func (d *Device) SetFirmware(version string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.Identity.Firmware = version
 }
 
 // Run emits one heartbeat per tick received on ticks into out, until ctx is cancelled. The
@@ -55,7 +83,7 @@ func (d *Device) Run(ctx context.Context, ticks <-chan time.Time, out chan<- *ag
 			hb := &agentv1.Heartbeat{
 				EventId:   d.IDs.Next(d.Identity.ID),
 				DeviceId:  d.Identity.ID,
-				CurrentFw: d.Identity.Firmware,
+				CurrentFw: d.Firmware(),
 				Status:    sample.Status,
 				Ts:        timestamppb.New(now()),
 				Cpu:       sample.CPU,

@@ -14,9 +14,10 @@ import (
 	agentv1 "github.com/DisMosGit/fleetops/api/proto/agent/v1"
 )
 
-// CommandHandler receives commands the control plane dispatches to a device behind this agent.
-// Firmware apply lands later and implements this seam; until then cmd/agent wires a logging
-// handler.
+// CommandHandler receives commands the control plane dispatches to a device behind this
+// agent. The firmware update handler implements this seam. Commands are handled off the
+// stream's receive loop — a handler talks back to the control plane on that same stream — and
+// every handler call stops with the client's context.
 type CommandHandler interface {
 	// Handle consumes one command dispatched over the stream.
 	Handle(ctx context.Context, cmd *agentv1.Command) error
@@ -88,6 +89,10 @@ type Client struct {
 	// before draining the queues (heartbeats still behind the registration gate). Owned by
 	// the writer goroutines, which never overlap.
 	held *agentv1.AgentEnvelope
+
+	// handlers tracks the in-flight command handlers, owned by the read loop and joined by
+	// Run so none outlives the client.
+	handlers sync.WaitGroup
 
 	mu      sync.Mutex
 	pending map[string]*pending
@@ -161,12 +166,15 @@ func NewClient(svc agentv1.AgentServiceClient, opts Options) (*Client, error) {
 // Run maintains the Connect stream until ctx is cancelled: heartbeats read from the heartbeats
 // channel are delivered through the bounded outbound queue, and stream failures end in
 // reconnect attempts with capped exponential backoff. Run returns nil on graceful shutdown and
-// an error only when the client cannot continue (ctx cancelled while resending).
+// an error only when the client cannot continue (ctx cancelled while resending). Command
+// handlers are joined before it returns, so none outlives the client.
 func (c *Client) Run(ctx context.Context, heartbeats <-chan *agentv1.Heartbeat) error {
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() error { return c.pump(gctx, heartbeats) })
 	g.Go(func() error { return c.maintain(gctx) })
-	return g.Wait()
+	err := g.Wait()
+	c.handlers.Wait()
+	return err
 }
 
 // pump wraps emitted heartbeats into the outbound queue. It owns no state; its stop condition

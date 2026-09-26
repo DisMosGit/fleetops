@@ -94,8 +94,8 @@ func (c *Client) writeLoop(ctx context.Context, stream stream, ready <-chan stru
 	}
 }
 
-// readLoop demuxes the control stream: commands go to the command handler, responses to the
-// request waiting on their correlation id.
+// readLoop demuxes the control stream: commands go to their handler goroutines, responses to
+// the request waiting on their correlation id.
 func (c *Client) readLoop(ctx context.Context, stream stream) error {
 	for {
 		env, err := stream.Recv()
@@ -106,12 +106,20 @@ func (c *Client) readLoop(ctx context.Context, stream stream) error {
 			return fmt.Errorf("receive control envelope: %w", err)
 		}
 		if cmd := env.GetCommand(); cmd != nil {
-			if err := c.handler.Handle(ctx, cmd); err != nil {
-				// A command handler failure must not tear the stream down: the command is
-				// gone either way, and its result belongs on Report, not here.
-				c.log.Error("handle command",
-					"command_id", cmd.GetCommandId(), "device_id", cmd.GetDeviceId(), "err", err)
-			}
+			// Commands run off the receive loop: a handler talks back to this very stream
+			// (update status rides correlated requests the loop must keep delivering), so
+			// handling one inline would deadlock the exchange. The client owns the
+			// goroutine — Run joins them — and the session context stops it.
+			c.handlers.Add(1)
+			go func() {
+				defer c.handlers.Done()
+				if err := c.handler.Handle(ctx, cmd); err != nil {
+					// A command handler failure must not tear the stream down: the command is
+					// gone either way, and its result belongs on Report, not here.
+					c.log.Error("handle command",
+						"command_id", cmd.GetCommandId(), "device_id", cmd.GetDeviceId(), "err", err)
+				}
+			}()
 			continue
 		}
 		if env.CorrelationId == "" {
