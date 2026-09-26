@@ -16,6 +16,15 @@ model.
 **Not implemented yet:** the stack manifests themselves arrive at stage 1 (compose first, then
 k3d manifests); until then `make up` / `make down` have nothing to apply.
 
+## Configuration and probes
+
+`config.yaml` is a commented sample of the single YAML configuration file every binary loads
+via `-config` (see [cmd/README](../cmd/README.md)): simulation scale, gRPC, MongoDB, RabbitMQ,
+Temporal, and observability endpoints, each shown with its default. Loading validates the whole
+file — unknown keys and invalid values stop startup with the offending field named. The control
+plane and the worker serve `GET /healthz` (liveness) and `GET /readyz` (readiness: connectivity
+to MongoDB, RabbitMQ, and Temporal) on `observability.health_addr`.
+
 ## MongoDB data model contract
 
 Source of truth for requirements: `openspec/specs/mongo-data-model/spec.md`. Database `fleetops`.

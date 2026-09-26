@@ -5,6 +5,7 @@ go 1.27.1
 require (
 	github.com/google/go-cmp v0.7.0
 	go.yaml.in/yaml/v3 v3.0.5
+	golang.org/x/sync v0.23.0
 	google.golang.org/grpc v1.84.0
 	google.golang.org/protobuf v1.36.12
 )

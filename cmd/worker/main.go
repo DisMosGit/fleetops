@@ -1,31 +1,82 @@
 // Command worker runs the FleetOps Temporal workers: it hosts the DeviceWorkflow,
-// RolloutWorkflow, and FirmwareWorkflow implementations together with their activities. Not
-// implemented yet — delivered at stage 2.
+// RolloutWorkflow, and FirmwareWorkflow implementations together with their activities. It
+// loads the shared configuration and serves the liveness/readiness probes today; the workflow
+// and activity workers join with stage 2.
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"golang.org/x/sync/errgroup"
+
+	"github.com/DisMosGit/fleetops/internal/config"
+	"github.com/DisMosGit/fleetops/internal/health"
 )
 
-// errNotImplemented marks a stage-gated entrypoint whose wire-up does not exist yet.
-var errNotImplemented = errors.New("not implemented yet")
+// shutdownTimeout bounds graceful shutdown of the probe server.
+const shutdownTimeout = 5 * time.Second
 
 func main() {
-	temporalAddr := flag.String("temporal-address", "localhost:7233", "Temporal frontend address")
-	taskQueue := flag.String("task-queue", "fleetops", "Temporal task queue to poll")
+	configPath := flag.String(
+		"config", "", "path to the YAML configuration file (defaults apply when omitted)",
+	)
 	flag.Parse()
 
-	if err := run(*temporalAddr, *taskQueue); err != nil {
-		slog.Error("worker stopped", "temporal_addr", *temporalAddr, "task_queue", *taskQueue, "err", err)
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		slog.Error("load configuration", "err", err)
+		os.Exit(1)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if err := run(ctx, cfg); err != nil {
+		slog.Error("worker stopped", "err", err)
 		os.Exit(1)
 	}
 }
 
-// run connects to Temporal and starts the workflow and activity workers.
-func run(temporalAddr, taskQueue string) error {
-	// TODO(stage 2): build the Temporal client and register workflows and activities.
-	return errNotImplemented
+// run serves the liveness/readiness probes on the configured health address until ctx is
+// cancelled. The Temporal workflow and activity workers join the same lifecycle at stage 2.
+func run(ctx context.Context, cfg config.Config) error {
+	// TODO(stage 2): build the Temporal client on cfg.Temporal and register workflows and
+	// activities on cfg.Temporal.TaskQueue.
+
+	checks, err := health.NewDependencyChecks(cfg.MongoDB.URI, cfg.RabbitMQ.URL, cfg.Temporal.Address)
+	if err != nil {
+		return fmt.Errorf("dependency checks: %w", err)
+	}
+	srv := &http.Server{
+		Addr:    cfg.Observability.HealthAddr,
+		Handler: health.NewHandler(checks...),
+	}
+
+	g, gctx := errgroup.WithContext(ctx)
+	g.Go(func() error {
+		slog.Info("probe server listening", "addr", cfg.Observability.HealthAddr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return fmt.Errorf("serve probes on %s: %w", cfg.Observability.HealthAddr, err)
+		}
+		return nil
+	})
+	g.Go(func() error {
+		<-gctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			return fmt.Errorf("shut down probe server: %w", err)
+		}
+		return nil
+	})
+	return g.Wait()
 }
