@@ -155,7 +155,7 @@ func TestWorkflowRetriesUndeliveredCommand(t *testing.T) {
 		failures: map[string]int{"cmd-1": 1},
 		fail:     errors.New("device not connected"),
 	}
-	env := newDeviceWorkflowEnv(rec)
+	env := newDeviceWorkflowEnv(rec, &snapshotRecorder{})
 	env.RegisterDelayedCallback(func() {
 		env.SignalWorkflow(CommandIssuedSignalName, CommandIssuedSignal{
 			CommandID: "cmd-1", DeviceID: "dev-1", Kind: CommandKindUpdate,
@@ -197,7 +197,7 @@ func TestWorkflowSupersededDispatchIsHarmless(t *testing.T) {
 		CommandID: "cmd-2", DeviceID: "dev-1", Kind: CommandKindUpdate,
 		FirmwareID: "fw-3", Version: "fw-3",
 	}
-	carried := runDevice(t, newDeviceState("dev-1", testSettings()), rec,
+	carried := runDevice(t, newDeviceState("dev-1", testSettings()), rec, &snapshotRecorder{},
 		testSignal{CommandIssuedSignalName, first},
 		testSignal{CommandIssuedSignalName, second},
 		testSignal{CommandResultSignalName, CommandResultSignal{
@@ -233,7 +233,7 @@ func TestWorkflowDoesNotRetryInvalidCommand(t *testing.T) {
 		attempts++
 		mu.Unlock()
 		return real(ctx, cmd)
-	})
+	}, &snapshotRecorder{})
 	env.RegisterDelayedCallback(func() {
 		env.SignalWorkflow(CommandIssuedSignalName, CommandIssuedSignal{
 			CommandID: "cmd-1", DeviceID: "dev-1", Kind: "reboot",

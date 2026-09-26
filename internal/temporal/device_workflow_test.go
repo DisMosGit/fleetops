@@ -52,10 +52,41 @@ func (d *dispatchRecorder) recorded() []CommandIssuedSignal {
 	return append([]CommandIssuedSignal(nil), d.calls...)
 }
 
+// errSnapshotWrite stands in for the snapshot store's write failure.
+var errSnapshotWrite = errors.New("mongo is down")
+
+// snapshotRecorder stands in for the snapshot activity's side effect: it records every
+// snapshot the workflow persists and can fail chosen writes to exercise failure isolation.
+type snapshotRecorder struct {
+	mu       sync.Mutex
+	saved    []Snapshot
+	failures int // remaining failures
+}
+
+// run is the recorded snapshot activity.
+func (s *snapshotRecorder) run(_ context.Context, snap Snapshot) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.failures > 0 {
+		s.failures--
+		return errSnapshotWrite
+	}
+	s.saved = append(s.saved, snap)
+	return nil
+}
+
+// recorded returns the snapshots persisted so far.
+func (s *snapshotRecorder) recorded() []Snapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]Snapshot(nil), s.saved...)
+}
+
 // newDeviceWorkflowEnv returns a test environment hosting DeviceWorkflow under its
-// registered name and the dispatch activity under DispatchActivityName, backed by rec.
-func newDeviceWorkflowEnv(rec *dispatchRecorder) *testsuite.TestWorkflowEnvironment {
-	return newDeviceWorkflowEnvWith(rec.run)
+// registered name and its two activities — dispatch-command and snapshot-device-state —
+// backed by rec and snaps.
+func newDeviceWorkflowEnv(rec *dispatchRecorder, snaps *snapshotRecorder) *testsuite.TestWorkflowEnvironment {
+	return newDeviceWorkflowEnvWith(rec.run, snaps)
 }
 
 // newDeviceWorkflowEnvWith is newDeviceWorkflowEnv with a caller-supplied dispatch activity
@@ -63,12 +94,14 @@ func newDeviceWorkflowEnv(rec *dispatchRecorder) *testsuite.TestWorkflowEnvironm
 // signal, and that debug noise drowns the test output.
 func newDeviceWorkflowEnvWith(
 	dispatch func(context.Context, CommandIssuedSignal) error,
+	snaps *snapshotRecorder,
 ) *testsuite.TestWorkflowEnvironment {
 	var suite testsuite.WorkflowTestSuite
 	suite.SetLogger(discardLogger{})
 	env := suite.NewTestWorkflowEnvironment()
 	env.RegisterWorkflowWithOptions(DeviceWorkflow, workflow.RegisterOptions{Name: DeviceWorkflowName})
 	env.RegisterActivityWithOptions(dispatch, activity.RegisterOptions{Name: DispatchActivityName})
+	env.RegisterActivityWithOptions(snaps.run, activity.RegisterOptions{Name: SnapshotActivityName})
 	return env
 }
 
@@ -106,10 +139,11 @@ func runDevice(
 	t *testing.T,
 	input deviceState,
 	rec *dispatchRecorder,
+	snaps *snapshotRecorder,
 	signals ...testSignal,
 ) deviceState {
 	t.Helper()
-	env := newDeviceWorkflowEnv(rec)
+	env := newDeviceWorkflowEnv(rec, snaps)
 	queueSignals(env, signals...)
 	padToRollover(env, len(signals))
 	env.ExecuteWorkflow(DeviceWorkflow, input)
@@ -137,7 +171,7 @@ func TestDeviceWorkflowStateQuery(t *testing.T) {
 	t.Parallel()
 
 	var queried State
-	env := newDeviceWorkflowEnv(&dispatchRecorder{})
+	env := newDeviceWorkflowEnv(&dispatchRecorder{}, &snapshotRecorder{})
 	env.RegisterDelayedCallback(func() {
 		env.SignalWorkflow(HeartbeatSignalName, HeartbeatSignal{
 			EventID: "evt-1", DeviceID: "dev-1", CurrentFw: "fw-1", Timestamp: time.Unix(1000, 0),
@@ -236,8 +270,8 @@ func TestDeviceWorkflowSignalIdempotency(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			clean := runDevice(t, newDeviceState("dev-1", testSettings()), &dispatchRecorder{}, tc.first...)
-			noisy := runDevice(t, newDeviceState("dev-1", testSettings()), &dispatchRecorder{},
+			clean := runDevice(t, newDeviceState("dev-1", testSettings()), &dispatchRecorder{}, &snapshotRecorder{}, tc.first...)
+			noisy := runDevice(t, newDeviceState("dev-1", testSettings()), &dispatchRecorder{}, &snapshotRecorder{},
 				append(append([]testSignal{}, tc.first...), tc.duplicates...)...)
 			if diff := cmp.Diff(clean.view(), noisy.view()); diff != "" {
 				t.Errorf("duplicates changed device state (-without +with duplicates):\n%s", diff)
@@ -264,7 +298,7 @@ func TestDeviceWorkflowCommandLifecycle(t *testing.T) {
 	t.Run("issued command becomes pending and dispatches", func(t *testing.T) {
 		t.Parallel()
 		rec := &dispatchRecorder{}
-		carried := runDevice(t, newDeviceState("dev-1", testSettings()), rec, testSignal{CommandIssuedSignalName, update})
+		carried := runDevice(t, newDeviceState("dev-1", testSettings()), rec, &snapshotRecorder{}, testSignal{CommandIssuedSignalName, update})
 
 		want := State{DeviceID: "dev-1", Pending: &PendingCommand{Command: update, Dispatched: true}}
 		if diff := cmp.Diff(want, carried.view()); diff != "" {
@@ -278,7 +312,7 @@ func TestDeviceWorkflowCommandLifecycle(t *testing.T) {
 	t.Run("newer command supersedes the pending one", func(t *testing.T) {
 		t.Parallel()
 		rec := &dispatchRecorder{}
-		carried := runDevice(t, newDeviceState("dev-1", testSettings()), rec,
+		carried := runDevice(t, newDeviceState("dev-1", testSettings()), rec, &snapshotRecorder{},
 			testSignal{CommandIssuedSignalName, update},
 			testSignal{CommandIssuedSignalName, update3},
 			testSignal{CommandResultSignalName, CommandResultSignal{
@@ -297,7 +331,7 @@ func TestDeviceWorkflowCommandLifecycle(t *testing.T) {
 	t.Run("success adopts the commanded firmware", func(t *testing.T) {
 		t.Parallel()
 		rec := &dispatchRecorder{}
-		carried := runDevice(t, newDeviceState("dev-1", testSettings()), rec,
+		carried := runDevice(t, newDeviceState("dev-1", testSettings()), rec, &snapshotRecorder{},
 			heartbeat,
 			testSignal{CommandIssuedSignalName, update},
 			testSignal{CommandResultSignalName, CommandResultSignal{
@@ -318,7 +352,7 @@ func TestDeviceWorkflowCommandLifecycle(t *testing.T) {
 	t.Run("failure leaves firmware unchanged", func(t *testing.T) {
 		t.Parallel()
 		rec := &dispatchRecorder{}
-		carried := runDevice(t, newDeviceState("dev-1", testSettings()), rec,
+		carried := runDevice(t, newDeviceState("dev-1", testSettings()), rec, &snapshotRecorder{},
 			heartbeat,
 			testSignal{CommandIssuedSignalName, update},
 			testSignal{CommandResultSignalName, CommandResultSignal{
@@ -339,7 +373,7 @@ func TestDeviceWorkflowCommandLifecycle(t *testing.T) {
 	t.Run("result for a non-pending command changes nothing", func(t *testing.T) {
 		t.Parallel()
 		rec := &dispatchRecorder{}
-		carried := runDevice(t, newDeviceState("dev-1", testSettings()), rec,
+		carried := runDevice(t, newDeviceState("dev-1", testSettings()), rec, &snapshotRecorder{},
 			testSignal{CommandIssuedSignalName, update},
 			testSignal{CommandResultSignalName, CommandResultSignal{
 				DeviceID: "dev-1", CommandID: "cmd-99", Outcome: OutcomeFailed,
@@ -367,7 +401,7 @@ func TestDeviceWorkflowRollingContinuation(t *testing.T) {
 	t.Run("state and dedup memory survive the rollover", func(t *testing.T) {
 		t.Parallel()
 		rec := &dispatchRecorder{}
-		first := runDevice(t, newDeviceState("dev-1", testSettings()), rec,
+		first := runDevice(t, newDeviceState("dev-1", testSettings()), rec, &snapshotRecorder{},
 			heartbeat, testSignal{CommandIssuedSignalName, update})
 
 		if !first.RecentEventIDs.has("evt-1") || !first.RecentCommandIDs.has("cmd-1") {
@@ -378,7 +412,7 @@ func TestDeviceWorkflowRollingContinuation(t *testing.T) {
 			t.Errorf("SignalsApplied carried out of the run = %d, want 0", first.SignalsApplied)
 		}
 
-		second := runDevice(t, first, &dispatchRecorder{})
+		second := runDevice(t, first, &dispatchRecorder{}, &snapshotRecorder{})
 		if diff := cmp.Diff(first.view(), second.view()); diff != "" {
 			t.Errorf("rollover changed device state (-before +after):\n%s", diff)
 		}
@@ -392,11 +426,11 @@ func TestDeviceWorkflowRollingContinuation(t *testing.T) {
 
 	t.Run("duplicate signals across a continuation are dropped", func(t *testing.T) {
 		t.Parallel()
-		first := runDevice(t, newDeviceState("dev-1", testSettings()), &dispatchRecorder{}, heartbeat)
+		first := runDevice(t, newDeviceState("dev-1", testSettings()), &dispatchRecorder{}, &snapshotRecorder{}, heartbeat)
 
 		// The redelivered heartbeat reuses its event id but claims a newer timestamp: only
 		// the carried dedup memory can drop it. The fresh one after it must still apply.
-		second := runDevice(t, first, &dispatchRecorder{},
+		second := runDevice(t, first, &dispatchRecorder{}, &snapshotRecorder{},
 			testSignal{HeartbeatSignalName, HeartbeatSignal{
 				EventID: "evt-1", DeviceID: "dev-1", CurrentFw: "fw-1", Timestamp: time.Unix(9000, 0),
 			}},
@@ -419,8 +453,8 @@ func TestDeviceWorkflowRollingContinuation(t *testing.T) {
 		t.Parallel()
 		// The last real signal of a run and its redelivery to the continuing run — what an
 		// at-least-once producer does around a rollover — must total one application.
-		first := runDevice(t, newDeviceState("dev-1", testSettings()), &dispatchRecorder{}, heartbeat)
-		second := runDevice(t, first, &dispatchRecorder{}, heartbeat)
+		first := runDevice(t, newDeviceState("dev-1", testSettings()), &dispatchRecorder{}, &snapshotRecorder{}, heartbeat)
+		second := runDevice(t, first, &dispatchRecorder{}, &snapshotRecorder{}, heartbeat)
 
 		want := State{
 			DeviceID:        "dev-1",
@@ -434,7 +468,7 @@ func TestDeviceWorkflowRollingContinuation(t *testing.T) {
 
 	t.Run("unknown carry version fails loudly", func(t *testing.T) {
 		t.Parallel()
-		env := newDeviceWorkflowEnv(&dispatchRecorder{})
+		env := newDeviceWorkflowEnv(&dispatchRecorder{}, &snapshotRecorder{})
 		env.ExecuteWorkflow(DeviceWorkflow, deviceState{CarryVersion: carryVersion + 1, DeviceID: "dev-1"})
 		err := env.GetWorkflowResult(nil)
 		if err == nil {
@@ -485,7 +519,7 @@ func bufferedSignalsWorkflow(ctx workflow.Context) (deviceState, error) {
 func TestDrainAllAppliesBufferedSignals(t *testing.T) {
 	t.Parallel()
 
-	env := newDeviceWorkflowEnv(&dispatchRecorder{})
+	env := newDeviceWorkflowEnv(&dispatchRecorder{}, &snapshotRecorder{})
 	env.RegisterWorkflow(bufferedSignalsWorkflow)
 	env.ExecuteWorkflow(bufferedSignalsWorkflow)
 

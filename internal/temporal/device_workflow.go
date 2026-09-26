@@ -16,6 +16,8 @@ const (
 	DeviceWorkflowName = "device-workflow"
 	// DispatchActivityName is the registered name of the dispatch-command activity.
 	DispatchActivityName = "dispatch-command"
+	// SnapshotActivityName is the registered name of the snapshot-device-state activity.
+	SnapshotActivityName = "snapshot-device-state"
 	// GetStateQueryType is the state query returning the authoritative device state.
 	GetStateQueryType = "get-state"
 	// HeartbeatSignalName carries a HeartbeatSignal.
@@ -43,10 +45,12 @@ func DeviceWorkflowID(deviceID string) string {
 // DeviceWorkflow is the long-lived per-device entity: it owns the device's authoritative
 // state (current firmware, last heartbeat, pending command, configuration snapshot) and
 // folds in signals — heartbeat, command_issued, command_result, config_changed — exactly
-// once per delivery key. The state is the workflow's only mutable data and travels whole
-// across rolling continuations, so the entity outlives any run while its history stays
-// bounded. The state argument is the empty state of a new device on first start and the
-// carried-over state on every continuation.
+// once per delivery key. It keeps the outside world in step with that state: search
+// attributes mirror it for the Temporal UI, and a snapshot activity projects it into the
+// fleet database periodically and on every meaningful transition. The state is the
+// workflow's only mutable data and travels whole across rolling continuations, so the
+// entity outlives any run while its history stays bounded. The state argument is the empty
+// state of a new device on first start and the carried-over state on every continuation.
 func DeviceWorkflow(ctx workflow.Context, state deviceState) error {
 	if err := state.validate(); err != nil {
 		return err
@@ -76,13 +80,64 @@ func DeviceWorkflow(ctx workflow.Context, state deviceState) error {
 			NonRetryableErrorTypes: []string{invalidCommandErrorType},
 		},
 	})
+	snapshotCtx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+		StartToCloseTimeout: 10 * time.Second,
+		// The snapshot write converges on the newest state, so retries are cheap — and
+		// bounded, so a permanently failing write resolves instead of holding the single
+		// in-flight snapshot slot for the life of the run.
+		RetryPolicy: &temporal.RetryPolicy{
+			InitialInterval:    time.Second,
+			BackoffCoefficient: 2,
+			MaximumInterval:    10 * time.Second,
+			MaximumAttempts:    3,
+		},
+	})
 
-	var dispatch workflow.Future
+	var dispatch, snapshot workflow.Future
 	var dispatching, dispatchFailed string // command ids
+	var snapshotPending bool               // a snapshot was asked for while one is in flight
+	timer := workflow.NewTimer(ctx, state.Settings.SnapshotInterval)
+	var attrs map[string]any // the search attributes last upserted; nil before the first
+
+	// schedule applies the consequences of one decision point — run start, an applied
+	// signal, or a snapshot tick: the derived liveness judgement, the snapshots the state
+	// changes call for, and the search attributes that mirror the state. It is the only
+	// place the entity reaches out to the world besides command dispatch.
+	schedule := func(applied transitions, tick bool) {
+		flipped := state.refreshLiveness(workflow.Now(ctx))
+		if tick {
+			timer = workflow.NewTimer(ctx, state.Settings.SnapshotInterval)
+		}
+		if applied.needsSnapshot() || flipped || tick {
+			if snapshot != nil {
+				// Coalesce onto the write already in flight: its successor projects the
+				// state as it stands when the in-flight one completes.
+				snapshotPending = true
+			} else {
+				snapshot = workflow.ExecuteActivity(snapshotCtx, SnapshotActivityName,
+					snapshotOf(state, workflow.Now(ctx)))
+			}
+		}
+		if next := searchAttributes(state); !attrsEqual(attrs, next) {
+			if err := workflow.UpsertTypedSearchAttributes(ctx, attrUpdates(next)...); err != nil {
+				// The state query stays authoritative. A failed upsert is retried at the
+				// next decision point, because the recorded map stays stale until one
+				// succeeds.
+				workflow.GetLogger(ctx).Error("upsert search attributes",
+					"device_id", state.DeviceID, "error", err)
+			} else {
+				attrs = next
+			}
+		}
+	}
+	schedule(transitions{}, false)
+
 	for {
 		if state.SignalsApplied >= maxSignalsPerRun {
 			signals.drainAll(&state)
 			state.SignalsApplied = 0
+			// An in-flight snapshot is abandoned here on purpose: the write is idempotent
+			// and the continuing run's next tick refreshes the projection.
 			return workflow.NewContinueAsNewError(ctx, DeviceWorkflowName, state)
 		}
 
@@ -98,26 +153,28 @@ func DeviceWorkflow(ctx workflow.Context, state deviceState) error {
 			dispatch, dispatching = nil, ""
 		}
 
+		var applied transitions
+		tick := false
 		sel := workflow.NewSelector(ctx)
 		sel.AddReceive(signals.heartbeat, func(c workflow.ReceiveChannel, _ bool) {
 			var h HeartbeatSignal
 			c.Receive(ctx, &h)
-			state.applyHeartbeat(h)
+			applied = state.applyHeartbeat(h)
 		})
 		sel.AddReceive(signals.issued, func(c workflow.ReceiveChannel, _ bool) {
 			var cmd CommandIssuedSignal
 			c.Receive(ctx, &cmd)
-			state.applyCommandIssued(cmd)
+			applied = state.applyCommandIssued(cmd)
 		})
 		sel.AddReceive(signals.result, func(c workflow.ReceiveChannel, _ bool) {
 			var r CommandResultSignal
 			c.Receive(ctx, &r)
-			state.applyCommandResult(r)
+			applied = state.applyCommandResult(r)
 		})
 		sel.AddReceive(signals.config, func(c workflow.ReceiveChannel, _ bool) {
 			var change ConfigChangedSignal
 			c.Receive(ctx, &change)
-			state.applyConfigChanged(change)
+			applied = state.applyConfigChanged(change)
 		})
 		if dispatch != nil {
 			sel.AddFuture(dispatch, func(f workflow.Future) {
@@ -134,7 +191,31 @@ func DeviceWorkflow(ctx workflow.Context, state deviceState) error {
 				dispatch, dispatching = nil, ""
 			})
 		}
+		if snapshot != nil {
+			sel.AddFuture(snapshot, func(f workflow.Future) {
+				if err := f.Get(ctx, nil); err != nil {
+					// A lost snapshot write costs at most one snapshot interval of
+					// staleness — the periodic snapshot bounds it — and never disturbs
+					// the entity.
+					workflow.GetLogger(ctx).Error("snapshot device state failed",
+						"device_id", state.DeviceID, "error", err)
+				}
+				snapshot = nil
+				if snapshotPending {
+					snapshotPending = false
+					snapshot = workflow.ExecuteActivity(snapshotCtx, SnapshotActivityName,
+						snapshotOf(state, workflow.Now(ctx)))
+				}
+			})
+		}
+		if timer != nil {
+			sel.AddFuture(timer, func(workflow.Future) {
+				timer = nil
+				tick = true
+			})
+		}
 		sel.Select(ctx)
+		schedule(applied, tick)
 	}
 }
 

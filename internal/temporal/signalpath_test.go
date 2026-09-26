@@ -49,7 +49,7 @@ func TestSignalPathEndToEnd(t *testing.T) {
 	t.Parallel()
 
 	dispatcher := &fakeDispatcher{}
-	env := newDeviceWorkflowEnvWith(NewDispatchActivity(dispatcher))
+	env := newDeviceWorkflowEnvWith(NewDispatchActivity(dispatcher), &snapshotRecorder{})
 	signaler := NewSignaler(&envSignalClient{env: env}, "fleetops", testSettings())
 	rec := devices.Record{ID: "dev-1", Model: "oak-s3", Region: "eu-west"}
 	hbTime := time.Unix(1000, 0)
