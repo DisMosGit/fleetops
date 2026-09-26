@@ -74,6 +74,7 @@ func (c *Client) writeLoop(ctx context.Context, stream stream, ready <-chan stru
 			case env = <-heartbeatQueue: // never fires while the gate is closed
 			case <-ready:
 				heartbeatQueue = c.heartbeats
+				ready = nil // the gate opens once; a closed channel must not re-fire
 				continue
 			case <-ctx.Done():
 				return nil
