@@ -679,7 +679,8 @@ func (x *Heartbeat) GetHealth() float64 {
 }
 
 // FirmwareDownloadRequest pulls a firmware binary by id. The agent issues it after a
-// StartUpdate command and assembles the chunks returned on the same correlation id.
+// StartUpdate command and assembles the chunks the transfer returns — on the Connect
+// stream under the request's correlation id, or on the DownloadFirmware server stream.
 type FirmwareDownloadRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Device that will apply the firmware.
@@ -750,7 +751,10 @@ type FirmwareDownloadResponse struct {
 	// Byte offset of this chunk within the complete binary.
 	Offset int64 `protobuf:"varint,5,opt,name=offset,proto3" json:"offset,omitempty"`
 	// End-of-transfer marker: true on the final message of the download.
-	Eof           bool `protobuf:"varint,6,opt,name=eof,proto3" json:"eof,omitempty"`
+	Eof bool `protobuf:"varint,6,opt,name=eof,proto3" json:"eof,omitempty"`
+	// Total size of the complete binary, for the agent to size what it assembles and
+	// report download progress; set on the stream's opening message.
+	TotalSize     int64 `protobuf:"varint,7,opt,name=total_size,json=totalSize,proto3" json:"total_size,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -825,6 +829,13 @@ func (x *FirmwareDownloadResponse) GetEof() bool {
 		return x.Eof
 	}
 	return false
+}
+
+func (x *FirmwareDownloadResponse) GetTotalSize() int64 {
+	if x != nil {
+		return x.TotalSize
+	}
+	return 0
 }
 
 // UpdateStatusRequest reports firmware-update progress for one device. Fine-grained and
@@ -1346,7 +1357,7 @@ const file_agent_v1_agent_proto_rawDesc = "" +
 	"\x17FirmwareDownloadRequest\x12\x1b\n" +
 	"\tdevice_id\x18\x01 \x01(\tR\bdeviceId\x12\x1f\n" +
 	"\vfirmware_id\x18\x02 \x01(\tR\n" +
-	"firmwareId\"\xb1\x01\n" +
+	"firmwareId\"\xd0\x01\n" +
 	"\x18FirmwareDownloadResponse\x12\x1f\n" +
 	"\vfirmware_id\x18\x01 \x01(\tR\n" +
 	"firmwareId\x12\x18\n" +
@@ -1354,7 +1365,9 @@ const file_agent_v1_agent_proto_rawDesc = "" +
 	"\bchecksum\x18\x03 \x01(\tR\bchecksum\x12\x14\n" +
 	"\x05chunk\x18\x04 \x01(\fR\x05chunk\x12\x16\n" +
 	"\x06offset\x18\x05 \x01(\x03R\x06offset\x12\x10\n" +
-	"\x03eof\x18\x06 \x01(\bR\x03eof\"\xcc\x01\n" +
+	"\x03eof\x18\x06 \x01(\bR\x03eof\x12\x1d\n" +
+	"\n" +
+	"total_size\x18\a \x01(\x03R\ttotalSize\"\xcc\x01\n" +
 	"\x13UpdateStatusRequest\x12\x1b\n" +
 	"\tdevice_id\x18\x01 \x01(\tR\bdeviceId\x12\x1f\n" +
 	"\vfirmware_id\x18\x02 \x01(\tR\n" +
@@ -1398,10 +1411,11 @@ const file_agent_v1_agent_proto_rawDesc = "" +
 	"\x0eCommandOutcome\x12\x1f\n" +
 	"\x1bCOMMAND_OUTCOME_UNSPECIFIED\x10\x00\x12\x1d\n" +
 	"\x19COMMAND_OUTCOME_SUCCEEDED\x10\x01\x12\x1a\n" +
-	"\x16COMMAND_OUTCOME_FAILED\x10\x022\xb2\x01\n" +
+	"\x16COMMAND_OUTCOME_FAILED\x10\x022\xa1\x02\n" +
 	"\fAgentService\x12S\n" +
 	"\aConnect\x12 .fleetops.agent.v1.AgentEnvelope\x1a\".fleetops.agent.v1.ControlEnvelope(\x010\x01\x12M\n" +
-	"\x06Report\x12 .fleetops.agent.v1.ReportRequest\x1a!.fleetops.agent.v1.ReportResponseB:Z8github.com/DisMosGit/fleetops/api/proto/agent/v1;agentv1b\x06proto3"
+	"\x06Report\x12 .fleetops.agent.v1.ReportRequest\x1a!.fleetops.agent.v1.ReportResponse\x12m\n" +
+	"\x10DownloadFirmware\x12*.fleetops.agent.v1.FirmwareDownloadRequest\x1a+.fleetops.agent.v1.FirmwareDownloadResponse0\x01B:Z8github.com/DisMosGit/fleetops/api/proto/agent/v1;agentv1b\x06proto3"
 
 var (
 	file_agent_v1_agent_proto_rawDescOnce sync.Once
@@ -1452,10 +1466,12 @@ var file_agent_v1_agent_proto_depIdxs = []int32{
 	1,  // 12: fleetops.agent.v1.ReportRequest.outcome:type_name -> fleetops.agent.v1.CommandOutcome
 	2,  // 13: fleetops.agent.v1.AgentService.Connect:input_type -> fleetops.agent.v1.AgentEnvelope
 	14, // 14: fleetops.agent.v1.AgentService.Report:input_type -> fleetops.agent.v1.ReportRequest
-	3,  // 15: fleetops.agent.v1.AgentService.Connect:output_type -> fleetops.agent.v1.ControlEnvelope
-	15, // 16: fleetops.agent.v1.AgentService.Report:output_type -> fleetops.agent.v1.ReportResponse
-	15, // [15:17] is the sub-list for method output_type
-	13, // [13:15] is the sub-list for method input_type
+	7,  // 15: fleetops.agent.v1.AgentService.DownloadFirmware:input_type -> fleetops.agent.v1.FirmwareDownloadRequest
+	3,  // 16: fleetops.agent.v1.AgentService.Connect:output_type -> fleetops.agent.v1.ControlEnvelope
+	15, // 17: fleetops.agent.v1.AgentService.Report:output_type -> fleetops.agent.v1.ReportResponse
+	8,  // 18: fleetops.agent.v1.AgentService.DownloadFirmware:output_type -> fleetops.agent.v1.FirmwareDownloadResponse
+	16, // [16:19] is the sub-list for method output_type
+	13, // [13:16] is the sub-list for method input_type
 	13, // [13:13] is the sub-list for extension type_name
 	13, // [13:13] is the sub-list for extension extendee
 	0,  // [0:13] is the sub-list for field type_name

@@ -15,8 +15,8 @@ option go_package = "github.com/DisMosGit/fleetops/api/proto/agent/v1;agentv1";
 import "google/protobuf/timestamp.proto";
 
 // AgentService is the control-plane surface every device agent speaks: one bidirectional
-// stream for the live conversation (heartbeats up, commands down) and one unary call for
-// command results that must survive stream loss.
+// stream for the live conversation (heartbeats up, commands down), one unary call for
+// command results that must survive stream loss, and one server stream per firmware download.
 service AgentService {
   // Connect is one long-lived bidirectional stream per agent. AgentEnvelope carries
   // registration, heartbeats, and the agent-initiated request/response exchanges;
@@ -30,6 +30,14 @@ service AgentService {
   // command's effects: a key already seen is accepted again with no second effect, and a
   // report without a key is rejected as INVALID_ARGUMENT.
   rpc Report(ReportRequest) returns (ReportResponse);
+
+  // DownloadFirmware streams one firmware binary to the agent as bounded chunks over a
+  // server stream. The agent issues it after a StartUpdate command; the stream opens with
+  // the metadata message (version, checksum, total size, no chunk), carries the binary in
+  // offset-ordered chunks, and closes with the end-of-transfer marker, so neither side ever
+  // holds the whole binary in memory. It reuses the firmware download messages of the
+  // Connect exchange; that exchange stays frozen and is not served.
+  rpc DownloadFirmware(FirmwareDownloadRequest) returns (stream FirmwareDownloadResponse);
 }
 
 // AgentEnvelope is one message from agent to control plane on the Connect stream. The
@@ -121,7 +129,8 @@ message Heartbeat {
 }
 
 // FirmwareDownloadRequest pulls a firmware binary by id. The agent issues it after a
-// StartUpdate command and assembles the chunks returned on the same correlation id.
+// StartUpdate command and assembles the chunks the transfer returns — on the Connect
+// stream under the request's correlation id, or on the DownloadFirmware server stream.
 message FirmwareDownloadRequest {
   // Device that will apply the firmware.
   string device_id = 1;
@@ -145,6 +154,9 @@ message FirmwareDownloadResponse {
   int64 offset = 5;
   // End-of-transfer marker: true on the final message of the download.
   bool eof = 6;
+  // Total size of the complete binary, for the agent to size what it assembles and
+  // report download progress; set on the stream's opening message.
+  int64 total_size = 7;
 }
 
 // UpdateStatusRequest reports firmware-update progress for one device. Fine-grained and

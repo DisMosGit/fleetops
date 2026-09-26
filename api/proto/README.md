@@ -2,7 +2,8 @@
 
 v1 `.proto` contracts for FleetOps' bounded contexts (one proto package per bounded context,
 messages never shared across services) and the Go code generated from them. v1 freezes at the end
-of stage 1; afterwards contracts evolve by adding fields only — never renumber, never rewrite.
+of stage 1; afterwards contracts evolve by adding fields, messages, and RPCs only — never
+renumber, never rewrite.
 
 ## The v1 agent ↔ control-plane contract
 
@@ -16,13 +17,17 @@ of stage 1; afterwards contracts evolve by adding fields only — never renumber
 - **`AgentService.Report`** — unary command-result reporting. `ReportRequest` carries an
   idempotency key (a redelivered result must be a no-op), the `command_id`, the `device_id`, and
   the terminal `CommandOutcome`.
+- **`AgentService.DownloadFirmware`** — server-streaming firmware delivery. The stream opens
+  with a metadata message (`version`, `checksum`, `total_size`, no chunk), carries the binary in
+  bounded offset-ordered chunks, and closes with the `eof` marker. It reuses the firmware
+  download messages of the Connect exchange; that exchange stays frozen and is not served.
 
 Message vocabulary:
 
 | Exchange | Messages | Carries |
 |----------|----------|---------|
 | Device registration | `RegisterDeviceRequest` / `RegisterDeviceResponse` | `device_id`, `model`, `region`, `current_fw` → acceptance + resulting `status` |
-| Firmware download | `FirmwareDownloadRequest` / `FirmwareDownloadResponse` | `firmware_id` → `version`, `checksum`, bounded `chunk` + `offset` + `eof` marker |
+| Firmware download | `FirmwareDownloadRequest` / `FirmwareDownloadResponse` | `firmware_id` → `version`, `checksum`, `total_size`, bounded `chunk` + `offset` + `eof` marker |
 | Update status | `UpdateStatusRequest` / `UpdateStatusResponse` | `device_id`, `firmware_id`, `UpdatePhase`, `progress_percent`, failure `detail` → acknowledgment |
 | Heartbeat | `Heartbeat` (fire-and-forget) | `event_id`, `device_id`, `current_fw`, `status`, `ts`, `cpu`, `mem`, `health` |
 | Commands | `Command` (`StartUpdate`, `AbortUpdate`) | `command_id`, `device_id`, typed payload |

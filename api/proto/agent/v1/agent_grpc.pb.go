@@ -29,8 +29,9 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	AgentService_Connect_FullMethodName = "/fleetops.agent.v1.AgentService/Connect"
-	AgentService_Report_FullMethodName  = "/fleetops.agent.v1.AgentService/Report"
+	AgentService_Connect_FullMethodName          = "/fleetops.agent.v1.AgentService/Connect"
+	AgentService_Report_FullMethodName           = "/fleetops.agent.v1.AgentService/Report"
+	AgentService_DownloadFirmware_FullMethodName = "/fleetops.agent.v1.AgentService/DownloadFirmware"
 )
 
 // AgentServiceClient is the client API for AgentService service.
@@ -38,8 +39,8 @@ const (
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
 // AgentService is the control-plane surface every device agent speaks: one bidirectional
-// stream for the live conversation (heartbeats up, commands down) and one unary call for
-// command results that must survive stream loss.
+// stream for the live conversation (heartbeats up, commands down), one unary call for
+// command results that must survive stream loss, and one server stream per firmware download.
 type AgentServiceClient interface {
 	// Connect is one long-lived bidirectional stream per agent. AgentEnvelope carries
 	// registration, heartbeats, and the agent-initiated request/response exchanges;
@@ -52,6 +53,13 @@ type AgentServiceClient interface {
 	// command's effects: a key already seen is accepted again with no second effect, and a
 	// report without a key is rejected as INVALID_ARGUMENT.
 	Report(ctx context.Context, in *ReportRequest, opts ...grpc.CallOption) (*ReportResponse, error)
+	// DownloadFirmware streams one firmware binary to the agent as bounded chunks over a
+	// server stream. The agent issues it after a StartUpdate command; the stream opens with
+	// the metadata message (version, checksum, total size, no chunk), carries the binary in
+	// offset-ordered chunks, and closes with the end-of-transfer marker, so neither side ever
+	// holds the whole binary in memory. It reuses the firmware download messages of the
+	// Connect exchange; that exchange stays frozen and is not served.
+	DownloadFirmware(ctx context.Context, in *FirmwareDownloadRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[FirmwareDownloadResponse], error)
 }
 
 type agentServiceClient struct {
@@ -85,13 +93,32 @@ func (c *agentServiceClient) Report(ctx context.Context, in *ReportRequest, opts
 	return out, nil
 }
 
+func (c *agentServiceClient) DownloadFirmware(ctx context.Context, in *FirmwareDownloadRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[FirmwareDownloadResponse], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &AgentService_ServiceDesc.Streams[1], AgentService_DownloadFirmware_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[FirmwareDownloadRequest, FirmwareDownloadResponse]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type AgentService_DownloadFirmwareClient = grpc.ServerStreamingClient[FirmwareDownloadResponse]
+
 // AgentServiceServer is the server API for AgentService service.
 // All implementations must embed UnimplementedAgentServiceServer
 // for forward compatibility.
 //
 // AgentService is the control-plane surface every device agent speaks: one bidirectional
-// stream for the live conversation (heartbeats up, commands down) and one unary call for
-// command results that must survive stream loss.
+// stream for the live conversation (heartbeats up, commands down), one unary call for
+// command results that must survive stream loss, and one server stream per firmware download.
 type AgentServiceServer interface {
 	// Connect is one long-lived bidirectional stream per agent. AgentEnvelope carries
 	// registration, heartbeats, and the agent-initiated request/response exchanges;
@@ -104,6 +131,13 @@ type AgentServiceServer interface {
 	// command's effects: a key already seen is accepted again with no second effect, and a
 	// report without a key is rejected as INVALID_ARGUMENT.
 	Report(context.Context, *ReportRequest) (*ReportResponse, error)
+	// DownloadFirmware streams one firmware binary to the agent as bounded chunks over a
+	// server stream. The agent issues it after a StartUpdate command; the stream opens with
+	// the metadata message (version, checksum, total size, no chunk), carries the binary in
+	// offset-ordered chunks, and closes with the end-of-transfer marker, so neither side ever
+	// holds the whole binary in memory. It reuses the firmware download messages of the
+	// Connect exchange; that exchange stays frozen and is not served.
+	DownloadFirmware(*FirmwareDownloadRequest, grpc.ServerStreamingServer[FirmwareDownloadResponse]) error
 	mustEmbedUnimplementedAgentServiceServer()
 }
 
@@ -119,6 +153,9 @@ func (UnimplementedAgentServiceServer) Connect(grpc.BidiStreamingServer[AgentEnv
 }
 func (UnimplementedAgentServiceServer) Report(context.Context, *ReportRequest) (*ReportResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Report not implemented")
+}
+func (UnimplementedAgentServiceServer) DownloadFirmware(*FirmwareDownloadRequest, grpc.ServerStreamingServer[FirmwareDownloadResponse]) error {
+	return status.Error(codes.Unimplemented, "method DownloadFirmware not implemented")
 }
 func (UnimplementedAgentServiceServer) mustEmbedUnimplementedAgentServiceServer() {}
 func (UnimplementedAgentServiceServer) testEmbeddedByValue()                      {}
@@ -166,6 +203,17 @@ func _AgentService_Report_Handler(srv interface{}, ctx context.Context, dec func
 	return interceptor(ctx, in, info, handler)
 }
 
+func _AgentService_DownloadFirmware_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(FirmwareDownloadRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(AgentServiceServer).DownloadFirmware(m, &grpc.GenericServerStream[FirmwareDownloadRequest, FirmwareDownloadResponse]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type AgentService_DownloadFirmwareServer = grpc.ServerStreamingServer[FirmwareDownloadResponse]
+
 // AgentService_ServiceDesc is the grpc.ServiceDesc for AgentService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -184,6 +232,11 @@ var AgentService_ServiceDesc = grpc.ServiceDesc{
 			Handler:       _AgentService_Connect_Handler,
 			ServerStreams: true,
 			ClientStreams: true,
+		},
+		{
+			StreamName:    "DownloadFirmware",
+			Handler:       _AgentService_DownloadFirmware_Handler,
+			ServerStreams: true,
 		},
 	},
 	Metadata: "agent/v1/agent.proto",
