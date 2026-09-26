@@ -118,7 +118,22 @@ type fakeService struct {
 	// connect, when set, builds the stream for each call; a nil stream with nil error is a
 	// connection failure.
 	connect func(ctx context.Context, call int) (*fakeStream, error)
-	calls   int
+	// download, when set, builds the firmware download stream for each call.
+	download func(ctx context.Context, req *agentv1.FirmwareDownloadRequest) (agentv1.AgentService_DownloadFirmwareClient, error)
+	calls    int
+}
+
+// DownloadFirmware returns the configured download stream, or a failure when the fake has
+// none: firmware delivery is exercised by the downloader's own tests.
+func (f *fakeService) DownloadFirmware(
+	ctx context.Context,
+	req *agentv1.FirmwareDownloadRequest,
+	_ ...grpc.CallOption,
+) (agentv1.AgentService_DownloadFirmwareClient, error) {
+	if f.download == nil {
+		return nil, errors.New("downloads not configured")
+	}
+	return f.download(ctx, req)
 }
 
 func (f *fakeService) Connect(ctx context.Context, _ ...grpc.CallOption) (
