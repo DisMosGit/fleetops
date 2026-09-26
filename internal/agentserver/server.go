@@ -5,11 +5,13 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	agentv1 "github.com/DisMosGit/fleetops/api/proto/agent/v1"
+	"github.com/DisMosGit/fleetops/internal/devices"
 )
 
 // sessionQueueBound bounds the per-session outbound queue: commands wait for queue space until
@@ -17,18 +19,21 @@ import (
 const sessionQueueBound = 32
 
 // Server is the control-plane side of AgentService: it accepts agent streams, completes the
-// registration exchange, routes heartbeats to the hub, and lets the hub push commands back
-// over the same stream. Report stays unimplemented until the command-result stage.
+// registration exchange and records its device in the registry, routes heartbeats to the hub,
+// and lets the hub push commands back over the same stream. Report stays unimplemented until
+// the command-result stage.
 type Server struct {
 	agentv1.UnimplementedAgentServiceServer
 
-	hub *Hub
-	log *slog.Logger
+	hub      *Hub
+	registry DeviceRegistry
+	log      *slog.Logger
 }
 
-// NewServer returns an AgentService server backed by hub.
-func NewServer(hub *Hub, log *slog.Logger) *Server {
-	return &Server{hub: hub, log: log}
+// NewServer returns an AgentService server backed by hub and recording accepted devices in
+// registry.
+func NewServer(hub *Hub, registry DeviceRegistry, log *slog.Logger) *Server {
+	return &Server{hub: hub, registry: registry, log: log}
 }
 
 // Connect serves one agent stream end to end: registrations enroll devices, heartbeats route
@@ -40,7 +45,7 @@ func (s *Server) Connect(stream agentv1.AgentService_ConnectServer) error {
 
 	sess := &session{
 		send:    make(chan *agentv1.ControlEnvelope, sessionQueueBound),
-		devices: make(map[string]struct{}),
+		devices: make(map[string]devices.Record),
 	}
 	writerDone := make(chan error, 1)
 	go func() { writerDone <- sess.writeLoop(ctx, stream) }()
@@ -109,8 +114,9 @@ func (s *Server) handle(
 	}
 }
 
-// register answers one registration exchange and enrolls the device only when the request is
-// complete and accepted.
+// register answers one registration exchange, recording the device in the registry and
+// enrolling it only when the request is complete and the record could be persisted: a
+// registration the registry cannot store is rejected and enrolls nothing.
 func (s *Server) register(
 	ctx context.Context,
 	sess *session,
@@ -121,20 +127,36 @@ func (s *Server) register(
 		return status.Error(codes.InvalidArgument, "registration without correlation id")
 	}
 
-	resp := &agentv1.RegisterDeviceResponse{DeviceId: req.GetDeviceId()}
+	rec := devices.Record{
+		ID:        req.GetDeviceId(),
+		Model:     req.GetModel(),
+		Region:    req.GetRegion(),
+		CurrentFw: req.GetCurrentFw(),
+		Status:    devices.StatusOnline,
+		LastSeen:  time.Now(),
+	}
+
+	resp := &agentv1.RegisterDeviceResponse{DeviceId: rec.ID}
 	switch {
-	case req.GetDeviceId() == "":
+	case rec.ID == "":
 		resp.Reason = "device id required"
-	case req.GetModel() == "":
+	case rec.Model == "":
 		resp.Reason = "model required"
-	case req.GetRegion() == "":
+	case rec.Region == "":
 		resp.Reason = "region required"
-	case req.GetCurrentFw() == "":
+	case rec.CurrentFw == "":
 		resp.Reason = "current firmware required"
 	default:
+		if err := s.registry.Upsert(ctx, rec); err != nil {
+			// The device record is the source of truth: an acceptance that could not be
+			// recorded is a rejection, with an operator-safe reason and nothing enrolled.
+			s.log.Error("record device registration", "device_id", rec.ID, "err", err)
+			resp.Reason = "device registry unavailable"
+			break
+		}
 		resp.Accepted = true
-		resp.Status = "online"
-		s.hub.enroll(req.GetDeviceId(), sess)
+		resp.Status = rec.Status
+		s.hub.enroll(rec, sess)
 	}
 
 	return s.respond(ctx, sess, &agentv1.ControlEnvelope{
@@ -143,20 +165,27 @@ func (s *Server) register(
 	})
 }
 
-// heartbeat routes one heartbeat from an enrolled device; a heartbeat from a device this
-// stream never enrolled is dropped, never routed.
+// heartbeat routes one heartbeat from an enrolled device, together with the identity it
+// registered with; a heartbeat from a device this stream never enrolled is dropped, never
+// routed.
 func (s *Server) heartbeat(ctx context.Context, sess *session, hb *agentv1.Heartbeat) error {
-	if hb.GetEventId() == "" || hb.GetDeviceId() == "" {
+	switch {
+	case hb.GetEventId() == "" || hb.GetDeviceId() == "":
 		return status.Error(codes.InvalidArgument, "heartbeat without event id or device id")
+	case hb.GetTs() == nil:
+		// A measurement time is what keys the telemetry document; without it there is
+		// nothing truthful to store, and a zero ts would expire out of the TTL index at once.
+		return status.Error(codes.InvalidArgument, "heartbeat without measurement time")
 	}
-	if !s.hub.enrolled(hb.GetDeviceId(), sess) {
+	rec, ok := s.hub.identity(hb.GetDeviceId(), sess)
+	if !ok {
 		s.log.Warn("heartbeat from unenrolled device dropped",
 			"device_id", hb.GetDeviceId(), "event_id", hb.GetEventId())
 		return nil
 	}
-	if err := s.hub.route(ctx, hb); err != nil {
+	if err := s.hub.route(ctx, hb, rec); err != nil {
 		// Heartbeats are fire-and-forget: a sink failure is logged at this boundary and the
-		// stream stays up. Persistence and retry belong to the telemetry stage behind the
+		// stream stays up. Retry and idempotence belong to the ingest pipeline behind the
 		// sink.
 		s.log.Error("route heartbeat",
 			"device_id", hb.GetDeviceId(), "event_id", hb.GetEventId(), "err", err)

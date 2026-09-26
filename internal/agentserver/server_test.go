@@ -14,37 +14,69 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	agentv1 "github.com/DisMosGit/fleetops/api/proto/agent/v1"
+	"github.com/DisMosGit/fleetops/internal/devices"
 )
 
 // fakeSink is a hand-written HeartbeatSink double recording what it receives.
 type fakeSink struct {
 	mu         sync.Mutex
-	heartbeats []*agentv1.Heartbeat
+	heartbeats []handled
 	err        error
 }
 
-func (s *fakeSink) Handle(_ context.Context, hb *agentv1.Heartbeat) error {
+// handled is one routed heartbeat as the sink saw it: the message and the identity the device
+// registered with.
+type handled struct {
+	hb  *agentv1.Heartbeat
+	rec devices.Record
+}
+
+func (s *fakeSink) Handle(_ context.Context, hb *agentv1.Heartbeat, rec devices.Record) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.heartbeats = append(s.heartbeats, hb)
+	s.heartbeats = append(s.heartbeats, handled{hb: hb, rec: rec})
 	return s.err
 }
 
-func (s *fakeSink) recorded() []*agentv1.Heartbeat {
+func (s *fakeSink) recorded() []handled {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return append([]*agentv1.Heartbeat(nil), s.heartbeats...)
+	return append([]handled(nil), s.heartbeats...)
+}
+
+// fakeRegistry is a hand-written DeviceRegistry double recording upserts.
+type fakeRegistry struct {
+	mu      sync.Mutex
+	records []devices.Record
+	err     error
+}
+
+func (r *fakeRegistry) Upsert(_ context.Context, rec devices.Record) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.err != nil {
+		return r.err
+	}
+	r.records = append(r.records, rec)
+	return nil
+}
+
+func (r *fakeRegistry) recorded() []devices.Record {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]devices.Record(nil), r.records...)
 }
 
 // startServer serves hub over an in-memory listener with the production server options and
 // returns a connection to it.
-func startServer(t *testing.T, hub *Hub) *grpc.ClientConn {
+func startServer(t *testing.T, hub *Hub, registry DeviceRegistry) *grpc.ClientConn {
 	t.Helper()
 	lis := bufconn.Listen(1 << 20)
 	server := grpc.NewServer(ServerOptions(slog.New(slog.DiscardHandler))...)
-	agentv1.RegisterAgentServiceServer(server, NewServer(hub, slog.New(slog.DiscardHandler)))
+	agentv1.RegisterAgentServiceServer(server, NewServer(hub, registry, slog.New(slog.DiscardHandler)))
 	go func() {
 		_ = server.Serve(lis) // ends at Stop
 	}()
@@ -109,23 +141,43 @@ func TestRegistrationAccepted(t *testing.T) {
 	t.Parallel()
 
 	sink := &fakeSink{}
+	registry := &fakeRegistry{}
 	hub := NewHub(sink, slog.New(slog.DiscardHandler))
-	stream := openStream(t, startServer(t, hub))
+	stream := openStream(t, startServer(t, hub, registry))
 
+	before := time.Now()
 	reg := registerDevice(t, stream, "corr-1", "device-0", "oak-s3", "eu-west", "1.0.0")
+	after := time.Now()
 	if !reg.GetAccepted() {
 		t.Fatalf("registration rejected: %s", reg.GetReason())
 	}
 	if reg.GetDeviceId() != "device-0" || reg.GetStatus() != "online" {
 		t.Errorf("response = %+v, want device-0 online", reg)
 	}
+
+	got := registry.recorded()
+	if len(got) != 1 {
+		t.Fatalf("registry recorded %d upserts, want 1", len(got))
+	}
+	rec := got[0]
+	if rec.ID != "device-0" || rec.Model != "oak-s3" || rec.Region != "eu-west" || rec.CurrentFw != "1.0.0" {
+		t.Errorf("registered record = %+v, want the submitted identity", rec)
+	}
+	if rec.Status != devices.StatusOnline {
+		t.Errorf("registered status = %q, want %q", rec.Status, devices.StatusOnline)
+	}
+	if rec.LastSeen.Before(before) || rec.LastSeen.After(after) {
+		t.Errorf("registered last seen = %v, want the acceptance time within [%v, %v]",
+			rec.LastSeen, before, after)
+	}
 }
 
-func TestRegistrationRejectedEnrollsNothing(t *testing.T) {
+func TestRegistrationRejectedWritesNothing(t *testing.T) {
 	t.Parallel()
 
+	registry := &fakeRegistry{}
 	hub := NewHub(&fakeSink{}, slog.New(slog.DiscardHandler))
-	stream := openStream(t, startServer(t, hub))
+	stream := openStream(t, startServer(t, hub, registry))
 
 	reg := registerDevice(t, stream, "corr-1", "device-0", "", "eu-west", "1.0.0")
 	if reg.GetAccepted() {
@@ -133,6 +185,9 @@ func TestRegistrationRejectedEnrollsNothing(t *testing.T) {
 	}
 	if reg.GetReason() == "" {
 		t.Error("rejected registration must carry a reason")
+	}
+	if got := registry.recorded(); len(got) != 0 {
+		t.Errorf("registry recorded %+v, want no writes for a rejected registration", got)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -142,17 +197,40 @@ func TestRegistrationRejectedEnrollsNothing(t *testing.T) {
 	}
 }
 
+func TestRegistrationRejectedWhenRegistryUnavailable(t *testing.T) {
+	t.Parallel()
+
+	registry := &fakeRegistry{err: errors.New("mongo is down")}
+	hub := NewHub(&fakeSink{}, slog.New(slog.DiscardHandler))
+	stream := openStream(t, startServer(t, hub, registry))
+
+	reg := registerDevice(t, stream, "corr-1", "device-0", "oak-s3", "eu-west", "1.0.0")
+	if reg.GetAccepted() {
+		t.Fatal("registration must be rejected when the device record cannot be stored")
+	}
+	if reg.GetReason() == "" {
+		t.Error("rejected registration must carry a reason")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := hub.Send(ctx, &agentv1.Command{CommandId: "cmd-1", DeviceId: "device-0"}); !errors.Is(err, ErrNotFound) {
+		t.Errorf("dispatch to an unstored device = %v, want ErrNotFound", err)
+	}
+}
+
 func TestHeartbeatRoutedUnchanged(t *testing.T) {
 	t.Parallel()
 
 	sink := &fakeSink{}
 	hub := NewHub(sink, slog.New(slog.DiscardHandler))
-	stream := openStream(t, startServer(t, hub))
+	stream := openStream(t, startServer(t, hub, &fakeRegistry{}))
 	registerDevice(t, stream, "corr-1", "device-0", "oak-s3", "eu-west", "1.0.0")
 
 	want := &agentv1.Heartbeat{
 		EventId: "evt-1", DeviceId: "device-0", CurrentFw: "1.0.0",
 		Status: "online", Cpu: 0.3, Mem: 0.4, Health: 0.9,
+		Ts: timestamppb.New(time.Now()),
 	}
 	if err := stream.Send(&agentv1.AgentEnvelope{
 		Payload: &agentv1.AgentEnvelope_Heartbeat{Heartbeat: want},
@@ -168,9 +246,39 @@ func TestHeartbeatRoutedUnchanged(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("sink received %d heartbeats, want 1", len(got))
 	}
-	if got[0].GetEventId() != want.GetEventId() || got[0].GetHealth() != want.GetHealth() ||
-		got[0].GetCurrentFw() != want.GetCurrentFw() {
-		t.Errorf("routed heartbeat = %+v, want %+v", got[0], want)
+	if got[0].hb.GetEventId() != want.GetEventId() || got[0].hb.GetHealth() != want.GetHealth() ||
+		got[0].hb.GetCurrentFw() != want.GetCurrentFw() {
+		t.Errorf("routed heartbeat = %+v, want %+v", got[0].hb, want)
+	}
+	if got[0].rec.ID != "device-0" || got[0].rec.Model != "oak-s3" || got[0].rec.Region != "eu-west" {
+		t.Errorf("routed identity = %+v, want the registered identity of device-0", got[0].rec)
+	}
+}
+
+func TestHeartbeatWithoutMeasurementTimeNotPersisted(t *testing.T) {
+	t.Parallel()
+
+	sink := &fakeSink{}
+	registry := &fakeRegistry{}
+	hub := NewHub(sink, slog.New(slog.DiscardHandler))
+	stream := openStream(t, startServer(t, hub, registry))
+	registerDevice(t, stream, "corr-1", "device-0", "oak-s3", "eu-west", "1.0.0")
+
+	if err := stream.Send(&agentv1.AgentEnvelope{
+		Payload: &agentv1.AgentEnvelope_Heartbeat{Heartbeat: &agentv1.Heartbeat{
+			EventId: "evt-1", DeviceId: "device-0",
+		}},
+	}); err != nil {
+		t.Fatalf("send heartbeat: %v", err)
+	}
+	if _, err := stream.Recv(); status.Code(err) != codes.InvalidArgument {
+		t.Errorf("stream error = %v, want InvalidArgument", err)
+	}
+	if got := sink.recorded(); len(got) != 0 {
+		t.Errorf("sink received %+v, want no heartbeat without a measurement time", got)
+	}
+	if got := registry.recorded(); len(got) != 1 {
+		t.Errorf("registry recorded %d upserts, want only the registration write", len(got))
 	}
 }
 
@@ -179,13 +287,13 @@ func TestUnenrolledHeartbeatNotRouted(t *testing.T) {
 
 	sink := &fakeSink{}
 	hub := NewHub(sink, slog.New(slog.DiscardHandler))
-	stream := openStream(t, startServer(t, hub))
+	stream := openStream(t, startServer(t, hub, &fakeRegistry{}))
 
 	// First a heartbeat from a device this stream never enrolled: dropped. Then one from an
 	// enrolled device: routed. Only the latter may reach the sink.
 	if err := stream.Send(&agentv1.AgentEnvelope{
 		Payload: &agentv1.AgentEnvelope_Heartbeat{Heartbeat: &agentv1.Heartbeat{
-			EventId: "evt-x", DeviceId: "device-x",
+			EventId: "evt-x", DeviceId: "device-x", Ts: timestamppb.New(time.Now()),
 		}},
 	}); err != nil {
 		t.Fatalf("send heartbeat: %v", err)
@@ -193,7 +301,7 @@ func TestUnenrolledHeartbeatNotRouted(t *testing.T) {
 	registerDevice(t, stream, "corr-1", "device-0", "oak-s3", "eu-west", "1.0.0")
 	if err := stream.Send(&agentv1.AgentEnvelope{
 		Payload: &agentv1.AgentEnvelope_Heartbeat{Heartbeat: &agentv1.Heartbeat{
-			EventId: "evt-1", DeviceId: "device-0",
+			EventId: "evt-1", DeviceId: "device-0", Ts: timestamppb.New(time.Now()),
 		}},
 	}); err != nil {
 		t.Fatalf("send heartbeat: %v", err)
@@ -204,7 +312,7 @@ func TestUnenrolledHeartbeatNotRouted(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 	got := sink.recorded()
-	if len(got) != 1 || got[0].GetEventId() != "evt-1" {
+	if len(got) != 1 || got[0].hb.GetEventId() != "evt-1" {
 		t.Errorf("sink received %+v, want only evt-1", got)
 	}
 }
@@ -213,7 +321,7 @@ func TestCommandDispatchTargetsOneStream(t *testing.T) {
 	t.Parallel()
 
 	hub := NewHub(&fakeSink{}, slog.New(slog.DiscardHandler))
-	conn := startServer(t, hub)
+	conn := startServer(t, hub, &fakeRegistry{})
 	streamA := openStream(t, conn)
 	streamB := openStream(t, conn)
 	registerDevice(t, streamA, "corr-1", "device-a", "oak-s3", "eu-west", "1.0.0")
@@ -277,10 +385,10 @@ func TestDispatchCongestedSessionTimesOut(t *testing.T) {
 	hub := NewHub(&fakeSink{}, slog.New(slog.DiscardHandler))
 	sess := &session{
 		send:    make(chan *agentv1.ControlEnvelope, 1),
-		devices: make(map[string]struct{}),
+		devices: make(map[string]devices.Record),
 	}
 	sess.send <- &agentv1.ControlEnvelope{} // fill the bounded queue: no writer drains it
-	hub.enroll("device-0", sess)
+	hub.enroll(devices.Record{ID: "device-0"}, sess)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
@@ -294,7 +402,7 @@ func TestStreamEndMakesDevicesUnroutable(t *testing.T) {
 	t.Parallel()
 
 	hub := NewHub(&fakeSink{}, slog.New(slog.DiscardHandler))
-	stream := openStream(t, startServer(t, hub))
+	stream := openStream(t, startServer(t, hub, &fakeRegistry{}))
 	registerDevice(t, stream, "corr-1", "device-0", "oak-s3", "eu-west", "1.0.0")
 	if err := stream.CloseSend(); err != nil {
 		t.Fatalf("CloseSend: %v", err)
@@ -344,13 +452,21 @@ func TestMalformedEnvelopeMapsToInvalidArgument(t *testing.T) {
 				Payload: &agentv1.AgentEnvelope_Heartbeat{Heartbeat: &agentv1.Heartbeat{DeviceId: "device-0"}},
 			},
 		},
+		{
+			name: "heartbeat without measurement time",
+			env: &agentv1.AgentEnvelope{
+				Payload: &agentv1.AgentEnvelope_Heartbeat{Heartbeat: &agentv1.Heartbeat{
+					EventId: "evt-1", DeviceId: "device-0",
+				}},
+			},
+		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			hub := NewHub(&fakeSink{}, slog.New(slog.DiscardHandler))
-			stream := openStream(t, startServer(t, hub))
+			stream := openStream(t, startServer(t, hub, &fakeRegistry{}))
 
 			if err := stream.Send(tc.env); err != nil {
 				t.Fatalf("send envelope: %v", err)

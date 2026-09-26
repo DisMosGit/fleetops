@@ -17,6 +17,7 @@ import (
 	agentv1 "github.com/DisMosGit/fleetops/api/proto/agent/v1"
 	"github.com/DisMosGit/fleetops/internal/agent"
 	"github.com/DisMosGit/fleetops/internal/agentserver"
+	"github.com/DisMosGit/fleetops/internal/devices"
 )
 
 // recordingSink is a hand-written HeartbeatSink double recording routed heartbeats.
@@ -25,12 +26,18 @@ type recordingSink struct {
 	heartbeats []*agentv1.Heartbeat
 }
 
-func (s *recordingSink) Handle(_ context.Context, hb *agentv1.Heartbeat) error {
+func (s *recordingSink) Handle(_ context.Context, hb *agentv1.Heartbeat, _ devices.Record) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.heartbeats = append(s.heartbeats, hb)
 	return nil
 }
+
+// nopRegistry is a hand-written DeviceRegistry double that stores nothing: the e2e path under
+// test is stream routing, not persistence.
+type nopRegistry struct{}
+
+func (nopRegistry) Upsert(context.Context, devices.Record) error { return nil }
 
 func (s *recordingSink) count() int {
 	s.mu.Lock()
@@ -126,7 +133,7 @@ func TestFleetEndToEnd(t *testing.T) {
 	server := grpc.NewServer(
 		append(agentserver.ServerOptions(slog.New(slog.DiscardHandler)), grpc.ChainStreamInterceptor(killAfter(4)))...,
 	)
-	agentv1.RegisterAgentServiceServer(server, agentserver.NewServer(hub, slog.New(slog.DiscardHandler)))
+	agentv1.RegisterAgentServiceServer(server, agentserver.NewServer(hub, nopRegistry{}, slog.New(slog.DiscardHandler)))
 
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
