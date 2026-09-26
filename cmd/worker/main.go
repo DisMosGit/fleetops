@@ -1,7 +1,7 @@
-// Command worker runs the FleetOps Temporal workers: it hosts the DeviceWorkflow,
-// RolloutWorkflow, and FirmwareWorkflow implementations together with their activities. It
-// loads the shared configuration and serves the liveness/readiness probes today; the workflow
-// and activity workers join with stage 2.
+// Command worker runs the FleetOps Temporal workers: it hosts the DeviceWorkflow entity and
+// the workflows of later stages together with their activities on the shared task queue. It
+// loads the shared configuration and serves the liveness/readiness probes alongside the
+// worker.
 package main
 
 import (
@@ -18,8 +18,13 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
+	"go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/worker"
+	"go.temporal.io/sdk/workflow"
+
 	"github.com/DisMosGit/fleetops/internal/config"
 	"github.com/DisMosGit/fleetops/internal/health"
+	"github.com/DisMosGit/fleetops/internal/temporal"
 )
 
 // shutdownTimeout bounds graceful shutdown of the probe server.
@@ -46,11 +51,24 @@ func main() {
 	}
 }
 
-// run serves the liveness/readiness probes on the configured health address until ctx is
-// cancelled. The Temporal workflow and activity workers join the same lifecycle at stage 2.
+// run serves the liveness/readiness probes on the configured health address and runs the
+// Temporal worker hosting DeviceWorkflow on the configured task queue until ctx is cancelled.
+// Activities register with the workers that own their side effects: the dispatch-command
+// activity joins the control-plane process beside the agent streams it dispatches on.
 func run(ctx context.Context, cfg config.Config) error {
-	// TODO(stage 2): build the Temporal client on cfg.Temporal and register workflows and
-	// activities on cfg.Temporal.TaskQueue.
+	tc, err := client.Dial(client.Options{
+		HostPort:  cfg.Temporal.Address,
+		Namespace: cfg.Temporal.Namespace,
+	})
+	if err != nil {
+		return fmt.Errorf("connect to temporal: %w", err)
+	}
+	defer tc.Close()
+
+	w := worker.New(tc, cfg.Temporal.TaskQueue, worker.Options{})
+	w.RegisterWorkflowWithOptions(temporal.DeviceWorkflow, workflow.RegisterOptions{
+		Name: temporal.DeviceWorkflowName,
+	})
 
 	checks, err := health.NewDependencyChecks(cfg.MongoDB.URI, cfg.RabbitMQ.URL, cfg.Temporal.Address)
 	if err != nil {
@@ -62,6 +80,18 @@ func run(ctx context.Context, cfg config.Config) error {
 	}
 
 	g, gctx := errgroup.WithContext(ctx)
+	g.Go(func() error {
+		slog.Info("temporal worker started", "task_queue", cfg.Temporal.TaskQueue)
+		stop := make(chan any)
+		go func() {
+			<-gctx.Done()
+			close(stop)
+		}()
+		if err := w.Run(stop); err != nil {
+			return fmt.Errorf("run temporal worker: %w", err)
+		}
+		return nil
+	})
 	g.Go(func() error {
 		slog.Info("probe server listening", "addr", cfg.Observability.HealthAddr)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
