@@ -101,9 +101,11 @@ func (s *Signaler) signalWithStart(
 		return fmt.Errorf("signal %s: device id required", signalName)
 	}
 	workflowID := DeviceWorkflowID(deviceID)
+	// The workflow type is its registered name, not the function value: starting by
+	// reflection would stamp every execution with the function name the UI shows.
 	if _, err := s.client.SignalWithStartWorkflow(ctx, workflowID, signalName, payload,
 		client.StartWorkflowOptions{TaskQueue: s.taskQueue},
-		DeviceWorkflow, newDeviceState(deviceID, s.settings),
+		DeviceWorkflowName, newDeviceState(deviceID, s.settings),
 	); err != nil {
 		return fmt.Errorf("signal %s to %s: %w", signalName, workflowID, err)
 	}

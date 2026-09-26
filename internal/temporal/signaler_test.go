@@ -25,11 +25,12 @@ type fakeSignalClient struct {
 
 // signalCall is one recorded signal-with-start.
 type signalCall struct {
-	workflowID  string
-	signalName  string
-	signalArg   any
-	options     client.StartWorkflowOptions
-	workflowArg any
+	workflowID   string
+	workflowType any
+	signalName   string
+	signalArg    any
+	options      client.StartWorkflowOptions
+	workflowArg  any
 }
 
 func (c *fakeSignalClient) SignalWithStartWorkflow(
@@ -38,7 +39,7 @@ func (c *fakeSignalClient) SignalWithStartWorkflow(
 	signalName string,
 	signalArg any,
 	options client.StartWorkflowOptions,
-	_ any,
+	workflowType any,
 	workflowArgs ...any,
 ) (client.WorkflowRun, error) {
 	c.mu.Lock()
@@ -51,11 +52,12 @@ func (c *fakeSignalClient) SignalWithStartWorkflow(
 		seed = workflowArgs[0]
 	}
 	c.calls = append(c.calls, signalCall{
-		workflowID:  workflowID,
-		signalName:  signalName,
-		signalArg:   signalArg,
-		options:     options,
-		workflowArg: seed,
+		workflowID:   workflowID,
+		workflowType: workflowType,
+		signalName:   signalName,
+		signalArg:    signalArg,
+		options:      options,
+		workflowArg:  seed,
 	})
 	return nil, nil
 }
@@ -107,6 +109,11 @@ func TestSignalerDeliversOneSignalPerCall(t *testing.T) {
 	for i, call := range calls {
 		if call.workflowID != "device-dev-1" {
 			t.Errorf("call %d workflow id = %q, want device-dev-1", i, call.workflowID)
+		}
+		// The run chain starts under the workflow's registered name: starting by function
+		// reflection would stamp executions with a name the UI must not show.
+		if call.workflowType != DeviceWorkflowName {
+			t.Errorf("call %d workflow type = %v, want %q", i, call.workflowType, DeviceWorkflowName)
 		}
 		if call.signalName != wantNames[i] {
 			t.Errorf("call %d signal name = %q, want %q", i, call.signalName, wantNames[i])
