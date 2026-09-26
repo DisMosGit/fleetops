@@ -1,7 +1,7 @@
 // Command agent is the FleetOps device-agent emulator: one process runs N simulated devices as
 // goroutines, each heartbeating to the control plane over the AgentService bidirectional
-// stream, receiving commands, and (at their stage) applying firmware. It loads the shared
-// configuration and runs the fleet until shutdown.
+// stream, receiving commands, and applying firmware through the deterministic stub. It loads
+// the shared configuration and runs the fleet until shutdown.
 package main
 
 import (
@@ -45,12 +45,15 @@ func main() {
 
 // run runs the simulated fleet against the control plane until ctx is cancelled: the fleet
 // emits heartbeats into the stream client, which delivers them over one multiplexed Connect
-// stream and reconnects with backoff when it breaks.
+// stream and reconnects with backoff when it breaks, and dispatched firmware updates are
+// downloaded, applied through the deterministic stub, and reported back.
 func run(ctx context.Context, cfg config.Config) error {
 	seed := time.Now().UnixNano()
 	slog.Info("starting emulator",
 		"control_plane", cfg.GRPC.ControlPlaneAddr,
 		"fleet_size", cfg.Simulation.FleetSize,
+		"apply_delay", cfg.Simulation.ApplyDelay.Duration,
+		"apply_success_rate", cfg.Simulation.ApplySuccessRate,
 		"simulation_seed", seed,
 	)
 
@@ -76,14 +79,46 @@ func run(ctx context.Context, cfg config.Config) error {
 	if err != nil {
 		return fmt.Errorf("build fleet: %w", err)
 	}
-	client, err := agent.NewClient(agentv1.NewAgentServiceClient(conn), agent.Options{
+
+	// Downloaded firmware stages in a per-process directory and leaves with the process.
+	downloadDir, err := os.MkdirTemp("", "fleetops-firmware-")
+	if err != nil {
+		return fmt.Errorf("firmware download directory: %w", err)
+	}
+	defer func() {
+		if err := os.RemoveAll(downloadDir); err != nil {
+			slog.Error("remove firmware download directory", "dir", downloadDir, "err", err)
+		}
+	}()
+
+	svc := agentv1.NewAgentServiceClient(conn)
+	downloader, err := agent.NewDownloader(svc, downloadDir)
+	if err != nil {
+		return fmt.Errorf("firmware downloader: %w", err)
+	}
+	applier, err := agent.NewApplier(
+		cfg.Simulation.ApplyDelay.Duration,
+		cfg.Simulation.ApplySuccessRate,
+		rand.NewSource(seed),
+	)
+	if err != nil {
+		return fmt.Errorf("firmware applier: %w", err)
+	}
+	// The command handler and the stream client depend on each other: the client drives
+	// the handler, and the handler reports update status through the client. The relay
+	// breaks that construction cycle and is bound once the client exists.
+	relay := &agent.StatusRelay{}
+	handler := agent.NewUpdateHandler(downloader, applier, fleet,
+		agent.NewUpdateReporter(relay, svc), slog.Default())
+	client, err := agent.NewClient(svc, agent.Options{
 		Devices: fleet.Identities(),
-		Handler: logHandler{},
+		Handler: handler,
 		IDs:     ids,
 	})
 	if err != nil {
 		return fmt.Errorf("build stream client: %w", err)
 	}
+	relay.Bind(client)
 
 	// One bounded channel of heartbeats from the fleet to the client: when the client is
 	// disconnected, the fleet waits here instead of buffering without limit.
@@ -95,16 +130,5 @@ func run(ctx context.Context, cfg config.Config) error {
 		return fmt.Errorf("run emulator: %w", err)
 	}
 	slog.Info("emulator stopped")
-	return nil
-}
-
-// logHandler is the CommandHandler seam until firmware apply lands: a dispatched command is
-// acknowledged at the log boundary and otherwise dropped, because nothing can act on it yet.
-type logHandler struct{}
-
-// Handle logs one command received over the stream.
-func (logHandler) Handle(_ context.Context, cmd *agentv1.Command) error {
-	slog.Info("command received",
-		"command_id", cmd.GetCommandId(), "device_id", cmd.GetDeviceId())
 	return nil
 }
