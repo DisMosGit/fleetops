@@ -45,6 +45,27 @@ Indexes: `_id_` (unique, device identity), `idx_region_model {region, model}` (e
 rollout target-group queries), `idx_status {status}` (UI device list filtering). No TTL — device
 records never expire.
 
+### `device_state_snapshots` — one projected device-workflow state per device
+
+Written by the device workflow's snapshot activity; the write is monotone in `snapshot_at`, so
+the document always holds the newest projected state and an out-of-order write converges instead
+of regressing it.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `_id` | string | device identity (unique) |
+| `region` | string | device region (required) |
+| `model` | string | device model (required) |
+| `current_fw` | string | firmware version the device runs (required) |
+| `online` | bool | liveness status of the device workflow (required) |
+| `last_heartbeat` | date | timestamp of the newest applied heartbeat (required) |
+| `pending` | object | outstanding command + delivery state (`command_id`, `device_id`, `kind`, `firmware_id`, `version`, `checksum`, `reason`, `dispatched`); absent while none is outstanding |
+| `config` | object | configuration snapshot with its `version` (required) and `data` (any JSON value) |
+| `snapshot_at` | date | workflow time the state was decided at (required) |
+
+Indexes: `_id_` (unique, device identity), `idx_region_model {region, model}`, `idx_online
+{online}`. No TTL — state snapshots never expire.
+
 ### `firmware` — firmware metadata (binary in GridFS)
 
 | Field | Type | Meaning |

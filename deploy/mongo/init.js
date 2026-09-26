@@ -42,6 +42,52 @@ ensureCollection("devices", {
 fleet.devices.createIndex({ region: 1, model: 1 }, { name: "idx_region_model" });
 fleet.devices.createIndex({ status: 1 }, { name: "idx_status" });
 
+// device_state_snapshots: the device workflow's authoritative state projected by the snapshot
+// activity, one document per device, _id = device identity. The write path is monotone in
+// snapshot_at, so the document always holds the newest projected state. Domain record: never
+// expires.
+ensureCollection("device_state_snapshots", {
+  validationAction: "error",
+  validationLevel: "strict",
+  validator: {
+    $jsonSchema: {
+      bsonType: "object",
+      required: ["region", "model", "current_fw", "online", "last_heartbeat", "config", "snapshot_at"],
+      properties: {
+        region: { bsonType: "string" },
+        model: { bsonType: "string" },
+        current_fw: { bsonType: "string" },
+        online: { bsonType: "bool" },
+        last_heartbeat: { bsonType: "date" },
+        pending: {
+          bsonType: "object",
+          required: ["command_id", "device_id", "kind", "dispatched"],
+          properties: {
+            command_id: { bsonType: "string" },
+            device_id: { bsonType: "string" },
+            kind: { bsonType: "string" },
+            firmware_id: { bsonType: "string" },
+            version: { bsonType: "string" },
+            checksum: { bsonType: "string" },
+            reason: { bsonType: "string" },
+            dispatched: { bsonType: "bool" },
+          },
+        },
+        config: {
+          bsonType: "object",
+          required: ["version"],
+          properties: {
+            version: { bsonType: ["int", "long"] },
+          },
+        },
+        snapshot_at: { bsonType: "date" },
+      },
+    },
+  },
+});
+fleet.device_state_snapshots.createIndex({ region: 1, model: 1 }, { name: "idx_region_model" });
+fleet.device_state_snapshots.createIndex({ online: 1 }, { name: "idx_online" });
+
 // firmware: metadata only, _id = firmware id; the binary lives in GridFS (see gridfs_id).
 ensureCollection("firmware", {
   validationAction: "error",

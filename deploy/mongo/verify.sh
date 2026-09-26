@@ -43,7 +43,7 @@ function check(ok, label) {
 
 // --- collections ---
 const present = fleet.getCollectionNames();
-for (const name of ["devices", "firmware", "rollouts", "waves", "telemetry"]) {
+for (const name of ["devices", "device_state_snapshots", "firmware", "rollouts", "waves", "telemetry"]) {
   check(present.includes(name), "collection " + name + " exists");
 }
 
@@ -55,6 +55,7 @@ function requiredOf(name) {
 }
 const expectedRequired = {
   devices: ["model", "region", "current_fw", "status", "last_heartbeat"],
+  device_state_snapshots: ["region", "model", "current_fw", "online", "last_heartbeat", "config", "snapshot_at"],
   firmware: ["version", "checksum", "gridfs_id"],
   rollouts: ["firmware_id", "status", "temporal_wf_id", "region", "model"],
   waves: ["rollout_id", "percent", "status", "success_rate"],
@@ -87,6 +88,11 @@ const dev = indexMap("devices");
 check(sameKey(dev["idx_region_model"], [["region", 1], ["model", 1]]), "devices.idx_region_model {region, model}");
 check(sameKey(dev["idx_status"], [["status", 1]]), "devices.idx_status {status}");
 
+const snaps = indexMap("device_state_snapshots");
+check(sameKey(snaps["idx_region_model"], [["region", 1], ["model", 1]]),
+  "device_state_snapshots.idx_region_model {region, model}");
+check(sameKey(snaps["idx_online"], [["online", 1]]), "device_state_snapshots.idx_online {online}");
+
 const fw = indexMap("firmware");
 check(sameKey(fw["idx_version"], [["version", 1]]) && fw["idx_version"].unique === true,
   "firmware.idx_version {version} unique");
@@ -111,7 +117,7 @@ check(
 );
 
 // --- retention: no TTL anywhere else (domain records and GridFS never expire) ---
-for (const coll of ["devices", "firmware", "rollouts", "waves"]) {
+for (const coll of ["devices", "device_state_snapshots", "firmware", "rollouts", "waves"]) {
   const anyTtl = Object.values(indexMap(coll)).some((i) => i.expireAfterSeconds !== undefined);
   check(!anyTtl, coll + " has no TTL index");
 }
