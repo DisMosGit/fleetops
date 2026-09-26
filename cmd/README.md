@@ -16,9 +16,12 @@ construct dependencies, and start the run loop.
 
 - `controlplane` and `worker` serve `GET /healthz` (liveness) and `GET /readyz` (readiness:
   MongoDB, RabbitMQ, and Temporal connectivity, per-dependency in the body) on
-  `observability.health_addr`, and shut down gracefully on SIGINT/SIGTERM. The gRPC agent
-  server, the HTTP/SSE gateway (`-http-addr`), and the Temporal workers are still stage-gated
-  TODOs.
-- `agent` loads the configuration and hands `simulation.fleet_size` and
-  `grpc.control_plane_addr` to its emulator startup path, then exits `not implemented yet`
-  until the emulation lands.
+  `observability.health_addr`, and shut down gracefully on SIGINT/SIGTERM. The HTTP/SSE
+  gateway (`-http-addr`) and the Temporal workers are still stage-gated TODOs.
+- `controlplane` additionally serves `AgentService` on `grpc.listen_addr` for the agent fleet:
+  registrations, heartbeat routing to a logging sink (the telemetry pipeline takes over at
+  stage 3), and command dispatch through the `agentserver.Hub` seam.
+- `agent` runs `simulation.fleet_size` simulated devices against `grpc.control_plane_addr`:
+  periodic heartbeats (event id, firmware, status, cpu/mem/health) over one multiplexed
+  `AgentService.Connect` stream that re-registers and reconnects with capped exponential
+  backoff, and stops cleanly on SIGINT/SIGTERM.
