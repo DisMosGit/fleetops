@@ -84,6 +84,17 @@ func (s *Store) MarkStale(ctx context.Context, cutoff time.Time) (int64, error) 
 	return res.ModifiedCount, nil
 }
 
+// DeviceModels lists the distinct device models the registry knows — the models at least one
+// registered device runs. It is the model catalog upload validation checks firmware targets
+// against.
+func (s *Store) DeviceModels(ctx context.Context) ([]string, error) {
+	var models []string
+	if err := s.coll.Distinct(ctx, "model", bson.D{}).Decode(&models); err != nil {
+		return nil, fmt.Errorf("list device models: %w", err)
+	}
+	return models, nil
+}
+
 // coalesce reduces refreshes to one per device — the newest — preserving first-seen order so
 // a batch writes each device at most once.
 func coalesce(updates []Update) []Update {
