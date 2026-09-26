@@ -70,13 +70,60 @@ func (r *fakeRegistry) recorded() []devices.Record {
 	return append([]devices.Record(nil), r.records...)
 }
 
+// fakeSignaler is a hand-written DeviceSignaler double recording what it receives.
+type fakeSignaler struct {
+	mu         sync.Mutex
+	heartbeats []signaled
+	reports    []*agentv1.ReportRequest
+	err        error
+}
+
+// signaled is one heartbeat signal as the device-workflow seam saw it: the message and the
+// identity the device registered with.
+type signaled struct {
+	hb  *agentv1.Heartbeat
+	rec devices.Record
+}
+
+func (s *fakeSignaler) SignalHeartbeat(_ context.Context, rec devices.Record, hb *agentv1.Heartbeat) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.err != nil {
+		return s.err
+	}
+	s.heartbeats = append(s.heartbeats, signaled{hb: hb, rec: rec})
+	return nil
+}
+
+func (s *fakeSignaler) SignalCommandResult(_ context.Context, res *agentv1.ReportRequest) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.err != nil {
+		return s.err
+	}
+	s.reports = append(s.reports, res)
+	return nil
+}
+
+func (s *fakeSignaler) signaledHeartbeats() []signaled {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]signaled(nil), s.heartbeats...)
+}
+
+func (s *fakeSignaler) signaledResults() []*agentv1.ReportRequest {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]*agentv1.ReportRequest(nil), s.reports...)
+}
+
 // startServer serves hub over an in-memory listener with the production server options and
 // returns a connection to it.
-func startServer(t *testing.T, hub *Hub, registry DeviceRegistry) *grpc.ClientConn {
+func startServer(t *testing.T, hub *Hub, registry DeviceRegistry, signals DeviceSignaler) *grpc.ClientConn {
 	t.Helper()
 	lis := bufconn.Listen(1 << 20)
 	server := grpc.NewServer(ServerOptions(slog.New(slog.DiscardHandler))...)
-	agentv1.RegisterAgentServiceServer(server, NewServer(hub, registry, slog.New(slog.DiscardHandler)))
+	agentv1.RegisterAgentServiceServer(server, NewServer(hub, registry, signals, slog.New(slog.DiscardHandler)))
 	go func() {
 		_ = server.Serve(lis) // ends at Stop
 	}()
@@ -143,7 +190,7 @@ func TestRegistrationAccepted(t *testing.T) {
 	sink := &fakeSink{}
 	registry := &fakeRegistry{}
 	hub := NewHub(sink, slog.New(slog.DiscardHandler))
-	stream := openStream(t, startServer(t, hub, registry))
+	stream := openStream(t, startServer(t, hub, registry, &fakeSignaler{}))
 
 	before := time.Now()
 	reg := registerDevice(t, stream, "corr-1", "device-0", "oak-s3", "eu-west", "1.0.0")
@@ -177,7 +224,7 @@ func TestRegistrationRejectedWritesNothing(t *testing.T) {
 
 	registry := &fakeRegistry{}
 	hub := NewHub(&fakeSink{}, slog.New(slog.DiscardHandler))
-	stream := openStream(t, startServer(t, hub, registry))
+	stream := openStream(t, startServer(t, hub, registry, &fakeSignaler{}))
 
 	reg := registerDevice(t, stream, "corr-1", "device-0", "", "eu-west", "1.0.0")
 	if reg.GetAccepted() {
@@ -202,7 +249,7 @@ func TestRegistrationRejectedWhenRegistryUnavailable(t *testing.T) {
 
 	registry := &fakeRegistry{err: errors.New("mongo is down")}
 	hub := NewHub(&fakeSink{}, slog.New(slog.DiscardHandler))
-	stream := openStream(t, startServer(t, hub, registry))
+	stream := openStream(t, startServer(t, hub, registry, &fakeSignaler{}))
 
 	reg := registerDevice(t, stream, "corr-1", "device-0", "oak-s3", "eu-west", "1.0.0")
 	if reg.GetAccepted() {
@@ -224,7 +271,7 @@ func TestHeartbeatRoutedUnchanged(t *testing.T) {
 
 	sink := &fakeSink{}
 	hub := NewHub(sink, slog.New(slog.DiscardHandler))
-	stream := openStream(t, startServer(t, hub, &fakeRegistry{}))
+	stream := openStream(t, startServer(t, hub, &fakeRegistry{}, &fakeSignaler{}))
 	registerDevice(t, stream, "corr-1", "device-0", "oak-s3", "eu-west", "1.0.0")
 
 	want := &agentv1.Heartbeat{
@@ -261,7 +308,7 @@ func TestHeartbeatWithoutMeasurementTimeNotPersisted(t *testing.T) {
 	sink := &fakeSink{}
 	registry := &fakeRegistry{}
 	hub := NewHub(sink, slog.New(slog.DiscardHandler))
-	stream := openStream(t, startServer(t, hub, registry))
+	stream := openStream(t, startServer(t, hub, registry, &fakeSignaler{}))
 	registerDevice(t, stream, "corr-1", "device-0", "oak-s3", "eu-west", "1.0.0")
 
 	if err := stream.Send(&agentv1.AgentEnvelope{
@@ -287,7 +334,7 @@ func TestUnenrolledHeartbeatNotRouted(t *testing.T) {
 
 	sink := &fakeSink{}
 	hub := NewHub(sink, slog.New(slog.DiscardHandler))
-	stream := openStream(t, startServer(t, hub, &fakeRegistry{}))
+	stream := openStream(t, startServer(t, hub, &fakeRegistry{}, &fakeSignaler{}))
 
 	// First a heartbeat from a device this stream never enrolled: dropped. Then one from an
 	// enrolled device: routed. Only the latter may reach the sink.
@@ -321,7 +368,7 @@ func TestCommandDispatchTargetsOneStream(t *testing.T) {
 	t.Parallel()
 
 	hub := NewHub(&fakeSink{}, slog.New(slog.DiscardHandler))
-	conn := startServer(t, hub, &fakeRegistry{})
+	conn := startServer(t, hub, &fakeRegistry{}, &fakeSignaler{})
 	streamA := openStream(t, conn)
 	streamB := openStream(t, conn)
 	registerDevice(t, streamA, "corr-1", "device-a", "oak-s3", "eu-west", "1.0.0")
@@ -402,7 +449,7 @@ func TestStreamEndMakesDevicesUnroutable(t *testing.T) {
 	t.Parallel()
 
 	hub := NewHub(&fakeSink{}, slog.New(slog.DiscardHandler))
-	stream := openStream(t, startServer(t, hub, &fakeRegistry{}))
+	stream := openStream(t, startServer(t, hub, &fakeRegistry{}, &fakeSignaler{}))
 	registerDevice(t, stream, "corr-1", "device-0", "oak-s3", "eu-west", "1.0.0")
 	if err := stream.CloseSend(); err != nil {
 		t.Fatalf("CloseSend: %v", err)
@@ -466,7 +513,7 @@ func TestMalformedEnvelopeMapsToInvalidArgument(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			hub := NewHub(&fakeSink{}, slog.New(slog.DiscardHandler))
-			stream := openStream(t, startServer(t, hub, &fakeRegistry{}))
+			stream := openStream(t, startServer(t, hub, &fakeRegistry{}, &fakeSignaler{}))
 
 			if err := stream.Send(tc.env); err != nil {
 				t.Fatalf("send envelope: %v", err)
@@ -479,5 +526,114 @@ func TestMalformedEnvelopeMapsToInvalidArgument(t *testing.T) {
 				t.Error("status must carry an operator-safe message")
 			}
 		})
+	}
+}
+
+func TestHeartbeatsSignalDeviceWorkflow(t *testing.T) {
+	t.Parallel()
+
+	sink := &fakeSink{}
+	signals := &fakeSignaler{}
+	hub := NewHub(sink, slog.New(slog.DiscardHandler))
+	stream := openStream(t, startServer(t, hub, &fakeRegistry{}, signals))
+	registerDevice(t, stream, "corr-1", "device-0", "oak-s3", "eu-west", "1.0.0")
+
+	// One message, then its redelivery after a reconnect-style retry: the seam must see one
+	// signal per received message, both carrying the same event id, and the sink must still
+	// see both messages unchanged.
+	hb := &agentv1.Heartbeat{
+		EventId: "evt-1", DeviceId: "device-0", CurrentFw: "1.0.0",
+		Ts: timestamppb.New(time.Now()),
+	}
+	for range 2 {
+		if err := stream.Send(&agentv1.AgentEnvelope{
+			Payload: &agentv1.AgentEnvelope_Heartbeat{Heartbeat: hb},
+		}); err != nil {
+			t.Fatalf("send heartbeat: %v", err)
+		}
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for len(signals.signaledHeartbeats()) < 2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	got := signals.signaledHeartbeats()
+	if len(got) != 2 {
+		t.Fatalf("workflow seam received %d heartbeat signals, want 2", len(got))
+	}
+	for i, g := range got {
+		if g.hb.GetEventId() != "evt-1" {
+			t.Errorf("signal %d event id = %q, want evt-1", i, g.hb.GetEventId())
+		}
+		if g.rec.ID != "device-0" || g.rec.Model != "oak-s3" {
+			t.Errorf("signal %d identity = %+v, want the registered identity of device-0", i, g.rec)
+		}
+	}
+	if len(sink.recorded()) != 2 {
+		t.Errorf("sink received %d heartbeats, want 2 — the fan-out changed sink behavior",
+			len(sink.recorded()))
+	}
+}
+
+func TestUnenrolledHeartbeatSignalsNothing(t *testing.T) {
+	t.Parallel()
+
+	signals := &fakeSignaler{}
+	hub := NewHub(&fakeSink{}, slog.New(slog.DiscardHandler))
+	stream := openStream(t, startServer(t, hub, &fakeRegistry{}, signals))
+
+	if err := stream.Send(&agentv1.AgentEnvelope{
+		Payload: &agentv1.AgentEnvelope_Heartbeat{Heartbeat: &agentv1.Heartbeat{
+			EventId: "evt-x", DeviceId: "device-x", Ts: timestamppb.New(time.Now()),
+		}},
+	}); err != nil {
+		t.Fatalf("send heartbeat: %v", err)
+	}
+	registerDevice(t, stream, "corr-1", "device-0", "oak-s3", "eu-west", "1.0.0")
+	if err := stream.Send(&agentv1.AgentEnvelope{
+		Payload: &agentv1.AgentEnvelope_Heartbeat{Heartbeat: &agentv1.Heartbeat{
+			EventId: "evt-1", DeviceId: "device-0", Ts: timestamppb.New(time.Now()),
+		}},
+	}); err != nil {
+		t.Fatalf("send heartbeat: %v", err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for len(signals.signaledHeartbeats()) == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	got := signals.signaledHeartbeats()
+	if len(got) != 1 || got[0].hb.GetEventId() != "evt-1" {
+		t.Errorf("workflow seam received %+v, want only evt-1", got)
+	}
+}
+
+func TestSignalFailureDoesNotFailStream(t *testing.T) {
+	t.Parallel()
+
+	signals := &fakeSignaler{err: errors.New("temporal is down")}
+	sink := &fakeSink{}
+	hub := NewHub(sink, slog.New(slog.DiscardHandler))
+	stream := openStream(t, startServer(t, hub, &fakeRegistry{}, signals))
+	registerDevice(t, stream, "corr-1", "device-0", "oak-s3", "eu-west", "1.0.0")
+
+	// Heartbeats are fire-and-forget: a workflow seam failure is logged at the boundary and
+	// the stream keeps serving, exactly like a sink failure.
+	for _, id := range []string{"evt-1", "evt-2"} {
+		if err := stream.Send(&agentv1.AgentEnvelope{
+			Payload: &agentv1.AgentEnvelope_Heartbeat{Heartbeat: &agentv1.Heartbeat{
+				EventId: id, DeviceId: "device-0", Ts: timestamppb.New(time.Now()),
+			}},
+		}); err != nil {
+			t.Fatalf("send heartbeat %s after a signal failure: %v", id, err)
+		}
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for len(sink.recorded()) < 2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if len(sink.recorded()) != 2 {
+		t.Errorf("sink received %d heartbeats, want 2 — the stream must survive a signal failure",
+			len(sink.recorded()))
 	}
 }

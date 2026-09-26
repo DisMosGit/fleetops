@@ -39,6 +39,16 @@ type nopRegistry struct{}
 
 func (nopRegistry) Upsert(context.Context, devices.Record) error { return nil }
 
+// nopSignaler is a hand-written DeviceSignaler double that swallows signals: the e2e path
+// under test is stream routing, not the workflow.
+type nopSignaler struct{}
+
+func (nopSignaler) SignalHeartbeat(context.Context, devices.Record, *agentv1.Heartbeat) error {
+	return nil
+}
+
+func (nopSignaler) SignalCommandResult(context.Context, *agentv1.ReportRequest) error { return nil }
+
 func (s *recordingSink) count() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -133,7 +143,7 @@ func TestFleetEndToEnd(t *testing.T) {
 	server := grpc.NewServer(
 		append(agentserver.ServerOptions(slog.New(slog.DiscardHandler)), grpc.ChainStreamInterceptor(killAfter(4)))...,
 	)
-	agentv1.RegisterAgentServiceServer(server, agentserver.NewServer(hub, nopRegistry{}, slog.New(slog.DiscardHandler)))
+	agentv1.RegisterAgentServiceServer(server, agentserver.NewServer(hub, nopRegistry{}, nopSignaler{}, slog.New(slog.DiscardHandler)))
 
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

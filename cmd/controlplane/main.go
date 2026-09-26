@@ -18,6 +18,9 @@ import (
 
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.temporal.io/sdk/activity"
+	temporalclient "go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/worker"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 
@@ -30,6 +33,7 @@ import (
 	"github.com/DisMosGit/fleetops/internal/devices"
 	"github.com/DisMosGit/fleetops/internal/health"
 	"github.com/DisMosGit/fleetops/internal/telemetry"
+	"github.com/DisMosGit/fleetops/internal/temporal"
 )
 
 // shutdownTimeout bounds graceful shutdown of the probe server.
@@ -80,8 +84,9 @@ func main() {
 
 // run serves the liveness/readiness probes on the configured health address and AgentService
 // on the configured gRPC address until ctx is cancelled. Accepted streams persist device
-// records and heartbeats through the batched ingest pipeline. The HTTP/SSE gateway joins the
-// same lifecycle at stage 5.
+// records and heartbeats through the batched ingest pipeline and signal the device workflow,
+// and the dispatch-command activity delivers the workflow's commands back onto the streams.
+// The HTTP/SSE gateway joins the same lifecycle at stage 5.
 func run(ctx context.Context, cfg config.Config, httpAddr string) error {
 	// TODO(stage 5): serve the HTTP/SSE gateway on httpAddr.
 	log := slog.Default()
@@ -127,11 +132,29 @@ func run(ctx context.Context, cfg config.Config, httpAddr string) error {
 		Handler: metricsHandler(metrics),
 	}
 
-	// The hub is the command seam later stages send through; its sink is the ingest pipeline
-	// and its registry records accepted registrations.
+	// The hub is the command seam the dispatch activity sends through; its sink is the
+	// ingest pipeline and its registry records accepted registrations. Accepted heartbeats
+	// and command results reach the device workflow through the signaler.
+	tc, err := temporalclient.Dial(temporalclient.Options{
+		HostPort:  cfg.Temporal.Address,
+		Namespace: cfg.Temporal.Namespace,
+	})
+	if err != nil {
+		return fmt.Errorf("connect to temporal: %w", err)
+	}
+	defer tc.Close()
+
+	signaler := temporal.NewSignaler(tc, cfg.Temporal.TaskQueue)
 	hub := agentserver.NewHub(ingest, log)
 	grpcServer := grpc.NewServer(agentserver.ServerOptions(log)...)
-	agentv1.RegisterAgentServiceServer(grpcServer, agentserver.NewServer(hub, registry, log))
+	agentv1.RegisterAgentServiceServer(grpcServer, agentserver.NewServer(hub, registry, signaler, log))
+
+	// Activities live beside their side effects: dispatch-command needs the in-process hub,
+	// so it joins this process on the same task queue the workflow worker uses.
+	w := worker.New(tc, cfg.Temporal.TaskQueue, worker.Options{})
+	w.RegisterActivityWithOptions(temporal.NewDispatchActivity(hub), activity.RegisterOptions{
+		Name: temporal.DispatchActivityName,
+	})
 
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() error {
@@ -165,6 +188,18 @@ func run(ctx context.Context, cfg config.Config, httpAddr string) error {
 	})
 	g.Go(func() error {
 		return sweeper.Run(gctx)
+	})
+	g.Go(func() error {
+		slog.Info("temporal worker started", "task_queue", cfg.Temporal.TaskQueue)
+		stop := make(chan any)
+		go func() {
+			<-gctx.Done()
+			close(stop)
+		}()
+		if err := w.Run(stop); err != nil {
+			return fmt.Errorf("run temporal worker: %w", err)
+		}
+		return nil
 	})
 	g.Go(func() error {
 		<-gctx.Done()

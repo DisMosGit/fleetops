@@ -19,21 +19,27 @@ import (
 const sessionQueueBound = 32
 
 // Server is the control-plane side of AgentService: it accepts agent streams, completes the
-// registration exchange and records its device in the registry, routes heartbeats to the hub,
-// and lets the hub push commands back over the same stream. Report stays unimplemented until
-// the command-result stage.
+// registration exchange and records its device in the registry, routes heartbeats to the hub
+// and on to the device workflow, lets the hub push commands back over the same stream, and
+// accepts command results through Report.
 type Server struct {
 	agentv1.UnimplementedAgentServiceServer
 
 	hub      *Hub
 	registry DeviceRegistry
+	signals  DeviceSignaler
 	log      *slog.Logger
 }
 
-// NewServer returns an AgentService server backed by hub and recording accepted devices in
-// registry.
-func NewServer(hub *Hub, registry DeviceRegistry, log *slog.Logger) *Server {
-	return &Server{hub: hub, registry: registry, log: log}
+// NewServer returns an AgentService server backed by hub, recording accepted devices in
+// registry, and signaling the device workflow through signals.
+func NewServer(
+	hub *Hub,
+	registry DeviceRegistry,
+	signals DeviceSignaler,
+	log *slog.Logger,
+) *Server {
+	return &Server{hub: hub, registry: registry, signals: signals, log: log}
 }
 
 // Connect serves one agent stream end to end: registrations enroll devices, heartbeats route
@@ -188,6 +194,12 @@ func (s *Server) heartbeat(ctx context.Context, sess *session, hb *agentv1.Heart
 		// stream stays up. Retry and idempotence belong to the ingest pipeline behind the
 		// sink.
 		s.log.Error("route heartbeat",
+			"device_id", hb.GetDeviceId(), "event_id", hb.GetEventId(), "err", err)
+	}
+	// The device workflow is signaled alongside the sink, once per received message: the
+	// event id makes the redeliveries an agent may send idempotent downstream.
+	if err := s.signals.SignalHeartbeat(ctx, rec, hb); err != nil {
+		s.log.Error("signal device workflow",
 			"device_id", hb.GetDeviceId(), "event_id", hb.GetEventId(), "err", err)
 	}
 	return nil
