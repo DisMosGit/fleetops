@@ -9,8 +9,9 @@ import (
 )
 
 // carryVersion is the schema version stamped on every carried-over state. A run refuses a
-// state it cannot understand instead of guessing at a foreign shape.
-const carryVersion = 1
+// state it cannot understand instead of guessing at a foreign shape. Version 2 added the
+// identity attributes, the liveness status, and the settings to the carried state.
+const carryVersion = 2
 
 // Bounds of the dedup memory carried across continuations. The rings are the fast path of
 // signal idempotency; the structural guards in the apply methods are the backstop.
@@ -47,12 +48,18 @@ const (
 
 // HeartbeatSignal is the heartbeat signal payload: one liveness sample keyed by the event id
 // that redeliveries reuse. Timestamp is the device's sample time — identical on every
-// redelivery, which is what makes a redelivered heartbeat a structural no-op.
+// redelivery, which is what makes a redelivered heartbeat a structural no-op. Region and model
+// ride the registration data the producer already holds, so the entity keeps its identity
+// attributes current without a second entry point.
 type HeartbeatSignal struct {
 	// EventID is the heartbeat's delivery key; a redelivery reuses it.
 	EventID string `json:"event_id"`
 	// DeviceID is the device the sample belongs to.
 	DeviceID string `json:"device_id"`
+	// Region is the device's registered region; empty keeps the owned one.
+	Region string `json:"region,omitempty"`
+	// Model is the device's registered model; empty keeps the owned one.
+	Model string `json:"model,omitempty"`
 	// CurrentFw is the firmware version the device reported running.
 	CurrentFw string `json:"current_fw"`
 	// Timestamp is the sample time the device reported.
@@ -120,13 +127,30 @@ type ConfigSnapshot struct {
 	Data json.RawMessage `json:"data,omitempty"`
 }
 
+// DeviceSettings are the configured knobs the entity's own decisions depend on, seeded into
+// the state at run-chain start and carried with it: the periodic snapshot cadence and the
+// silence after which the device counts as offline. Configuration is deploy-time, so the
+// values a run chain starts with stay its values for its life.
+type DeviceSettings struct {
+	// SnapshotInterval is the cadence of periodic state snapshots.
+	SnapshotInterval time.Duration `json:"snapshot_interval"`
+	// OfflineThreshold is the silence after which the device counts as offline.
+	OfflineThreshold time.Duration `json:"offline_threshold"`
+}
+
 // State is the authoritative device state a state query returns: the fields the device
-// workflow owns.
+// workflow owns and carries.
 type State struct {
 	// DeviceID is the device this state belongs to.
 	DeviceID string `json:"device_id"`
+	// Region is the device's registered region, the identity attribute adopted from signals.
+	Region string `json:"region,omitempty"`
+	// Model is the device's registered model, the identity attribute adopted from signals.
+	Model string `json:"model,omitempty"`
 	// CurrentFw is the firmware version the device is considered to run.
 	CurrentFw string `json:"current_fw"`
+	// Online is the liveness status derived from heartbeat recency.
+	Online bool `json:"online"`
 	// LastHeartbeatAt is the timestamp of the newest applied heartbeat.
 	LastHeartbeatAt time.Time `json:"last_heartbeat_at"`
 	// Pending is the outstanding command, or nil when none is outstanding.
@@ -143,14 +167,24 @@ type deviceState struct {
 	CarryVersion int `json:"carry_version"`
 	// DeviceID is the device this state belongs to; the workflow's identity.
 	DeviceID string `json:"device_id"`
+	// Region is the device's registered region, adopted from the registration data signals
+	// carry.
+	Region string `json:"region,omitempty"`
+	// Model is the device's registered model, adopted from the registration data signals
+	// carry.
+	Model string `json:"model,omitempty"`
 	// CurrentFw is the firmware version the device is considered to run.
 	CurrentFw string `json:"current_fw"`
+	// Online is the liveness status derived from heartbeat recency; see refreshLiveness.
+	Online bool `json:"online"`
 	// LastHeartbeatAt is the timestamp of the newest applied heartbeat.
 	LastHeartbeatAt time.Time `json:"last_heartbeat_at"`
 	// Pending is the outstanding command, or nil when none is outstanding.
 	Pending *PendingCommand `json:"pending,omitempty"`
 	// Config is the configuration snapshot and its version.
 	Config ConfigSnapshot `json:"config"`
+	// Settings are the configured knobs the entity's decisions depend on.
+	Settings DeviceSettings `json:"settings"`
 	// RecentEventIDs remembers heartbeat delivery keys across continuations.
 	RecentEventIDs recentIDs `json:"recent_event_ids"`
 	// RecentCommandIDs remembers accepted command ids across continuations.
@@ -185,13 +219,37 @@ func (r *recentIDs) push(key string, limit int) {
 }
 
 // newDeviceState returns the empty state of a device: no firmware known, never heard from,
-// no pending command, no configuration.
-func newDeviceState(deviceID string) deviceState {
-	return deviceState{CarryVersion: carryVersion, DeviceID: deviceID}
+// no pending command, no configuration — decided under the given settings.
+func newDeviceState(deviceID string, settings DeviceSettings) deviceState {
+	return deviceState{
+		CarryVersion: carryVersion,
+		DeviceID:     deviceID,
+		Settings:     settings,
+	}
 }
 
+// transitions reports which meaningful changes one applied signal performed: identity or
+// firmware adoption, a pending-command lifecycle change (set, superseded, or concluded), or a
+// configuration apply. It is the workflow's scheduling input: needsSnapshot names the changes
+// worth persisting immediately, and the fields document what the state machine actually did.
+type transitions struct {
+	// Identity is set when the region or model was adopted.
+	Identity bool
+	// Firmware is set when the firmware version was adopted.
+	Firmware bool
+	// Pending is set when the pending command was set, superseded, or concluded.
+	Pending bool
+	// Config is set when a configuration snapshot was applied.
+	Config bool
+}
+
+// needsSnapshot reports whether the change is one the workflow persists immediately instead of
+// waiting for the periodic snapshot.
+func (t transitions) needsSnapshot() bool { return t.Firmware || t.Pending || t.Config }
+
 // validate checks the carried-over state a run was started from. A state from a newer schema
-// fails loudly instead of being half-understood.
+// fails loudly instead of being half-understood, and so does a state whose settings no
+// decision could be made under.
 func (s deviceState) validate() error {
 	if s.CarryVersion != carryVersion {
 		return fmt.Errorf("device state of %q at carry version %d (want %d): %w",
@@ -200,15 +258,24 @@ func (s deviceState) validate() error {
 	if s.DeviceID == "" {
 		return errors.New("device state without device id")
 	}
+	if s.Settings.SnapshotInterval <= 0 {
+		return errors.New("device state without positive snapshot interval")
+	}
+	if s.Settings.OfflineThreshold <= 0 {
+		return errors.New("device state without positive offline threshold")
+	}
 	return nil
 }
 
-// view reports the authoritative device state — the four owned fields — without the dedup
+// view reports the authoritative device state — the carried fields — without the dedup
 // memory and rollover counter, which are bookkeeping and not device state.
 func (s deviceState) view() State {
 	out := State{
 		DeviceID:        s.DeviceID,
+		Region:          s.Region,
+		Model:           s.Model,
 		CurrentFw:       s.CurrentFw,
+		Online:          s.Online,
 		LastHeartbeatAt: s.LastHeartbeatAt,
 		Config:          s.Config,
 	}
@@ -219,59 +286,91 @@ func (s deviceState) view() State {
 	return out
 }
 
+// refreshLiveness re-evaluates the derived liveness status at now: online while a heartbeat has
+// arrived within the settings' offline threshold, offline once the recorded last heartbeat
+// falls further behind, and never-heard counts as offline. It reports whether the status
+// flipped, which the workflow treats as a meaningful transition.
+func (s *deviceState) refreshLiveness(now time.Time) bool {
+	online := now.Sub(s.LastHeartbeatAt) < s.Settings.OfflineThreshold
+	if online == s.Online {
+		return false
+	}
+	s.Online = online
+	return true
+}
+
 // applyHeartbeat folds one heartbeat signal into the state: liveness moves to the signal's
-// timestamp and the reported firmware is adopted. A heartbeat that is not strictly newer than
-// the recorded one — its own redelivery, or any older sample — changes nothing, so a
-// duplicate is a no-op even outside the dedup window.
-func (s *deviceState) applyHeartbeat(h HeartbeatSignal) {
+// timestamp, the reported firmware is adopted, and the registration's identity attributes are
+// adopted when present. A heartbeat that is not strictly newer than the recorded one — its own
+// redelivery, or any older sample — changes nothing at all, so a duplicate is a no-op even
+// outside the dedup window. The report names the meaningful changes among firmware and
+// identity adoption.
+func (s *deviceState) applyHeartbeat(h HeartbeatSignal) transitions {
 	s.SignalsApplied++
 	if s.RecentEventIDs.has(h.EventID) {
-		return
+		return transitions{}
 	}
 	s.RecentEventIDs.push(h.EventID, maxRecentEventIDs)
 	if !h.Timestamp.After(s.LastHeartbeatAt) {
-		return
+		return transitions{}
 	}
 	s.LastHeartbeatAt = h.Timestamp
+	var tr transitions
+	if h.Region != "" && h.Region != s.Region {
+		s.Region = h.Region
+		tr.Identity = true
+	}
+	if h.Model != "" && h.Model != s.Model {
+		s.Model = h.Model
+		tr.Identity = true
+	}
 	if h.CurrentFw != "" && h.CurrentFw != s.CurrentFw {
 		s.CurrentFw = h.CurrentFw
+		tr.Firmware = true
 	}
+	return tr
 }
 
 // applyCommandIssued folds one command_issued signal into the state: the command becomes the
 // pending command, superseding any outstanding one. A command id already accepted changes
 // nothing, so a redelivered issue cannot re-open a concluded command while its id is
 // remembered.
-func (s *deviceState) applyCommandIssued(c CommandIssuedSignal) {
+func (s *deviceState) applyCommandIssued(c CommandIssuedSignal) transitions {
 	s.SignalsApplied++
 	if s.RecentCommandIDs.has(c.CommandID) {
-		return
+		return transitions{}
 	}
 	s.RecentCommandIDs.push(c.CommandID, maxRecentCommandIDs)
 	s.Pending = &PendingCommand{Command: c}
+	return transitions{Pending: true}
 }
 
 // applyCommandResult folds one command_result signal into the state: a result matching the
 // pending command concludes it — adopting the commanded firmware on success — and any other
 // result changes nothing, so a redelivered result can never conclude twice.
-func (s *deviceState) applyCommandResult(r CommandResultSignal) {
+func (s *deviceState) applyCommandResult(r CommandResultSignal) transitions {
 	s.SignalsApplied++
 	if s.Pending == nil || s.Pending.Command.CommandID != r.CommandID {
-		return
+		return transitions{}
 	}
+	var tr transitions
 	if r.Outcome == OutcomeSucceeded && s.Pending.Command.Version != "" {
 		s.CurrentFw = s.Pending.Command.Version
+		tr.Firmware = true
 	}
 	s.Pending = nil
+	tr.Pending = true
+	return tr
 }
 
 // applyConfigChanged folds one config_changed signal into the state: the snapshot replaces
 // the owned one only at a strictly newer version, so a duplicate or stale version changes
 // nothing.
-func (s *deviceState) applyConfigChanged(c ConfigChangedSignal) {
+func (s *deviceState) applyConfigChanged(c ConfigChangedSignal) transitions {
 	s.SignalsApplied++
 	if c.Version <= s.Config.Version {
-		return
+		return transitions{}
 	}
 	s.Config = ConfigSnapshot{Version: c.Version, Data: c.Snapshot}
+	return transitions{Config: true}
 }

@@ -26,15 +26,18 @@ type signalClient interface {
 
 // Signaler delivers device events to the per-device workflow: every call signals the device's
 // workflow and starts its run chain first when the device has none — one run chain per device
-// id, created lazily on first contact and never duplicated.
+// id, created lazily on first contact and never duplicated. New run chains are seeded with the
+// device's empty state under the configured settings.
 type Signaler struct {
 	client    signalClient
 	taskQueue string
+	settings  DeviceSettings
 }
 
-// NewSignaler returns a signaler that starts and signals device workflows on taskQueue.
-func NewSignaler(c signalClient, taskQueue string) *Signaler {
-	return &Signaler{client: c, taskQueue: taskQueue}
+// NewSignaler returns a signaler that starts and signals device workflows on taskQueue, seeding
+// new run chains with the entity settings they decide under.
+func NewSignaler(c signalClient, taskQueue string, settings DeviceSettings) *Signaler {
+	return &Signaler{client: c, taskQueue: taskQueue, settings: settings}
 }
 
 // SignalHeartbeat delivers one heartbeat to its device's workflow, carrying the event id a
@@ -47,6 +50,8 @@ func (s *Signaler) SignalHeartbeat(
 	return s.signalWithStart(ctx, rec.ID, HeartbeatSignalName, HeartbeatSignal{
 		EventID:   hb.GetEventId(),
 		DeviceID:  rec.ID,
+		Region:    rec.Region,
+		Model:     rec.Model,
 		CurrentFw: hb.GetCurrentFw(),
 		Timestamp: hb.GetTs().AsTime(),
 	})
@@ -98,7 +103,7 @@ func (s *Signaler) signalWithStart(
 	workflowID := DeviceWorkflowID(deviceID)
 	if _, err := s.client.SignalWithStartWorkflow(ctx, workflowID, signalName, payload,
 		client.StartWorkflowOptions{TaskQueue: s.taskQueue},
-		DeviceWorkflow, newDeviceState(deviceID),
+		DeviceWorkflow, newDeviceState(deviceID, s.settings),
 	); err != nil {
 		return fmt.Errorf("signal %s to %s: %w", signalName, workflowID, err)
 	}

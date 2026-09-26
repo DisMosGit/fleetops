@@ -144,7 +144,12 @@ func run(ctx context.Context, cfg config.Config, httpAddr string) error {
 	}
 	defer tc.Close()
 
-	signaler := temporal.NewSignaler(tc, cfg.Temporal.TaskQueue)
+	// New device run chains decide under the configured snapshot cadence and offline
+	// threshold; both are captured at chain start and carried with the entity state.
+	signaler := temporal.NewSignaler(tc, cfg.Temporal.TaskQueue, temporal.DeviceSettings{
+		SnapshotInterval: cfg.Snapshots.Interval.Duration,
+		OfflineThreshold: cfg.Liveness.OfflineThreshold.Duration,
+	})
 	hub := agentserver.NewHub(ingest, log)
 	grpcServer := grpc.NewServer(agentserver.ServerOptions(log)...)
 	agentv1.RegisterAgentServiceServer(grpcServer, agentserver.NewServer(hub, registry, signaler, log))

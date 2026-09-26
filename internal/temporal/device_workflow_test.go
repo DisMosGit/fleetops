@@ -159,7 +159,7 @@ func TestDeviceWorkflowStateQuery(t *testing.T) {
 		}
 	}, 3*time.Millisecond)
 	padToRollover(env, 2)
-	env.ExecuteWorkflow(DeviceWorkflow, newDeviceState("dev-1"))
+	env.ExecuteWorkflow(DeviceWorkflow, newDeviceState("dev-1", testSettings()))
 
 	want := State{
 		DeviceID:        "dev-1",
@@ -236,8 +236,8 @@ func TestDeviceWorkflowSignalIdempotency(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			clean := runDevice(t, newDeviceState("dev-1"), &dispatchRecorder{}, tc.first...)
-			noisy := runDevice(t, newDeviceState("dev-1"), &dispatchRecorder{},
+			clean := runDevice(t, newDeviceState("dev-1", testSettings()), &dispatchRecorder{}, tc.first...)
+			noisy := runDevice(t, newDeviceState("dev-1", testSettings()), &dispatchRecorder{},
 				append(append([]testSignal{}, tc.first...), tc.duplicates...)...)
 			if diff := cmp.Diff(clean.view(), noisy.view()); diff != "" {
 				t.Errorf("duplicates changed device state (-without +with duplicates):\n%s", diff)
@@ -264,7 +264,7 @@ func TestDeviceWorkflowCommandLifecycle(t *testing.T) {
 	t.Run("issued command becomes pending and dispatches", func(t *testing.T) {
 		t.Parallel()
 		rec := &dispatchRecorder{}
-		carried := runDevice(t, newDeviceState("dev-1"), rec, testSignal{CommandIssuedSignalName, update})
+		carried := runDevice(t, newDeviceState("dev-1", testSettings()), rec, testSignal{CommandIssuedSignalName, update})
 
 		want := State{DeviceID: "dev-1", Pending: &PendingCommand{Command: update, Dispatched: true}}
 		if diff := cmp.Diff(want, carried.view()); diff != "" {
@@ -278,7 +278,7 @@ func TestDeviceWorkflowCommandLifecycle(t *testing.T) {
 	t.Run("newer command supersedes the pending one", func(t *testing.T) {
 		t.Parallel()
 		rec := &dispatchRecorder{}
-		carried := runDevice(t, newDeviceState("dev-1"), rec,
+		carried := runDevice(t, newDeviceState("dev-1", testSettings()), rec,
 			testSignal{CommandIssuedSignalName, update},
 			testSignal{CommandIssuedSignalName, update3},
 			testSignal{CommandResultSignalName, CommandResultSignal{
@@ -297,7 +297,7 @@ func TestDeviceWorkflowCommandLifecycle(t *testing.T) {
 	t.Run("success adopts the commanded firmware", func(t *testing.T) {
 		t.Parallel()
 		rec := &dispatchRecorder{}
-		carried := runDevice(t, newDeviceState("dev-1"), rec,
+		carried := runDevice(t, newDeviceState("dev-1", testSettings()), rec,
 			heartbeat,
 			testSignal{CommandIssuedSignalName, update},
 			testSignal{CommandResultSignalName, CommandResultSignal{
@@ -318,7 +318,7 @@ func TestDeviceWorkflowCommandLifecycle(t *testing.T) {
 	t.Run("failure leaves firmware unchanged", func(t *testing.T) {
 		t.Parallel()
 		rec := &dispatchRecorder{}
-		carried := runDevice(t, newDeviceState("dev-1"), rec,
+		carried := runDevice(t, newDeviceState("dev-1", testSettings()), rec,
 			heartbeat,
 			testSignal{CommandIssuedSignalName, update},
 			testSignal{CommandResultSignalName, CommandResultSignal{
@@ -339,7 +339,7 @@ func TestDeviceWorkflowCommandLifecycle(t *testing.T) {
 	t.Run("result for a non-pending command changes nothing", func(t *testing.T) {
 		t.Parallel()
 		rec := &dispatchRecorder{}
-		carried := runDevice(t, newDeviceState("dev-1"), rec,
+		carried := runDevice(t, newDeviceState("dev-1", testSettings()), rec,
 			testSignal{CommandIssuedSignalName, update},
 			testSignal{CommandResultSignalName, CommandResultSignal{
 				DeviceID: "dev-1", CommandID: "cmd-99", Outcome: OutcomeFailed,
@@ -367,7 +367,7 @@ func TestDeviceWorkflowRollingContinuation(t *testing.T) {
 	t.Run("state and dedup memory survive the rollover", func(t *testing.T) {
 		t.Parallel()
 		rec := &dispatchRecorder{}
-		first := runDevice(t, newDeviceState("dev-1"), rec,
+		first := runDevice(t, newDeviceState("dev-1", testSettings()), rec,
 			heartbeat, testSignal{CommandIssuedSignalName, update})
 
 		if !first.RecentEventIDs.has("evt-1") || !first.RecentCommandIDs.has("cmd-1") {
@@ -392,7 +392,7 @@ func TestDeviceWorkflowRollingContinuation(t *testing.T) {
 
 	t.Run("duplicate signals across a continuation are dropped", func(t *testing.T) {
 		t.Parallel()
-		first := runDevice(t, newDeviceState("dev-1"), &dispatchRecorder{}, heartbeat)
+		first := runDevice(t, newDeviceState("dev-1", testSettings()), &dispatchRecorder{}, heartbeat)
 
 		// The redelivered heartbeat reuses its event id but claims a newer timestamp: only
 		// the carried dedup memory can drop it. The fresh one after it must still apply.
@@ -419,7 +419,7 @@ func TestDeviceWorkflowRollingContinuation(t *testing.T) {
 		t.Parallel()
 		// The last real signal of a run and its redelivery to the continuing run — what an
 		// at-least-once producer does around a rollover — must total one application.
-		first := runDevice(t, newDeviceState("dev-1"), &dispatchRecorder{}, heartbeat)
+		first := runDevice(t, newDeviceState("dev-1", testSettings()), &dispatchRecorder{}, heartbeat)
 		second := runDevice(t, first, &dispatchRecorder{}, heartbeat)
 
 		want := State{
@@ -473,7 +473,7 @@ func bufferedSignalsWorkflow(ctx workflow.Context) (deviceState, error) {
 		DeviceID: "dev-1", Version: 7, Snapshot: json.RawMessage(`{"a":1}`),
 	})
 	chans := signalChannels{heartbeat: heartbeat, issued: issued, result: result, config: config}
-	state := newDeviceState("dev-1")
+	state := newDeviceState("dev-1", testSettings())
 	chans.drainAll(&state)
 	return state, nil
 }

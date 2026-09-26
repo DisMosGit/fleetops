@@ -50,7 +50,7 @@ func TestSignalPathEndToEnd(t *testing.T) {
 
 	dispatcher := &fakeDispatcher{}
 	env := newDeviceWorkflowEnvWith(NewDispatchActivity(dispatcher))
-	signaler := NewSignaler(&envSignalClient{env: env}, "fleetops")
+	signaler := NewSignaler(&envSignalClient{env: env}, "fleetops", testSettings())
 	rec := devices.Record{ID: "dev-1", Model: "oak-s3", Region: "eu-west"}
 	hbTime := time.Unix(1000, 0)
 
@@ -109,11 +109,13 @@ func TestSignalPathEndToEnd(t *testing.T) {
 		}
 	}, 5*time.Millisecond)
 	padToRollover(env, 5)
-	env.ExecuteWorkflow(DeviceWorkflow, newDeviceState("dev-1"))
+	env.ExecuteWorkflow(DeviceWorkflow, newDeviceState("dev-1", testSettings()))
 
 	carried := finishRun(t, env)
 	want := State{
 		DeviceID:        "dev-1",
+		Region:          "eu-west",
+		Model:           "oak-s3",
 		CurrentFw:       "fw-2",
 		LastHeartbeatAt: hbTime,
 		Config:          ConfigSnapshot{Version: 1, Data: json.RawMessage(`{"interval":"5s"}`)},

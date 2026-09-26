@@ -85,7 +85,7 @@ func TestDeviceStateApply(t *testing.T) {
 
 	withState := func(setup func(*deviceState)) func(*deviceState) {
 		return func(s *deviceState) {
-			*s = newDeviceState("dev-1")
+			*s = newDeviceState("dev-1", testSettings())
 			setup(s)
 		}
 	}
@@ -279,7 +279,7 @@ func TestDeviceStateApply(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			s := newDeviceState("dev-1")
+			s := newDeviceState("dev-1", testSettings())
 			tc.setup(&s)
 			tc.apply(&s)
 			if diff := cmp.Diff(tc.want, s.view()); diff != "" {
@@ -292,11 +292,17 @@ func TestDeviceStateApply(t *testing.T) {
 	}
 }
 
+// testSettings returns valid entity settings for tests: anything positive works, but every
+// test shares one value so comparisons read the same everywhere.
+func testSettings() DeviceSettings {
+	return DeviceSettings{SnapshotInterval: time.Minute, OfflineThreshold: 30 * time.Second}
+}
+
 // newDeviceStateSetup returns the identity setup so table cases can share the fresh-state
 // baseline without sharing the state itself.
 func newDeviceStateSetup() func(*deviceState) {
 	return func(s *deviceState) {
-		*s = newDeviceState("dev-1")
+		*s = newDeviceState("dev-1", testSettings())
 	}
 }
 
@@ -305,14 +311,14 @@ func TestDeviceStateValidate(t *testing.T) {
 
 	t.Run("current carry version passes", func(t *testing.T) {
 		t.Parallel()
-		if err := newDeviceState("dev-1").validate(); err != nil {
+		if err := newDeviceState("dev-1", testSettings()).validate(); err != nil {
 			t.Fatalf("validate() on fresh state: %v", err)
 		}
 	})
 
 	t.Run("unknown carry version fails loudly", func(t *testing.T) {
 		t.Parallel()
-		s := newDeviceState("dev-1")
+		s := newDeviceState("dev-1", testSettings())
 		s.CarryVersion = carryVersion + 1
 		err := s.validate()
 		if !errors.Is(err, ErrUnsupportedCarryVersion) {
@@ -326,6 +332,324 @@ func TestDeviceStateValidate(t *testing.T) {
 			t.Fatal("validate() on state without device id returned nil")
 		}
 	})
+
+	t.Run("settings without positive snapshot interval fails loudly", func(t *testing.T) {
+		t.Parallel()
+		s := newDeviceState("dev-1", testSettings())
+		s.Settings.SnapshotInterval = 0
+		if err := s.validate(); err == nil {
+			t.Fatal("validate() on a zero snapshot interval returned nil")
+		}
+	})
+
+	t.Run("settings without positive offline threshold fails loudly", func(t *testing.T) {
+		t.Parallel()
+		s := newDeviceState("dev-1", testSettings())
+		s.Settings.OfflineThreshold = -time.Second
+		if err := s.validate(); err == nil {
+			t.Fatal("validate() on a negative offline threshold returned nil")
+		}
+	})
+
+	t.Run("carry version 1 payload is refused", func(t *testing.T) {
+		t.Parallel()
+		// A state as the previous build carried it: no identity, liveness, or settings
+		// fields at all. It must fail loudly instead of running half-understood.
+		const v1 = `{"carry_version":1,"device_id":"dev-1","current_fw":"fw-1"}`
+		var s deviceState
+		if err := json.Unmarshal([]byte(v1), &s); err != nil {
+			t.Fatalf("decode v1 payload: %v", err)
+		}
+		if err := s.validate(); !errors.Is(err, ErrUnsupportedCarryVersion) {
+			t.Errorf("validate() on a v1 payload = %v, want ErrUnsupportedCarryVersion", err)
+		}
+	})
+}
+
+// TestDeviceStateIdentityAdoption pins how the identity attributes are adopted: non-empty
+// registration data in a heartbeat wins, empty values keep the owned ones, and a heartbeat
+// that is not strictly newer changes nothing at all.
+func TestDeviceStateIdentityAdoption(t *testing.T) {
+	t.Parallel()
+
+	base := time.Unix(1000, 0)
+	cases := []struct {
+		name  string
+		setup func(*deviceState)
+		apply HeartbeatSignal
+		want  State
+		tr    transitions
+	}{
+		{
+			name:  "registration data is adopted",
+			setup: newDeviceStateSetup(),
+			apply: HeartbeatSignal{
+				EventID: "evt-1", DeviceID: "dev-1", Region: "eu-west", Model: "oak-s3",
+				Timestamp: base,
+			},
+			want: State{DeviceID: "dev-1", Region: "eu-west", Model: "oak-s3", LastHeartbeatAt: base},
+			tr:   transitions{Identity: true},
+		},
+		{
+			name: "empty identity keeps the owned one",
+			setup: func(s *deviceState) {
+				*s = newDeviceState("dev-1", testSettings())
+				s.Region, s.Model = "eu-west", "oak-s3"
+				s.LastHeartbeatAt = base
+			},
+			apply: HeartbeatSignal{EventID: "evt-2", DeviceID: "dev-1", Timestamp: base.Add(time.Second)},
+			want: State{
+				DeviceID: "dev-1", Region: "eu-west", Model: "oak-s3",
+				LastHeartbeatAt: base.Add(time.Second),
+			},
+			tr: transitions{},
+		},
+		{
+			name: "unchanged identity is not a transition",
+			setup: func(s *deviceState) {
+				*s = newDeviceState("dev-1", testSettings())
+				s.Region, s.Model = "eu-west", "oak-s3"
+				s.LastHeartbeatAt = base
+			},
+			apply: HeartbeatSignal{
+				EventID: "evt-2", DeviceID: "dev-1", Region: "eu-west", Model: "oak-s3",
+				Timestamp: base.Add(time.Second),
+			},
+			want: State{
+				DeviceID: "dev-1", Region: "eu-west", Model: "oak-s3",
+				LastHeartbeatAt: base.Add(time.Second),
+			},
+			tr: transitions{},
+		},
+		{
+			name: "stale heartbeat changes nothing",
+			setup: func(s *deviceState) {
+				*s = newDeviceState("dev-1", testSettings())
+				s.Region, s.Model = "eu-west", "oak-s3"
+				s.LastHeartbeatAt = base
+			},
+			apply: HeartbeatSignal{
+				EventID: "evt-2", DeviceID: "dev-1", Region: "us-east", Model: "oak-s9",
+				Timestamp: base.Add(-time.Second),
+			},
+			want: State{
+				DeviceID: "dev-1", Region: "eu-west", Model: "oak-s3", LastHeartbeatAt: base,
+			},
+			tr: transitions{},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			s := newDeviceState("dev-1", testSettings())
+			tc.setup(&s)
+			if diff := cmp.Diff(tc.tr, s.applyHeartbeat(tc.apply)); diff != "" {
+				t.Errorf("transitions mismatch (-want +got):\n%s", diff)
+			}
+			if diff := cmp.Diff(tc.want, s.view()); diff != "" {
+				t.Errorf("state view mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+// TestDeviceStateTransitions pins the transition report each apply produces, and the two
+// scheduling questions the workflow asks of it: what snapshots immediately, what upserts
+// search attributes.
+func TestDeviceStateTransitions(t *testing.T) {
+	t.Parallel()
+
+	pending := CommandIssuedSignal{
+		CommandID: "cmd-1", DeviceID: "dev-1", Kind: CommandKindUpdate,
+		FirmwareID: "fw-2", Version: "fw-2",
+	}
+	fresh := func(s *deviceState) {
+		*s = newDeviceState("dev-1", testSettings())
+		s.CurrentFw, s.LastHeartbeatAt = "fw-1", time.Unix(1000, 0)
+	}
+	withPending := func(s *deviceState) {
+		fresh(s)
+		s.applyCommandIssued(pending)
+	}
+
+	cases := []struct {
+		name  string
+		setup func(*deviceState)
+		apply func(*deviceState) transitions
+		want  transitions
+	}{
+		{
+			name:  "firmware adoption",
+			setup: fresh,
+			apply: func(s *deviceState) transitions {
+				return s.applyHeartbeat(HeartbeatSignal{
+					EventID: "evt-1", DeviceID: "dev-1", CurrentFw: "fw-2", Timestamp: time.Unix(2000, 0),
+				})
+			},
+			want: transitions{Firmware: true},
+		},
+		{
+			name:  "timestamp-only heartbeat",
+			setup: fresh,
+			apply: func(s *deviceState) transitions {
+				return s.applyHeartbeat(HeartbeatSignal{
+					EventID: "evt-1", DeviceID: "dev-1", Timestamp: time.Unix(2000, 0),
+				})
+			},
+			want: transitions{},
+		},
+		{
+			name:  "duplicate heartbeat",
+			setup: fresh,
+			apply: func(s *deviceState) transitions {
+				s.applyHeartbeat(HeartbeatSignal{
+					EventID: "evt-1", DeviceID: "dev-1", CurrentFw: "fw-2", Timestamp: time.Unix(2000, 0),
+				})
+				return s.applyHeartbeat(HeartbeatSignal{
+					EventID: "evt-1", DeviceID: "dev-1", CurrentFw: "fw-2", Timestamp: time.Unix(2000, 0),
+				})
+			},
+			want: transitions{},
+		},
+		{
+			name:  "command set",
+			setup: fresh,
+			apply: func(s *deviceState) transitions { return s.applyCommandIssued(pending) },
+			want:  transitions{Pending: true},
+		},
+		{
+			name:  "command superseded",
+			setup: withPending,
+			apply: func(s *deviceState) transitions {
+				return s.applyCommandIssued(CommandIssuedSignal{
+					CommandID: "cmd-2", DeviceID: "dev-1", Kind: CommandKindAbort, Reason: "stop",
+				})
+			},
+			want: transitions{Pending: true},
+		},
+		{
+			name:  "duplicate issuance",
+			setup: withPending,
+			apply: func(s *deviceState) transitions { return s.applyCommandIssued(pending) },
+			want:  transitions{},
+		},
+		{
+			name:  "command concluded with firmware adoption",
+			setup: withPending,
+			apply: func(s *deviceState) transitions {
+				return s.applyCommandResult(CommandResultSignal{
+					DeviceID: "dev-1", CommandID: "cmd-1", Outcome: OutcomeSucceeded,
+				})
+			},
+			want: transitions{Firmware: true, Pending: true},
+		},
+		{
+			name:  "command concluded without firmware adoption",
+			setup: withPending,
+			apply: func(s *deviceState) transitions {
+				return s.applyCommandResult(CommandResultSignal{
+					DeviceID: "dev-1", CommandID: "cmd-1", Outcome: OutcomeFailed, Detail: "boom",
+				})
+			},
+			want: transitions{Pending: true},
+		},
+		{
+			name:  "result for a non-pending command",
+			setup: fresh,
+			apply: func(s *deviceState) transitions {
+				return s.applyCommandResult(CommandResultSignal{
+					DeviceID: "dev-1", CommandID: "cmd-1", Outcome: OutcomeSucceeded,
+				})
+			},
+			want: transitions{},
+		},
+		{
+			name:  "configuration applied",
+			setup: fresh,
+			apply: func(s *deviceState) transitions {
+				return s.applyConfigChanged(ConfigChangedSignal{DeviceID: "dev-1", Version: 1})
+			},
+			want: transitions{Config: true},
+		},
+		{
+			name:  "stale configuration version",
+			setup: fresh,
+			apply: func(s *deviceState) transitions {
+				s.applyConfigChanged(ConfigChangedSignal{DeviceID: "dev-1", Version: 2})
+				return s.applyConfigChanged(ConfigChangedSignal{DeviceID: "dev-1", Version: 1})
+			},
+			want: transitions{},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			s := newDeviceState("dev-1", testSettings())
+			tc.setup(&s)
+			if diff := cmp.Diff(tc.want, tc.apply(&s)); diff != "" {
+				t.Errorf("transitions mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+
+	t.Run("scheduling question", func(t *testing.T) {
+		t.Parallel()
+		// Firmware, pending, and config changes snapshot immediately; identity adoption and
+		// timestamp-only heartbeats wait for the periodic snapshot.
+		for _, tr := range []transitions{{Firmware: true}, {Pending: true}, {Config: true}} {
+			if !tr.needsSnapshot() {
+				t.Errorf("%+v: needsSnapshot() = false, want true", tr)
+			}
+		}
+		for _, tr := range []transitions{{}, {Identity: true}} {
+			if tr.needsSnapshot() {
+				t.Errorf("%+v: needsSnapshot() = true, want false", tr)
+			}
+		}
+	})
+}
+
+// TestRefreshLiveness pins the derived liveness judgement: online within the configured
+// threshold of the last heartbeat, offline past it or never heard from, and a reported flip
+// only when the status actually changes.
+func TestRefreshLiveness(t *testing.T) {
+	t.Parallel()
+
+	settings := testSettings()
+	now := time.Unix(1000, 0)
+	heard := now.Add(-settings.OfflineThreshold + time.Second)
+	silent := now.Add(-settings.OfflineThreshold - time.Second)
+
+	cases := []struct {
+		name     string
+		last     time.Time
+		start    bool
+		want     bool
+		wantFlip bool
+	}{
+		{name: "never heard counts as offline", last: time.Time{}, start: false, want: false},
+		{name: "recent heartbeat counts as online", last: heard, start: false, want: true, wantFlip: true},
+		{name: "silence past the threshold counts as offline", last: silent, start: true, want: false, wantFlip: true},
+		{name: "unchanged online reports no flip", last: heard, start: true, want: true},
+		{name: "unchanged offline reports no flip", last: silent, start: false, want: false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			s := newDeviceState("dev-1", settings)
+			s.LastHeartbeatAt = tc.last
+			s.Online = tc.start
+			if flip := s.refreshLiveness(now); flip != tc.wantFlip {
+				t.Errorf("refreshLiveness() flip = %v, want %v", flip, tc.wantFlip)
+			}
+			if s.Online != tc.want {
+				t.Errorf("Online = %v, want %v", s.Online, tc.want)
+			}
+		})
+	}
 }
 
 // TestCarryRoundTrip pins the continuation contract: the carried-over payload encodes and
@@ -334,8 +658,10 @@ func TestDeviceStateValidate(t *testing.T) {
 func TestCarryRoundTrip(t *testing.T) {
 	t.Parallel()
 
-	s := newDeviceState("dev-1")
+	s := newDeviceState("dev-1", testSettings())
+	s.Region, s.Model = "eu-west", "oak-s3"
 	s.CurrentFw = "fw-2"
+	s.Online = true
 	s.LastHeartbeatAt = time.Unix(123456, 789).UTC()
 	s.Pending = &PendingCommand{
 		Command:    CommandIssuedSignal{CommandID: "cmd-1", DeviceID: "dev-1", Kind: CommandKindUpdate, FirmwareID: "fw-2", Version: "fw-2", Checksum: "sum"},

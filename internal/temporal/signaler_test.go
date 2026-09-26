@@ -70,7 +70,7 @@ func TestSignalerDeliversOneSignalPerCall(t *testing.T) {
 	t.Parallel()
 
 	fc := &fakeSignalClient{}
-	signaler := NewSignaler(fc, "fleetops")
+	signaler := NewSignaler(fc, "fleetops", testSettings())
 	hbTime := time.Unix(1000, 0)
 	rec := devices.Record{ID: "dev-1", Model: "oak-s3", Region: "eu-west"}
 
@@ -114,15 +114,18 @@ func TestSignalerDeliversOneSignalPerCall(t *testing.T) {
 		if call.options.TaskQueue != "fleetops" {
 			t.Errorf("call %d task queue = %q, want fleetops", i, call.options.TaskQueue)
 		}
-		// The start argument is the seed of a lazily created run chain.
+		// The start argument is the seed of a lazily created run chain: the empty state of
+		// the device under the configured entity settings.
 		seed, ok := call.workflowArg.(deviceState)
-		if !ok || seed.validate() != nil || seed.DeviceID != "dev-1" {
-			t.Errorf("call %d start argument = %+v, want the empty state of dev-1", i, call.workflowArg)
+		if !ok || seed.validate() != nil || seed.DeviceID != "dev-1" || seed.Settings != testSettings() {
+			t.Errorf("call %d start argument = %+v, want the empty state of dev-1 under the settings",
+				i, call.workflowArg)
 		}
 	}
 
 	if diff := cmp.Diff(HeartbeatSignal{
-		EventID: "evt-1", DeviceID: "dev-1", CurrentFw: "fw-1", Timestamp: hbTime,
+		EventID: "evt-1", DeviceID: "dev-1", Region: "eu-west", Model: "oak-s3",
+		CurrentFw: "fw-1", Timestamp: hbTime,
 	}, calls[0].signalArg); diff != "" {
 		t.Errorf("heartbeat payload mismatch (-want +got):\n%s", diff)
 	}
@@ -150,7 +153,7 @@ func TestSignalerSignalWithStartErrors(t *testing.T) {
 	t.Run("missing device id signals nothing", func(t *testing.T) {
 		t.Parallel()
 		fc := &fakeSignalClient{}
-		err := NewSignaler(fc, "fleetops").SignalCommandIssued(
+		err := NewSignaler(fc, "fleetops", testSettings()).SignalCommandIssued(
 			context.Background(), CommandIssuedSignal{CommandID: "cmd-1"})
 		if err == nil {
 			t.Fatal("SignalCommandIssued without device id returned nil")
@@ -163,7 +166,7 @@ func TestSignalerSignalWithStartErrors(t *testing.T) {
 	t.Run("unsupported outcome signals nothing", func(t *testing.T) {
 		t.Parallel()
 		fc := &fakeSignalClient{}
-		err := NewSignaler(fc, "fleetops").SignalCommandResult(
+		err := NewSignaler(fc, "fleetops", testSettings()).SignalCommandResult(
 			context.Background(), &agentv1.ReportRequest{
 				IdempotencyKey: "key-1", CommandId: "cmd-1", DeviceId: "dev-1",
 			})
@@ -178,7 +181,7 @@ func TestSignalerSignalWithStartErrors(t *testing.T) {
 	t.Run("client error is wrapped", func(t *testing.T) {
 		t.Parallel()
 		boom := errors.New("temporal is down")
-		signaler := NewSignaler(&fakeSignalClient{err: boom}, "fleetops")
+		signaler := NewSignaler(&fakeSignalClient{err: boom}, "fleetops", testSettings())
 		err := signaler.SignalHeartbeat(context.Background(), devices.Record{ID: "dev-1"},
 			&agentv1.Heartbeat{EventId: "evt-1", Ts: timestamppb.New(time.Unix(1, 0))})
 		if !errors.Is(err, boom) {

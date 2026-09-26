@@ -169,7 +169,7 @@ func TestWorkflowRetriesUndeliveredCommand(t *testing.T) {
 			env.SignalWorkflow(HeartbeatSignalName, HeartbeatSignal{EventID: "filler"})
 		}, time.Duration(i)*10*time.Millisecond)
 	}
-	env.ExecuteWorkflow(DeviceWorkflow, newDeviceState("dev-1"))
+	env.ExecuteWorkflow(DeviceWorkflow, newDeviceState("dev-1", testSettings()))
 
 	carried := finishRun(t, env)
 	if carried.Pending == nil || !carried.Pending.Dispatched {
@@ -197,7 +197,7 @@ func TestWorkflowSupersededDispatchIsHarmless(t *testing.T) {
 		CommandID: "cmd-2", DeviceID: "dev-1", Kind: CommandKindUpdate,
 		FirmwareID: "fw-3", Version: "fw-3",
 	}
-	carried := runDevice(t, newDeviceState("dev-1"), rec,
+	carried := runDevice(t, newDeviceState("dev-1", testSettings()), rec,
 		testSignal{CommandIssuedSignalName, first},
 		testSignal{CommandIssuedSignalName, second},
 		testSignal{CommandResultSignalName, CommandResultSignal{
@@ -240,7 +240,7 @@ func TestWorkflowDoesNotRetryInvalidCommand(t *testing.T) {
 		})
 	}, time.Millisecond)
 	padToRollover(env, 1)
-	env.ExecuteWorkflow(DeviceWorkflow, newDeviceState("dev-1"))
+	env.ExecuteWorkflow(DeviceWorkflow, newDeviceState("dev-1", testSettings()))
 
 	carried := finishRun(t, env)
 	if carried.Pending == nil || carried.Pending.Dispatched {
