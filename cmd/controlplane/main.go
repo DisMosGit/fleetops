@@ -16,17 +16,45 @@ import (
 	"syscall"
 	"time"
 
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	agentv1 "github.com/DisMosGit/fleetops/api/proto/agent/v1"
 	"github.com/DisMosGit/fleetops/internal/agentserver"
 	"github.com/DisMosGit/fleetops/internal/config"
+	"github.com/DisMosGit/fleetops/internal/devices"
 	"github.com/DisMosGit/fleetops/internal/health"
+	"github.com/DisMosGit/fleetops/internal/telemetry"
 )
 
 // shutdownTimeout bounds graceful shutdown of the probe server.
 const shutdownTimeout = 5 * time.Second
+
+// newMetrics serves the control plane's Prometheus source on a private registry: the device
+// offline-transition counter the liveness sweep feeds. metricsHandler exposes the registry on
+// the configured metrics address.
+func newMetrics() (*prometheus.Registry, prometheus.Counter) {
+	reg := prometheus.NewRegistry()
+	counter := prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: "fleetops",
+		Name:      "device_offline_transitions_total",
+		Help:      "Devices marked offline after heartbeat staleness, counted once per transition.",
+	})
+	reg.MustRegister(counter)
+	return reg, counter
+}
+
+// metricsHandler serves reg in the Prometheus exposition format on /metrics.
+func metricsHandler(reg *prometheus.Registry) http.Handler {
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
+	return mux
+}
 
 func main() {
 	configPath := flag.String(
@@ -51,11 +79,40 @@ func main() {
 }
 
 // run serves the liveness/readiness probes on the configured health address and AgentService
-// on the configured gRPC address until ctx is cancelled. The HTTP/SSE gateway joins the same
-// lifecycle at stage 5.
+// on the configured gRPC address until ctx is cancelled. Accepted streams persist device
+// records and heartbeats through the batched ingest pipeline. The HTTP/SSE gateway joins the
+// same lifecycle at stage 5.
 func run(ctx context.Context, cfg config.Config, httpAddr string) error {
-	// TODO(stage 1): construct MongoDB, Temporal, and RabbitMQ clients.
 	// TODO(stage 5): serve the HTTP/SSE gateway on httpAddr.
+	log := slog.Default()
+
+	client, err := mongo.Connect(options.Client().ApplyURI(cfg.MongoDB.URI))
+	if err != nil {
+		return fmt.Errorf("connect to mongodb: %w", err)
+	}
+	defer func() {
+		if err := client.Disconnect(context.Background()); err != nil {
+			log.Error("disconnect from mongodb", "err", err)
+		}
+	}()
+
+	db := client.Database(cfg.MongoDB.Database)
+	registry := devices.NewStore(db)
+	ingest := telemetry.NewWriter(
+		db.Collection("telemetry"),
+		registry,
+		cfg.Telemetry.BatchSize,
+		cfg.Telemetry.FlushInterval.Duration,
+		log,
+	)
+	metrics, offlineTransitions := newMetrics()
+	sweeper := devices.NewSweeper(
+		registry,
+		cfg.Liveness.OfflineThreshold.Duration,
+		cfg.Liveness.SweepInterval.Duration,
+		func(transitions int64) { offlineTransitions.Add(float64(transitions)) },
+		log,
+	)
 
 	checks, err := health.NewDependencyChecks(cfg.MongoDB.URI, cfg.RabbitMQ.URL, cfg.Temporal.Address)
 	if err != nil {
@@ -65,12 +122,16 @@ func run(ctx context.Context, cfg config.Config, httpAddr string) error {
 		Addr:    cfg.Observability.HealthAddr,
 		Handler: health.NewHandler(checks...),
 	}
+	metricsSrv := &http.Server{
+		Addr:    cfg.Observability.MetricsAddr,
+		Handler: metricsHandler(metrics),
+	}
 
-	// The hub is the command seam later stages send through; its sink joins the telemetry
-	// pipeline at stage 3.
-	hub := agentserver.NewHub(loggingSink{}, slog.Default())
-	grpcServer := grpc.NewServer(agentserver.ServerOptions(slog.Default())...)
-	agentv1.RegisterAgentServiceServer(grpcServer, agentserver.NewServer(hub, slog.Default()))
+	// The hub is the command seam later stages send through; its sink is the ingest pipeline
+	// and its registry records accepted registrations.
+	hub := agentserver.NewHub(ingest, log)
+	grpcServer := grpc.NewServer(agentserver.ServerOptions(log)...)
+	agentv1.RegisterAgentServiceServer(grpcServer, agentserver.NewServer(hub, registry, log))
 
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() error {
@@ -92,11 +153,28 @@ func run(ctx context.Context, cfg config.Config, httpAddr string) error {
 		return nil
 	})
 	g.Go(func() error {
+		slog.Info("metrics server listening", "addr", cfg.Observability.MetricsAddr)
+		if err := metricsSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return fmt.Errorf("serve metrics on %s: %w", cfg.Observability.MetricsAddr, err)
+		}
+		return nil
+	})
+	g.Go(func() error {
+		// The ingest pipeline stops with the process and flushes what it holds first.
+		return ingest.Run(gctx)
+	})
+	g.Go(func() error {
+		return sweeper.Run(gctx)
+	})
+	g.Go(func() error {
 		<-gctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
 		if err := srv.Shutdown(shutdownCtx); err != nil {
 			return fmt.Errorf("shut down probe server: %w", err)
+		}
+		if err := metricsSrv.Shutdown(shutdownCtx); err != nil {
+			return fmt.Errorf("shut down metrics server: %w", err)
 		}
 		// GracefulStop has no deadline of its own: give it the remaining shutdown budget
 		// and fall back to a hard stop so shutdown always completes.
@@ -111,19 +189,4 @@ func run(ctx context.Context, cfg config.Config, httpAddr string) error {
 		return nil
 	})
 	return g.Wait()
-}
-
-// loggingSink is the minimal HeartbeatSink until the telemetry pipeline lands at stage 3: it
-// acknowledges each routed heartbeat at the log boundary and stores nothing.
-type loggingSink struct{}
-
-// Handle logs one routed heartbeat.
-func (loggingSink) Handle(_ context.Context, hb *agentv1.Heartbeat) error {
-	slog.Info("heartbeat",
-		"device_id", hb.GetDeviceId(),
-		"event_id", hb.GetEventId(),
-		"status", hb.GetStatus(),
-		"health", hb.GetHealth(),
-	)
-	return nil
 }
