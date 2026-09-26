@@ -3,13 +3,16 @@
 All FleetOps library code lives here; there is no exported library surface. One package per
 capability:
 
-- `agent/` — device-agent emulator: heartbeat, bidi stream client, firmware apply (stages 1–3)
+- `agent/` — device-agent emulator: simulated fleet, heartbeat emission, bidi stream client
+  with reconnect (landed); firmware apply joins with its stage
+- `agentserver/` — control-plane side of the agent stream: session registry, heartbeat routing
+  to the `HeartbeatSink` seam, command dispatch (`Hub.Send`) (landed)
 - `temporal/` — workflows and activities: `DeviceWorkflow`, `RolloutWorkflow`, `FirmwareWorkflow`
   (stage 2)
 - `telemetry/` — RabbitMQ publisher/consumers, idempotent ingestion, DLQ handling (stage 3)
 - `config/` — the single YAML configuration file: loading, defaults, validation (landed)
 - `health/` — liveness/readiness probes and dependency connectivity checks (landed)
 
-The three stage-gated packages above carry only their doc comments; their code lands with the
-stage named beside them. `config` and `health` are implemented. Tests live beside the code as
+`temporal` and `telemetry` still carry only their doc comments; their code lands with the stage
+named beside them. The other packages are implemented. Tests live beside the code as
 `*_test.go`.
