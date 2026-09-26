@@ -60,6 +60,7 @@ of regressing it.
 | `online` | bool | liveness status of the device workflow (required) |
 | `last_heartbeat` | date | timestamp of the newest applied heartbeat (required) |
 | `pending` | object | outstanding command + delivery state (`command_id`, `device_id`, `kind`, `firmware_id`, `version`, `checksum`, `reason`, `dispatched`); absent while none is outstanding |
+| `update_status` | object | latest firmware-update progress (`firmware_id`, `phase`, `progress_percent`, `detail`); absent while none was reported |
 | `config` | object | configuration snapshot with its `version` (required) and `data` (any JSON value) |
 | `snapshot_at` | date | workflow time the state was decided at (required) |
 

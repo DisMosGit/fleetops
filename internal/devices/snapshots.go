@@ -28,6 +28,8 @@ type Snapshot struct {
 	LastHeartbeatAt time.Time `bson:"last_heartbeat"`
 	// Pending is the outstanding command and its delivery state; nil while none is.
 	Pending *SnapshotCommand `bson:"pending,omitempty"`
+	// Update is the latest firmware-update progress the device reported; nil while none was.
+	Update *SnapshotUpdate `bson:"update_status,omitempty"`
 	// Config is the configuration snapshot and its version.
 	Config SnapshotConfig `bson:"config"`
 	// SnapshotAt is the time the workflow decided the state at.
@@ -63,6 +65,18 @@ type SnapshotConfig struct {
 	// Data is the complete configuration content — any JSON value the device was configured
 	// with, stored as its natural document form.
 	Data any `bson:"data,omitempty"`
+}
+
+// SnapshotUpdate is the latest firmware-update progress as a snapshot records it.
+type SnapshotUpdate struct {
+	// FirmwareID is the firmware being applied.
+	FirmwareID string `bson:"firmware_id"`
+	// Phase is the update phase the device reported reaching.
+	Phase string `bson:"phase"`
+	// ProgressPercent is the completion of the reported update, 0-100.
+	ProgressPercent int32 `bson:"progress_percent"`
+	// Detail is operator-safe failure detail; set on a failed phase.
+	Detail string `bson:"detail,omitempty"`
 }
 
 // SnapshotStore is the device_state_snapshots collection: one projected document per device,

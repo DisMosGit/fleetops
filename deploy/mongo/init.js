@@ -73,6 +73,16 @@ ensureCollection("device_state_snapshots", {
             dispatched: { bsonType: "bool" },
           },
         },
+        update_status: {
+          bsonType: "object",
+          required: ["firmware_id", "phase"],
+          properties: {
+            firmware_id: { bsonType: "string" },
+            phase: { bsonType: "string" },
+            progress_percent: { bsonType: ["int", "long"] },
+            detail: { bsonType: "string" },
+          },
+        },
         config: {
           bsonType: "object",
           required: ["version"],
