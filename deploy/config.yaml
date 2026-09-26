@@ -1,0 +1,41 @@
+# FleetOps configuration — sample local-stack values (identical to the built-in defaults).
+#
+# Every binary takes this file via `-config <path>`; fields absent from the file keep the
+# defaults shown here, and startup fails on unknown keys or invalid values. Addresses are
+# host:port; URIs may carry credentials (they are never echoed in logs or probe responses).
+
+simulation:
+  # Simulated devices one agent emulator process runs.
+  fleet_size: 100
+
+grpc:
+  # Control plane AgentService listen address.
+  listen_addr: ":9090"
+  # Control plane gRPC address the agent emulator connects to.
+  control_plane_addr: "localhost:9090"
+
+mongodb:
+  # Connection URI (mongodb:// or mongodb+srv://).
+  uri: "mongodb://localhost:27017"
+  # Fleet database name.
+  database: "fleetops"
+
+rabbitmq:
+  # Connection URL (amqp:// or amqps://).
+  url: "amqp://guest:guest@localhost:5672/"
+
+temporal:
+  # Temporal frontend address.
+  address: "localhost:7233"
+  # Namespace hosting the FleetOps workflows.
+  namespace: "default"
+  # Task queue the workers poll.
+  task_queue: "fleetops"
+
+observability:
+  # OTLP collector endpoint; empty disables trace export.
+  otel_endpoint: "localhost:4317"
+  # Prometheus metrics listen address.
+  metrics_addr: ":9091"
+  # Liveness/readiness (/healthz, /readyz) listen address of the control plane and the worker.
+  health_addr: ":8081"
