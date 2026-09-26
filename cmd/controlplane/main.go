@@ -31,6 +31,7 @@ import (
 	"github.com/DisMosGit/fleetops/internal/agentserver"
 	"github.com/DisMosGit/fleetops/internal/config"
 	"github.com/DisMosGit/fleetops/internal/devices"
+	"github.com/DisMosGit/fleetops/internal/firmware"
 	"github.com/DisMosGit/fleetops/internal/health"
 	"github.com/DisMosGit/fleetops/internal/telemetry"
 	"github.com/DisMosGit/fleetops/internal/temporal"
@@ -64,7 +65,7 @@ func main() {
 	configPath := flag.String(
 		"config", "", "path to the YAML configuration file (defaults apply when omitted)",
 	)
-	httpAddr := flag.String("http-addr", ":8080", "HTTP/SSE gateway listen address (stage 5)")
+	httpAddr := flag.String("http-addr", ":8080", "HTTP gateway listen address (firmware upload API)")
 	flag.Parse()
 
 	cfg, err := config.Load(*configPath)
@@ -85,10 +86,10 @@ func main() {
 // run serves the liveness/readiness probes on the configured health address and AgentService
 // on the configured gRPC address until ctx is cancelled. Accepted streams persist device
 // records and heartbeats through the batched ingest pipeline and signal the device workflow,
-// and the dispatch-command activity delivers the workflow's commands back onto the streams.
-// The HTTP/SSE gateway joins the same lifecycle at stage 5.
+// the dispatch-command activity delivers the workflow's commands back onto the streams, and
+// firmware binaries stream to agents over their download RPC. The HTTP gateway serves the
+// firmware upload API on httpAddr; its SSE routes join the same lifecycle at stage 5.
 func run(ctx context.Context, cfg config.Config, httpAddr string) error {
-	// TODO(stage 5): serve the HTTP/SSE gateway on httpAddr.
 	log := slog.Default()
 
 	client, err := mongo.Connect(options.Client().ApplyURI(cfg.MongoDB.URI))
@@ -103,6 +104,7 @@ func run(ctx context.Context, cfg config.Config, httpAddr string) error {
 
 	db := client.Database(cfg.MongoDB.Database)
 	registry := devices.NewStore(db)
+	firmwareStore := firmware.NewStore(db)
 	ingest := telemetry.NewWriter(
 		db.Collection("telemetry"),
 		registry,
@@ -131,6 +133,12 @@ func run(ctx context.Context, cfg config.Config, httpAddr string) error {
 		Addr:    cfg.Observability.MetricsAddr,
 		Handler: metricsHandler(metrics),
 	}
+	// The gateway is the operator API: firmware uploads land in the registry through it.
+	// Its routes are validated before anything is stored — see internal/firmware.
+	gatewaySrv := &http.Server{
+		Addr:    httpAddr,
+		Handler: firmware.NewHandler(firmwareStore, registry, log),
+	}
 
 	// The hub is the command seam the dispatch activity sends through; its sink is the
 	// ingest pipeline and its registry records accepted registrations. Accepted heartbeats
@@ -152,7 +160,7 @@ func run(ctx context.Context, cfg config.Config, httpAddr string) error {
 	})
 	hub := agentserver.NewHub(ingest, log)
 	grpcServer := grpc.NewServer(agentserver.ServerOptions(log)...)
-	agentv1.RegisterAgentServiceServer(grpcServer, agentserver.NewServer(hub, registry, signaler, log))
+	agentv1.RegisterAgentServiceServer(grpcServer, agentserver.NewServer(hub, registry, signaler, firmwareStore, log))
 
 	// Activities live beside their side effects: dispatch-command needs the in-process hub,
 	// so it joins this process on the same task queue the workflow worker uses.
@@ -188,6 +196,13 @@ func run(ctx context.Context, cfg config.Config, httpAddr string) error {
 		return nil
 	})
 	g.Go(func() error {
+		slog.Info("gateway server listening", "addr", httpAddr)
+		if err := gatewaySrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return fmt.Errorf("serve gateway on %s: %w", httpAddr, err)
+		}
+		return nil
+	})
+	g.Go(func() error {
 		// The ingest pipeline stops with the process and flushes what it holds first.
 		return ingest.Run(gctx)
 	})
@@ -215,6 +230,9 @@ func run(ctx context.Context, cfg config.Config, httpAddr string) error {
 		}
 		if err := metricsSrv.Shutdown(shutdownCtx); err != nil {
 			return fmt.Errorf("shut down metrics server: %w", err)
+		}
+		if err := gatewaySrv.Shutdown(shutdownCtx); err != nil {
+			return fmt.Errorf("shut down gateway server: %w", err)
 		}
 		// GracefulStop has no deadline of its own: give it the remaining shutdown budget
 		// and fall back to a hard stop so shutdown always completes.
