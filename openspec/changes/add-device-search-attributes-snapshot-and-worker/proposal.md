@@ -87,4 +87,8 @@ UI via search attributes, gives the entity a durable state projection in MongoDB
   run chains is the migration).
 - **Out of scope**: rollout-side callers, UI or gateway consumption of the snapshots, k3d/compose
   manifests for worker replicas, and relocating the dispatch-command activity into the worker
-  (it keeps living beside the in-process hub on the same task queue).
+  (it keeps living beside the in-process hub on the same task queue). Also out of scope: the
+  live-stack verification of the worker replica story and of the end-to-end path — both need a
+  running local stack and a Temporal UI, which the delivery plan reaches at stage 1 (stack
+  bring-up) and stage 2 (UI) respectively, so they are deferred rather than attempted here (see
+  tasks.md — Deferred verification).

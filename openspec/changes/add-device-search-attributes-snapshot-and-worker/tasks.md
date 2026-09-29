@@ -81,23 +81,51 @@
   success and any other error as startup failure; verify tests over a fake operator client cover
   fresh registration, re-registration, and the failure path, and `go test ./internal/temporal/
   ./cmd/worker/` passes
-- [ ] 5.3 Confirm the worker's lifecycle and replica story: bounded graceful shutdown on
-  SIGTERM (stop polling, drain in-flight work, exit cleanly) and per-replica probes on
-  `observability.health_addr`; verify by running two `cmd/worker` replicas against the dev stack
-  and observing that signals advance workflows and snapshots keep landing (one document per
-  device in `device_state_snapshots`) with either replica stopped
 - [x] 5.4 Update the worker entrypoint documentation in `cmd/README.md` (what it registers, the
   search-attribute bootstrap, how to run replicas) and the `internal/temporal` package doc for
   the entity's extended state and snapshot behavior; verify the docs match the binary's flags
   and registered names
+- [ ] 5.3 **Deferred** — see Deferred verification below
 
 ## 6. Integration verification
 
-- [ ] 6.1 Run the full definition of done — `goimports -w .`, `go vet ./...`,
+- [x] 6.1 Run the full definition of done — `goimports -w .`, `go vet ./...`,
   `golangci-lint run`, `go test -race -count=1 ./...` (plus the `integration`-tagged suite) —
-  and fix every finding without disabling linters
-- [ ] 6.2 Smoke the whole path on the local stack: control plane + two worker replicas + agent
+  and fix every finding without disabling linters; verify all gates are green: `go build ./...`,
+  `go vet ./...`, `golangci-lint run` (0 issues), `goimports -l .` (no output), `go test -race
+  -count=1 ./...`, the `-tags integration` suite (Mongo and RabbitMQ via testcontainers), and
+  `go test -race -count=2 ./internal/temporal/` for replay stability
+- [ ] 6.2 **Deferred** — see Deferred verification below
+
+## Deferred verification
+
+Both tasks below verify behavior that is already implemented, unit-tested, and integration-tested
+in this change. What they add is confirmation against a **running local stack**, which this
+project does not have yet: `deploy/` ships the MongoDB bootstrap and the configuration sample, but
+no compose or k3d manifests, so `make up` has nothing to apply
+([deploy/README.md](../../../deploy/README.md) — "Not implemented yet"). The requirement is
+delivery-stage gated, not a gap in this change:
+
+- **5.3 — Confirm the worker's lifecycle and replica story.** Bounded graceful shutdown on SIGTERM
+  (stop polling, drain in-flight work, exit cleanly) and per-replica probes on
+  `observability.health_addr`; verify by running two `cmd/worker` replicas against the dev stack
+  and observing that signals advance workflows and snapshots keep landing (one document per device
+  in `device_state_snapshots`) with either replica stopped.
+- **6.2 — Smoke the whole path on the local stack.** Control plane + two worker replicas + agent
   emulator; verify in the Temporal UI that device runs filter by region, model, firmware version,
-  and online status (including a device flipping offline after the threshold), and in MongoDB
-  that `device_state_snapshots` shows fresh snapshots at the configured cadence and immediate
-  ones after a firmware change
+  and online status (including a device flipping offline after the threshold), and in MongoDB that
+  `device_state_snapshots` shows fresh snapshots at the configured cadence and immediate ones
+  after a firmware change.
+
+**Unblocked by:** the stage that delivers the local stack (README: stack bring-up is **planned,
+stage 1** — compose first, then k3d) together with the stage that puts the Temporal UI in the
+stack (README: **planned, stage 2**). The dependency genuinely spans both stages, which is why
+these tasks were written against an environment the delivery plan had not reached.
+
+**Coverage cost, stated plainly:** four spec scenarios carry no automated test, and none of them
+are reachable without a running stack — `temporal-worker` "Two replicas share the load" and
+"Replica loss changes nothing observable", `temporal-worker` "Graceful shutdown" (the live-drain
+half; the shutdown path itself is implemented via `WorkerStopTimeout` and the errgroup lifecycle,
+and wire-up is covered by `cmd/worker` tests), and `device-search-attributes` "Filtering devices
+in the Temporal UI" (a manual check by construction). Every other scenario in this change's spec
+deltas has a backing test.
