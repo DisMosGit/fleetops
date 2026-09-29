@@ -88,6 +88,10 @@ Indexes: `_id_` (unique), `idx_version {version}` (unique). No TTL.
 
 ### `rollouts` — one document per rollout
 
+Written by the rollout workflow: the document is created when the rollout starts — carrying the
+firmware, the target selector, and the workflow execution that owns it — and its `status` moves as
+the rollout progresses.
+
 | Field | Type | Meaning |
 |---|---|---|
 | `_id` | string | rollout id (unique) |
@@ -97,20 +101,39 @@ Indexes: `_id_` (unique), `idx_version {version}` (unique). No TTL.
 | `region` | string | target group region (required) |
 | `model` | string | target group model (required) |
 
+`status` is one of `running`, `awaiting_approval` (holding at a wave that requires an operator
+approval), `rolled_back`, `completed`, or `failed`. The last three are terminal: a later write
+never moves the document out of one, so a retried or late transition leaves a concluded rollout's
+record as it stands. Every write is idempotent — recording a status the document already holds
+changes nothing.
+
 Indexes: `_id_` (unique), `idx_status {status}` (rollout list filtering), `idx_firmware_id
 {firmware_id}` (rollouts per firmware). No TTL.
 
 ### `waves` — one document per canary wave
 
+Written by the rollout workflow: a wave's document is created when its membership is resolved,
+before any update command is dispatched, and its `status` and `success_rate` are recorded as its
+gate decides.
+
 | Field | Type | Meaning |
 |---|---|---|
-| `_id` | string | wave id (unique) |
+| `_id` | string | wave id, derived as `<rollout_id>-w<position>-<percent>` (unique) |
 | `rollout_id` | string | parent rollout (required) |
-| `percent` | int | canary share of the target group: 1, 5, 25, or 100 (required) |
+| `percent` | int | cumulative canary share of the target group (required; the default sequence is 1, 5, 25, 100) |
 | `status` | string | wave status (required) |
-| `success_rate` | number | health over the wave's health window (required) |
+| `success_rate` | number | success ratio measured over the wave's health window (required) |
 | `device_ids` | array of string | the target devices the wave was dispatched to (required; may be empty) |
 | `started_at` | date | when the wave started, opening its health window (required) |
+
+`status` is one of `dispatching` (membership recorded, update commands being delivered),
+`evaluating` (dispatched, inside its health window or being re-measured), `skipped` (a share that
+added no device: recorded, not dispatched, and not gated on health), `healthy` or `unhealthy` (the
+gate's decision), or `failed` (its update commands could not be delivered). `success_rate` is `0`
+until the wave's health has been evaluated and then carries the evaluated success ratio; a skipped
+wave is never evaluated and keeps `0`. Writing the same transition twice leaves the document
+unchanged, and a decided wave's membership and `started_at` are never rewritten — they are the
+denominator and the window its decision was measured over.
 
 `device_ids` is the wave's membership as resolved when it started, recorded rather than
 re-derived: a device that re-registers or changes model mid-rollout must not silently move the
