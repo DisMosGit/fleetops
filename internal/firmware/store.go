@@ -120,13 +120,20 @@ func (s *Store) Save(ctx context.Context, version string, models []string, binar
 	return rec, nil
 }
 
+// Metadata returns the metadata record of id without touching its stored binary — what a caller
+// needs to decide whether a firmware may be deployed, and to name its version and checksum in the
+// command that deploys it. An unknown id fails with an error wrapping ErrNotFound.
+func (s *Store) Metadata(ctx context.Context, id string) (Record, error) {
+	if id == "" {
+		return Record{}, errors.New("read firmware metadata: firmware id required")
+	}
+	return s.meta.find(ctx, id)
+}
+
 // Open returns the firmware record of id and a reader over its stored binary. An unknown id
 // fails with an error wrapping ErrNotFound.
 func (s *Store) Open(ctx context.Context, id string) (Record, io.ReadCloser, error) {
-	if id == "" {
-		return Record{}, nil, errors.New("open firmware: firmware id required")
-	}
-	rec, err := s.meta.find(ctx, id)
+	rec, err := s.Metadata(ctx, id)
 	if err != nil {
 		return Record{}, nil, err
 	}

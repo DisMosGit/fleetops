@@ -10,6 +10,8 @@ import (
 	"io"
 	"strings"
 	"testing"
+
+	"github.com/google/go-cmp/cmp"
 )
 
 // fakeMetadata is an in-memory metadata seam with a scriptable insert failure.
@@ -320,6 +322,43 @@ func TestOpen(t *testing.T) {
 		_, _, err := orphan.Open(context.Background(), rec.ID)
 		if err == nil || errors.Is(err, ErrNotFound) {
 			t.Fatalf("Open() error = %v, want the storage failure", err)
+		}
+	})
+}
+
+func TestMetadata(t *testing.T) {
+	t.Parallel()
+
+	store := &Store{meta: newFakeMetadata(), binaries: newFakeBinaries()}
+	rec, err := store.Save(context.Background(), "2.0.0", []string{"oak-s3"}, strings.NewReader("binary"))
+	if err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+
+	t.Run("returns the record without opening its binary", func(t *testing.T) {
+		t.Parallel()
+		got, err := store.Metadata(context.Background(), rec.ID)
+		if err != nil {
+			t.Fatalf("Metadata() error = %v", err)
+		}
+		if diff := cmp.Diff(rec, got); diff != "" {
+			t.Errorf("Metadata() mismatch (-want +got):\n%s", diff)
+		}
+	})
+
+	t.Run("unknown firmware wraps ErrNotFound", func(t *testing.T) {
+		t.Parallel()
+		_, err := store.Metadata(context.Background(), "fw-unknown")
+		if !errors.Is(err, ErrNotFound) {
+			t.Fatalf("Metadata() error = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("empty id is refused", func(t *testing.T) {
+		t.Parallel()
+		_, err := store.Metadata(context.Background(), "")
+		if err == nil {
+			t.Fatal("Metadata() error = nil, want an error")
 		}
 	})
 }
