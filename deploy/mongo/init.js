@@ -12,6 +12,13 @@
 const TELEMETRY_RETENTION_DAYS = Number(process.env.FLEETOPS_TELEMETRY_RETENTION_DAYS || 7);
 const TELEMETRY_RETENTION_SECONDS = TELEMETRY_RETENTION_DAYS * 24 * 60 * 60;
 
+// PROCESSED_EVENTS_RETENTION_DAYS is the single named configuration value for the consumer
+// dedup ledger's retention: the TTL index below is built from it, and the consumer's ledger
+// writes read the same FLEETOPS_PROCESSED_EVENTS_RETENTION_DAYS variable so one change moves
+// both. The ledger is pipeline bookkeeping, so — unlike domain records — it does expire.
+const PROCESSED_EVENTS_RETENTION_DAYS = Number(process.env.FLEETOPS_PROCESSED_EVENTS_RETENTION_DAYS || 7);
+const PROCESSED_EVENTS_RETENTION_SECONDS = PROCESSED_EVENTS_RETENTION_DAYS * 24 * 60 * 60;
+
 const fleet = db.getSiblingDB("fleetops");
 
 function ensureCollection(name, options) {
@@ -177,4 +184,61 @@ fleet.telemetry.createIndex(
   { name: "idx_ts_ttl", expireAfterSeconds: TELEMETRY_RETENTION_SECONDS },
 );
 
-print("fleetops bootstrap complete: telemetry retention " + TELEMETRY_RETENTION_DAYS + " days");
+// processed_events: the consumer dedup ledger, one document per (consumer, event id) pair,
+// _id = "<consumer>:<event id>". processed_at is absent until the consumer's side effect is
+// durable, and a document without it is unfinished work rather than an applied event — the
+// consumer resumes it. Pipeline bookkeeping, not a domain record: the TTL index bounds it.
+ensureCollection("processed_events", {
+  validationAction: "error",
+  validationLevel: "strict",
+  validator: {
+    $jsonSchema: {
+      bsonType: "object",
+      required: ["consumer", "event_id", "device_id", "claimed_at"],
+      properties: {
+        consumer: { bsonType: "string" },
+        event_id: { bsonType: "string" },
+        device_id: { bsonType: "string" },
+        claimed_at: { bsonType: "date" },
+        processed_at: { bsonType: "date" },
+      },
+    },
+  },
+});
+fleet.processed_events.createIndex(
+  { consumer: 1, event_id: 1 },
+  { name: "idx_consumer_event", unique: true },
+);
+fleet.processed_events.createIndex({ device_id: 1 }, { name: "idx_device_id" });
+fleet.processed_events.createIndex(
+  { claimed_at: 1 },
+  { name: "idx_claimed_at_ttl", expireAfterSeconds: PROCESSED_EVENTS_RETENTION_SECONDS },
+);
+
+// device_alerts: at most one alert document per device, _id = device identity, refreshed in
+// place by the alerting consumer's monotone upsert (earliest first_seen_at, lowest
+// min_health, newest last_seen_at). Domain record: never expires, and it never holds the raw
+// heartbeat payload.
+ensureCollection("device_alerts", {
+  validationAction: "error",
+  validationLevel: "strict",
+  validator: {
+    $jsonSchema: {
+      bsonType: "object",
+      required: ["device_id", "region", "model", "threshold", "min_health", "first_seen_at", "last_seen_at"],
+      properties: {
+        device_id: { bsonType: "string" },
+        region: { bsonType: "string" },
+        model: { bsonType: "string" },
+        threshold: { bsonType: ["double", "int", "long"] },
+        min_health: { bsonType: ["double", "int", "long"] },
+        first_seen_at: { bsonType: "date" },
+        last_seen_at: { bsonType: "date" },
+      },
+    },
+  },
+});
+fleet.device_alerts.createIndex({ region: 1, model: 1 }, { name: "idx_region_model" });
+
+print("fleetops bootstrap complete: telemetry retention " + TELEMETRY_RETENTION_DAYS + " days"
+  + ", processed-events retention " + PROCESSED_EVENTS_RETENTION_DAYS + " days");

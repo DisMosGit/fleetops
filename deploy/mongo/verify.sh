@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Verifies the FleetOps MongoDB data model (deploy/mongo/init.js) against a running MongoDB:
-# collections, required-field validators, the index set, telemetry TTL retention, and the
-# redelivery no-op contract. Exits non-zero on the first violation.
+# collections, required-field validators, the index set, telemetry and processed-events TTL
+# retention, and the redelivery no-op contract. Exits non-zero on the first violation.
 #
 # Usage:
 #   deploy/mongo/verify.sh
@@ -9,12 +9,15 @@
 # Environment:
 #   MONGO_URI                        connection string (default mongodb://localhost:27017)
 #   FLEETOPS_TELEMETRY_RETENTION_DAYS expected retention in days (default 7; must match init.js)
+#   FLEETOPS_PROCESSED_EVENTS_RETENTION_DAYS
+#                                    expected dedup-ledger retention in days (default 7)
 #   MONGO_CONTAINER                  container providing mongosh when none is on PATH
 #                                    (default fleetops-mongo)
 set -euo pipefail
 
 MONGO_URI="${MONGO_URI:-mongodb://localhost:27017}"
 RETENTION_DAYS="${FLEETOPS_TELEMETRY_RETENTION_DAYS:-7}"
+LEDGER_RETENTION_DAYS="${FLEETOPS_PROCESSED_EVENTS_RETENTION_DAYS:-7}"
 MONGO_CONTAINER="${MONGO_CONTAINER:-fleetops-mongo}"
 
 if command -v mongosh >/dev/null 2>&1; then
@@ -28,9 +31,11 @@ fi
 
 SCRIPT="$(mktemp)"
 trap 'rm -f "$SCRIPT"' EXIT
-sed "s/__RETENTION_DAYS__/${RETENTION_DAYS}/g" >"$SCRIPT" <<'EOF'
-// Assertions for the FleetOps data model; __RETENTION_DAYS__ is substituted by verify.sh.
+sed "s/__RETENTION_DAYS__/${RETENTION_DAYS}/g; s/__LEDGER_RETENTION_DAYS__/${LEDGER_RETENTION_DAYS}/g" >"$SCRIPT" <<'EOF'
+// Assertions for the FleetOps data model; the retention placeholders are substituted by
+// verify.sh.
 const EXPECTED_RETENTION_SECONDS = __RETENTION_DAYS__ * 24 * 60 * 60;
+const EXPECTED_LEDGER_RETENTION_SECONDS = __LEDGER_RETENTION_DAYS__ * 24 * 60 * 60;
 const fleet = db.getSiblingDB("fleetops");
 let failures = 0;
 
@@ -43,7 +48,7 @@ function check(ok, label) {
 
 // --- collections ---
 const present = fleet.getCollectionNames();
-for (const name of ["devices", "device_state_snapshots", "firmware", "rollouts", "waves", "telemetry"]) {
+for (const name of ["devices", "device_state_snapshots", "firmware", "rollouts", "waves", "telemetry", "processed_events", "device_alerts"]) {
   check(present.includes(name), "collection " + name + " exists");
 }
 
@@ -59,6 +64,8 @@ const expectedRequired = {
   firmware: ["version", "models", "checksum", "size", "created_at", "gridfs_id"],
   rollouts: ["firmware_id", "status", "temporal_wf_id", "region", "model"],
   waves: ["rollout_id", "percent", "status", "success_rate"],
+  processed_events: ["consumer", "event_id", "device_id", "claimed_at"],
+  device_alerts: ["device_id", "region", "model", "threshold", "min_health", "first_seen_at", "last_seen_at"],
 };
 for (const [coll, fields] of Object.entries(expectedRequired)) {
   const req = requiredOf(coll);
@@ -116,8 +123,25 @@ check(
   "telemetry.idx_ts_ttl {ts} expireAfterSeconds=" + EXPECTED_RETENTION_SECONDS,
 );
 
+const ledger = indexMap("processed_events");
+check(
+  sameKey(ledger["idx_consumer_event"], [["consumer", 1], ["event_id", 1]]) &&
+    ledger["idx_consumer_event"].unique === true,
+  "processed_events.idx_consumer_event {consumer, event_id} unique",
+);
+check(sameKey(ledger["idx_device_id"], [["device_id", 1]]), "processed_events.idx_device_id {device_id}");
+check(
+  sameKey(ledger["idx_claimed_at_ttl"], [["claimed_at", 1]]) &&
+    ledger["idx_claimed_at_ttl"].expireAfterSeconds === EXPECTED_LEDGER_RETENTION_SECONDS,
+  "processed_events.idx_claimed_at_ttl {claimed_at} expireAfterSeconds=" + EXPECTED_LEDGER_RETENTION_SECONDS,
+);
+
+const alerts = indexMap("device_alerts");
+check(sameKey(alerts["idx_region_model"], [["region", 1], ["model", 1]]),
+  "device_alerts.idx_region_model {region, model}");
+
 // --- retention: no TTL anywhere else (domain records and GridFS never expire) ---
-for (const coll of ["devices", "device_state_snapshots", "firmware", "rollouts", "waves"]) {
+for (const coll of ["devices", "device_state_snapshots", "firmware", "rollouts", "waves", "device_alerts"]) {
   const anyTtl = Object.values(indexMap(coll)).some((i) => i.expireAfterSeconds !== undefined);
   check(!anyTtl, coll + " has no TTL index");
 }
@@ -153,6 +177,26 @@ check(dupRejected, "duplicate insert signals the no-op via duplicate-key _id");
 check(fleet.telemetry.countDocuments({ _id: evt }) === 1,
   "duplicate insert does not create a second row");
 fleet.telemetry.deleteMany({ _id: evt });
+
+// --- dedup ledger contract: one document per (consumer, event id) ---
+const claim = {
+  _id: "verify-consumer:" + evt,
+  consumer: "verify-consumer",
+  event_id: evt,
+  device_id: "verify-dev",
+  claimed_at: new Date(),
+};
+fleet.processed_events.insertOne(claim);
+let secondRejected = false;
+try {
+  fleet.processed_events.insertOne(claim);
+} catch (e) {
+  secondRejected = e.code === 11000;
+}
+check(secondRejected, "a second processed_events document for one pair is refused");
+check(fleet.processed_events.countDocuments({ consumer: "verify-consumer", event_id: evt }) === 1,
+  "one processed_events document per consumer and event id");
+fleet.processed_events.deleteMany({ consumer: "verify-consumer", event_id: evt });
 
 if (failures > 0) {
   print(failures + " check(s) failed");

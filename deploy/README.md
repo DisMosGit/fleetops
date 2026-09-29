@@ -139,10 +139,57 @@ Indexes: `_id_` (unique), `idx_device_ts {meta.device_id, ts}` (per-device time 
 `idx_region_model_ts {meta.region, meta.model, ts}` (region+model health windows),
 `idx_ts_ttl {ts}` TTL with `expireAfterSeconds` (retention below).
 
+### `processed_events` — the consumer dedup ledger
+
+One document per consumer and event, `_id` = `<consumer>:<event id>`; the unique
+(`consumer`, `event_id`) index makes a second document for one pair impossible. `processed_at` is
+absent until the consumer's side effect is durable, and a document without it is unfinished work
+the consumer resumes rather than an applied event. Pipeline bookkeeping, not a domain record: it
+expires (retention below).
+
+| Field | Type | Meaning |
+|---|---|---|
+| `_id` | string | `<consumer>:<event id>` (unique) |
+| `consumer` | string | consumer identity, the work queue name (required) |
+| `event_id` | string | the event's stable identifier (required) |
+| `device_id` | string | device the event belongs to (required) |
+| `claimed_at` | date | when the consumer first took the event for processing (required) |
+| `processed_at` | date | when the side effect became durable; absent while the work is unfinished |
+
+Indexes: `_id_` (unique), `idx_consumer_event {consumer, event_id}` (unique — the dedup
+guarantee), `idx_device_id {device_id}`, `idx_claimed_at_ttl {claimed_at}` TTL with
+`expireAfterSeconds` (retention below).
+
+### `device_alerts` — one alert per degraded device
+
+Written by the alerting consumer's monotone upsert: `$min` on `first_seen_at` and `min_health`,
+`$max` on `last_seen_at`, `$set` for identity and threshold, so replaying an event converges to the
+same document. Domain record: never expires, and it never holds the raw heartbeat payload.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `_id` | string | device identity (unique) |
+| `device_id` | string | device identity (required) |
+| `region` | string | device region (required) |
+| `model` | string | device model (required) |
+| `threshold` | number | health threshold that triggered the alert (required) |
+| `min_health` | number | lowest health observed since the alert opened (required) |
+| `first_seen_at` | date | earliest degraded observation (required) |
+| `last_seen_at` | date | newest degraded observation (required) |
+
+Indexes: `_id_` (unique, device identity), `idx_region_model {region, model}`. No TTL.
+
 ### Retention
 
 Heartbeat telemetry is retained for **7 days** after its `ts` and then removed automatically by
 the TTL index — no cleanup job. The period is the single named configuration value
 `FLEETOPS_TELEMETRY_RETENTION_DAYS` (default 7): `mongo/init.js` builds the TTL index from it and
 the ingestion path (stage 3) reads the same variable, so one change moves both. Domain
-collections (`devices`, `firmware`, `rollouts`, `waves`) and GridFS binaries never expire.
+collections (`devices`, `firmware`, `rollouts`, `waves`, `device_state_snapshots`,
+`device_alerts`) and GridFS binaries never expire.
+
+The consumer dedup ledger is bookkeeping and expires too: `processed_events` documents are removed
+**7 days** after `claimed_at`, built from the named value
+`FLEETOPS_PROCESSED_EVENTS_RETENTION_DAYS` (default 7, the same pattern). Past that window a
+redelivery is applied again, which is why every consumer side effect is idempotent by
+construction.
