@@ -1,0 +1,83 @@
+// FleetOps rollout health contract, v1.
+//
+// One unary RolloutService.GetWaveHealth answers the question a canary gate asks: how
+// healthy is a given wave of a given rollout right now, and on how much evidence. The
+// response carries the measured success ratio and sample size together with the window the
+// samples were read from and the thresholds the verdict was computed against, so a caller
+// never has to guess which configuration produced a number.
+//
+// This package is a different bounded context from the agent transport: an operator health
+// query is not an agent exchange, and messages are never shared across the two packages.
+//
+// v1 freezes when it lands: evolve by adding fields, messages, and RPCs only. Never
+// renumber, reuse, or rewrite an existing field.
+syntax = "proto3";
+
+package fleetops.rollout.v1;
+
+option go_package = "github.com/DisMosGit/fleetops/api/proto/rollout/v1;rolloutv1";
+
+import "google/protobuf/timestamp.proto";
+
+// RolloutService is the operator- and workflow-facing surface over rollout state: it answers
+// how a running canary wave is doing, over the heartbeat telemetry its devices emitted.
+service RolloutService {
+  // GetWaveHealth evaluates one wave of one rollout over the configured sliding health
+  // window and returns the wave's success ratio, the sample size the ratio rests on, and the
+  // resulting verdict. An empty window is a successful, undecided result rather than an
+  // error; an unknown rollout or a wave that is not that rollout's maps to NOT_FOUND, and a
+  // request missing either id is rejected as INVALID_ARGUMENT before any state is read.
+  rpc GetWaveHealth(GetWaveHealthRequest) returns (GetWaveHealthResponse);
+}
+
+// GetWaveHealthRequest names the wave to evaluate. Both ids are required: a wave is only
+// meaningful inside its rollout, and the pair is what makes the answer unambiguous.
+message GetWaveHealthRequest {
+  // Rollout whose wave is evaluated.
+  string rollout_id = 1;
+  // Wave of that rollout to evaluate.
+  string wave_id = 2;
+}
+
+// GetWaveHealthResponse is one wave's health: the measurement, the evidence behind it, and
+// the configuration it was judged against. The verdict is never left unspecified on a served
+// response — a window without enough evidence is reported as undecided.
+message GetWaveHealthResponse {
+  // Rollout the evaluation was requested for, echoed so concurrent callers can match
+  // results to requests.
+  string rollout_id = 1;
+  // Wave the evaluation was requested for, echoed likewise.
+  string wave_id = 2;
+  // Share of the window's samples whose health was at or above the per-sample health
+  // threshold, in [0, 1]; zero when the window holds no samples.
+  double success_ratio = 3;
+  // Number of heartbeat samples the ratio was computed over; zero for an empty window.
+  int64 sample_size = 4;
+  // Verdict the ratio and sample size produced.
+  WaveHealthVerdict verdict = 5;
+  // Start of the effective window the samples were read from: the configured health window
+  // ending at the evaluation, never earlier than the wave's start.
+  google.protobuf.Timestamp window_start = 6;
+  // End of the effective window, at the moment the evaluation ran.
+  google.protobuf.Timestamp window_end = 7;
+  // Health score at or above which a sample counted as a success.
+  double sample_health_threshold = 8;
+  // Success ratio at or above which a decided window is healthy.
+  double min_success_ratio = 9;
+  // Sample count a window must hold before its verdict is decided.
+  int64 min_samples = 10;
+}
+
+// WaveHealthVerdict is the closed set of outcomes one evaluation can report. A window with
+// fewer samples than the configured minimum is undecided rather than healthy, so thin
+// evidence can never promote a wave and a waiting gate is distinguishable from a rollback.
+enum WaveHealthVerdict {
+  // Unset; never sent on a served response.
+  WAVE_HEALTH_VERDICT_UNSPECIFIED = 0;
+  // The window holds too few samples for a decision; the ratio is not promotion evidence.
+  WAVE_HEALTH_VERDICT_UNDECIDED = 1;
+  // The window holds enough samples and the success ratio is at or above the minimum.
+  WAVE_HEALTH_VERDICT_HEALTHY = 2;
+  // The window holds enough samples and the success ratio is below the minimum.
+  WAVE_HEALTH_VERDICT_UNHEALTHY = 3;
+}

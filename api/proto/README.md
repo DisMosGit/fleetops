@@ -32,6 +32,25 @@ Message vocabulary:
 | Heartbeat | `Heartbeat` (fire-and-forget) | `event_id`, `device_id`, `current_fw`, `status`, `ts`, `cpu`, `mem`, `health` |
 | Commands | `Command` (`StartUpdate`, `AbortUpdate`) | `command_id`, `device_id`, typed payload |
 
+## The v1 rollout health contract
+
+`rollout/v1/rollout.proto` (package `fleetops.rollout.v1`, import
+`github.com/DisMosGit/fleetops/api/proto/rollout/v1`) is the operator- and workflow-facing surface
+over rollout state. It is a different bounded context from the agent transport and shares no
+messages with it:
+
+- **`RolloutService.GetWaveHealth`** — unary. `GetWaveHealthRequest` names a `rollout_id` and a
+  `wave_id`; `GetWaveHealthResponse` returns the wave's `success_ratio` and `sample_size`, the
+  `WaveHealthVerdict`, the effective `window_start` / `window_end` the samples were read from, and
+  the `sample_health_threshold`, `min_success_ratio`, and `min_samples` the verdict was computed
+  against. Both ids are echoed so concurrent callers can match results to their requests.
+
+The verdict set is closed and never unset on a served response: `WAVE_HEALTH_VERDICT_UNDECIDED`
+when the window holds fewer samples than `min_samples` (thin evidence must not promote a wave),
+otherwise `HEALTHY` at or above `min_success_ratio` and `UNHEALTHY` below it. An unknown rollout,
+an unknown wave, and a wave belonging to another rollout are all `NOT_FOUND`, and a request
+missing either id is `INVALID_ARGUMENT`.
+
 ## Regenerating the Go stubs
 
 Generated Go (`*.pb.go`, `*_grpc.pb.go`) is committed beside the contracts under `api/proto/` so
