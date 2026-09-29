@@ -27,19 +27,73 @@ construct dependencies, and start the run loop.
 - `worker` hosts the device entity and the canary rollout on `temporal.task_queue`. For the
   entity it registers `DeviceWorkflow` and the `snapshot-device-state` activity (the projection of
   device state into `device_state_snapshots`); for a rollout it registers `rollout-workflow` and
-  the six activities a rollout's side effects need — `load-firmware`, `resolve-wave-targets`,
-  `record-rollout-state`, `record-wave-state`, `update-device`, and `evaluate-wave-health` — all
-  under their explicit names, plus the namespace's custom search attributes (`DeviceRegion`,
-  `DeviceModel`, `DeviceFirmware`, `DeviceOnline`, `RolloutFirmware`, `RolloutRegion`,
-  `RolloutStatus`) before it starts polling, so device and rollout runs are filterable in the
-  Temporal UI. It holds no replica-local state: run it as one process or as many replicas on the
-  same task queue — any replica executes any workflow or activity task, and replicas may start and
-  stop freely. `update-device` runs one activity per target device: it signals that device's
-  workflow, then waits for the device's reported result by reading its state query, so the
-  worker needs no agent connection. The `dispatch-command` activity is not registered here: it
-  runs in `controlplane`, beside the agent hub it dispatches through. On one machine, give each
-  replica its own `observability.health_addr` and `observability.metrics_addr`; in the cluster each
-  pod has its own.
+  the nine activities a rollout's side effects need — `load-firmware`, `resolve-wave-targets`,
+  `record-rollout-state`, `record-wave-state`, `update-device`, `downgrade-device`,
+  `reconcile-device-inventory`, `announce-rollback`, and `evaluate-wave-health` — all under their
+  explicit names, plus the namespace's custom search attributes (`DeviceRegion`, `DeviceModel`,
+  `DeviceFirmware`, `DeviceOnline`, `RolloutFirmware`, `RolloutRegion`, `RolloutStatus`) before it
+  starts polling, so device and rollout runs are filterable in the Temporal UI. It holds no
+  replica-local state: run it as one process or as many replicas on the same task queue — any
+  replica executes any workflow or activity task, and replicas may start and stop freely.
+  `update-device` and `downgrade-device` run one activity per target device: each signals that
+  device's workflow, then waits for the device's reported result by reading its state query, so
+  the worker needs no agent connection. `reconcile-device-inventory` reconciles one device's
+  recorded `current_fw` against the version that device's workflow holds. The `dispatch-command`
+  activity is not registered here: it runs in `controlplane`, beside the agent hub it dispatches
+  through. On one machine, give each replica its own `observability.health_addr` and
+  `observability.metrics_addr`; in the cluster each pod has its own.
+- `worker` also hosts the broker publisher a rollback's announcements are published through:
+  `announce-rollback` runs here, so the publisher is started with the worker (before it polls) and
+  keeps a RabbitMQ session for the worker's lifetime, reconnecting after an outage without a
+  worker restart. A broker that is unreachable at startup does not stop the worker polling — an
+  announcement fails after its short retry budget and the rollback continues. The worker declares
+  the same broker layout `controlplane` does, including the `fleetops.rollout.notifications`
+  queue a rollback's events are enqueued on (see [docs/telemetry.md](../docs/telemetry.md)).
+
+## Rolling back
+
+A rollout rolls back on its own when a wave fails: an unhealthy verdict, an undecided wave past its
+decision timeout, or a wave whose update commands could not be delivered. Entering rollback derives
+the plan of compensations from the rollout's own recorded progress and runs it in order — the
+`rollout.notification.rollback.started` announcement, one `downgrade-device` per device of each
+dispatched wave with the most recently dispatched first, `reconcile-device-inventory` per device the
+plan compensates, and the `rollout.notification.rollback.completed` announcement — after which the
+rollout records its terminal `rolled_back` status. While the plan runs the rollout reports
+`rolling_back`, and a pause, a resume, or an approval delivered then changes nothing: a
+compensation is not interruptible.
+
+Reading the rollout's state query while it compensates or after it concluded:
+
+```json
+{
+  "rollout_id": "ro-2026-01-02",
+  "status": "rolling_back",
+  "firmware_id": "fw-1a2b3c",
+  "firmware_version": "2.0.0",
+  "region": "eu-west",
+  "model": "oak-s3",
+  "waves": [{"percent": 1, "status": "healthy", "target_count": 10, "failed_count": 0, "unreported_count": 0}],
+  "current": -1,
+  "outcome": "unhealthy_wave",
+  "ended_by": "ro-2026-01-02-w1-5",
+  "rollback": {
+    "plan": [
+      {"kind": "notify_started", "status": "completed", "devices": 0},
+      {"kind": "downgrade", "wave_id": "ro-2026-01-02-w1-5", "status": "running", "devices": 40,
+       "restored": 0, "failed": 0, "unreported": 0, "skipped": 0, "unavailable": 0},
+      {"kind": "reconcile_inventory", "status": "pending", "devices": 50}
+    ],
+    "unrestored_device_ids": []
+  }
+}
+```
+
+`rollback.inventory` fills in once the reconciliation has run — the number of devices the rollback
+touched that were found on each firmware version — and `rollback.unrestored_device_ids` names the
+devices left on the rolled-back firmware: the ones that reported a failed restore, never reported,
+or could not be restored at all. A device that never reported is not lost work: its device workflow
+keeps the restore command pending and delivers it when the agent returns. The same record is written
+to the rollout document as it compensates.
 
 ## Starting a rollout
 
@@ -137,6 +191,10 @@ failure rather than holding an operator's request open behind a query nothing is
 | `POST /api/rollouts/{id}/approve` | authorize the next approval-gated wave |
 | `POST /api/rollouts/{id}/pause` | hold the rollout |
 | `POST /api/rollouts/{id}/resume` | continue a held rollout |
+
+A rollout that has entered rollback ignores `approve`, `pause`, and `resume`: its compensations are
+not interruptible, and the call is still answered `202` because the rollout is not concluded (see
+[Rolling back](#rolling-back)).
 
 ### Starting a rollout
 
