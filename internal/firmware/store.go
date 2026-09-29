@@ -41,6 +41,9 @@ type metadata interface {
 	insert(ctx context.Context, rec Record) error
 	// find returns the firmware document with the given id, or an error wrapping ErrNotFound.
 	find(ctx context.Context, id string) (Record, error)
+	// findByVersion returns the firmware document carrying version, or an error wrapping
+	// ErrNotFound. Versions are unique, so the lookup has at most one answer.
+	findByVersion(ctx context.Context, version string) (Record, error)
 	// versionExists reports whether a document already carries version.
 	versionExists(ctx context.Context, version string) (bool, error)
 }
@@ -130,6 +133,18 @@ func (s *Store) Metadata(ctx context.Context, id string) (Record, error) {
 	return s.meta.find(ctx, id)
 }
 
+// MetadataByVersion returns the metadata record carrying version, without touching its stored
+// binary. It is how a caller that knows only a version — a device reporting the firmware it ran,
+// or a rollback restoring a device to it — obtains the firmware's id, checksum, and target
+// models. A version the registry does not hold fails with an error wrapping ErrNotFound, which
+// is a different answer from a record with empty fields.
+func (s *Store) MetadataByVersion(ctx context.Context, version string) (Record, error) {
+	if version == "" {
+		return Record{}, errors.New("read firmware metadata: firmware version required")
+	}
+	return s.meta.findByVersion(ctx, version)
+}
+
 // Open returns the firmware record of id and a reader over its stored binary. An unknown id
 // fails with an error wrapping ErrNotFound.
 func (s *Store) Open(ctx context.Context, id string) (Record, io.ReadCloser, error) {
@@ -178,6 +193,18 @@ func (m *mongoMetadata) find(ctx context.Context, id string) (Record, error) {
 			return Record{}, fmt.Errorf("find firmware %s: %w", id, ErrNotFound)
 		}
 		return Record{}, fmt.Errorf("find firmware %s: %w", id, err)
+	}
+	return rec, nil
+}
+
+// findByVersion returns the firmware document carrying version.
+func (m *mongoMetadata) findByVersion(ctx context.Context, version string) (Record, error) {
+	var rec Record
+	if err := m.coll.FindOne(ctx, bson.D{{Key: "version", Value: version}}).Decode(&rec); err != nil {
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			return Record{}, fmt.Errorf("find firmware version %s: %w", version, ErrNotFound)
+		}
+		return Record{}, fmt.Errorf("find firmware version %s: %w", version, err)
 	}
 	return rec, nil
 }

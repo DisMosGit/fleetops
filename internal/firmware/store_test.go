@@ -14,12 +14,13 @@ import (
 	"github.com/google/go-cmp/cmp"
 )
 
-// fakeMetadata is an in-memory metadata seam with a scriptable insert failure.
+// fakeMetadata is an in-memory metadata seam with scriptable insert and lookup failures.
 type fakeMetadata struct {
 	docs      map[string]Record
 	byVersion map[string]string
 	insertErr error
-	existsErr error
+	// lookupErr fails both version lookups, standing in for a backend that is unreachable.
+	lookupErr error
 }
 
 // newFakeMetadata returns an empty fake metadata collection.
@@ -54,11 +55,23 @@ func (f *fakeMetadata) find(_ context.Context, id string) (Record, error) {
 
 // versionExists reports whether the fake already holds version.
 func (f *fakeMetadata) versionExists(_ context.Context, version string) (bool, error) {
-	if f.existsErr != nil {
-		return false, f.existsErr
+	if f.lookupErr != nil {
+		return false, f.lookupErr
 	}
 	_, ok := f.byVersion[version]
 	return ok, nil
+}
+
+// findByVersion returns the record carrying version.
+func (f *fakeMetadata) findByVersion(_ context.Context, version string) (Record, error) {
+	if f.lookupErr != nil {
+		return Record{}, f.lookupErr
+	}
+	id, ok := f.byVersion[version]
+	if !ok {
+		return Record{}, fmt.Errorf("find firmware version %s: %w", version, ErrNotFound)
+	}
+	return f.docs[id], nil
 }
 
 // fakeBinaries is an in-memory binaries seam with scriptable failures.
@@ -359,6 +372,59 @@ func TestMetadata(t *testing.T) {
 		_, err := store.Metadata(context.Background(), "")
 		if err == nil {
 			t.Fatal("Metadata() error = nil, want an error")
+		}
+	})
+}
+
+// TestMetadataByVersion pins the lookup a rollback resolves a device's previous firmware through:
+// a version resolves to its record without reading the binary, an unclaimed version is reported as
+// not found rather than as an empty record, and a backend failure is wrapped rather than swallowed.
+func TestMetadataByVersion(t *testing.T) {
+	t.Parallel()
+
+	store := &Store{meta: newFakeMetadata(), binaries: newFakeBinaries()}
+	rec, err := store.Save(context.Background(), "1.0.0", []string{"oak-s3"}, strings.NewReader("binary"))
+	if err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+
+	t.Run("resolves a version to its record", func(t *testing.T) {
+		t.Parallel()
+		got, err := store.MetadataByVersion(context.Background(), "1.0.0")
+		if err != nil {
+			t.Fatalf("MetadataByVersion() error = %v", err)
+		}
+		if diff := cmp.Diff(rec, got); diff != "" {
+			t.Errorf("MetadataByVersion() mismatch (-want +got):\n%s", diff)
+		}
+	})
+
+	t.Run("unclaimed version wraps ErrNotFound", func(t *testing.T) {
+		t.Parallel()
+		_, err := store.MetadataByVersion(context.Background(), "9.9.9")
+		if !errors.Is(err, ErrNotFound) {
+			t.Fatalf("MetadataByVersion() error = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("empty version is refused", func(t *testing.T) {
+		t.Parallel()
+		_, err := store.MetadataByVersion(context.Background(), "")
+		if err == nil {
+			t.Fatal("MetadataByVersion() error = nil, want an error")
+		}
+	})
+
+	t.Run("backend failure is wrapped", func(t *testing.T) {
+		t.Parallel()
+		backend := errors.New("mongo is down")
+		failing := &Store{
+			meta:     &fakeMetadata{docs: map[string]Record{}, byVersion: map[string]string{}, lookupErr: backend},
+			binaries: newFakeBinaries(),
+		}
+		_, err := failing.MetadataByVersion(context.Background(), "1.0.0")
+		if !errors.Is(err, backend) {
+			t.Fatalf("MetadataByVersion() error = %v, want it to wrap %v", err, backend)
 		}
 	})
 }

@@ -30,6 +30,11 @@ func (f failingMetadata) find(ctx context.Context, id string) (Record, error) {
 	return f.inner.find(ctx, id)
 }
 
+// findByVersion delegates to the real metadata collection.
+func (f failingMetadata) findByVersion(ctx context.Context, version string) (Record, error) {
+	return f.inner.findByVersion(ctx, version)
+}
+
 // versionExists delegates to the real metadata collection.
 func (f failingMetadata) versionExists(ctx context.Context, version string) (bool, error) {
 	return f.inner.versionExists(ctx, version)
@@ -137,6 +142,19 @@ func TestStore(t *testing.T) {
 		_, _, err := store.Open(ctx, "fw-unknown")
 		if !errors.Is(err, ErrNotFound) {
 			t.Fatalf("Open() error = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("saved firmware resolves by version", func(t *testing.T) {
+		got, err := store.MetadataByVersion(ctx, "2.0.0")
+		if err != nil {
+			t.Fatalf("MetadataByVersion() error = %v", err)
+		}
+		if got.ID == "" || got.Version != "2.0.0" || got.Checksum == "" || len(got.Models) == 0 {
+			t.Errorf("MetadataByVersion() = %+v, want the saved record", got)
+		}
+		if _, err := store.MetadataByVersion(ctx, "9.9.9"); !errors.Is(err, ErrNotFound) {
+			t.Errorf("MetadataByVersion() on an unclaimed version = %v, want ErrNotFound", err)
 		}
 	})
 
