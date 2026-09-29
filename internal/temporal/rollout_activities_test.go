@@ -193,6 +193,34 @@ func TestRecordActivities(t *testing.T) {
 		}
 	})
 
+	t.Run("a rollback record rides the rollout write", func(t *testing.T) {
+		t.Parallel()
+
+		withRollback := newRolloutFakes(settings, rolloutTestFirmware())
+		want := &rollout.RollbackRecord{
+			Outcome: string(OutcomeUnhealthyWave),
+			Steps: []rollout.RollbackStepRecord{{
+				Kind: rollout.RollbackNotifyStarted, Status: rollout.RollbackStepCompleted,
+			}},
+			Inventory:           []rollout.FirmwareInventoryRecord{{Version: "1.0.0", Devices: 3}},
+			UnrestoredDeviceIDs: []string{"dev-9"},
+		}
+		if err := NewRecordRolloutActivity(withRollback)(ctx, RecordRolloutRequest{
+			RolloutID: "ro-1", FirmwareID: "fw-1", WorkflowID: "rollout-ro-1",
+			Region: "eu-west", Model: "oak-s3", Status: rollout.RolloutRollingBack,
+			Rollback: want,
+		}); err != nil {
+			t.Fatalf("record rollout: %v", err)
+		}
+		got, ok := withRollback.recordedRollout("ro-1")
+		if !ok {
+			t.Fatal("the rollout was not recorded")
+		}
+		if diff := cmp.Diff(want, got.Rollback); diff != "" {
+			t.Errorf("recorded rollback mismatch (-want +got):\n%s", diff)
+		}
+	})
+
 	t.Run("a recording failure is reported", func(t *testing.T) {
 		t.Parallel()
 

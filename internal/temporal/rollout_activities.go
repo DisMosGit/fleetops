@@ -9,8 +9,10 @@ import (
 
 	"go.temporal.io/sdk/temporal"
 
+	"github.com/DisMosGit/fleetops/internal/devices"
 	"github.com/DisMosGit/fleetops/internal/firmware"
 	"github.com/DisMosGit/fleetops/internal/rollout"
+	"github.com/DisMosGit/fleetops/internal/telemetry"
 	"github.com/DisMosGit/fleetops/internal/wavehealth"
 )
 
@@ -20,6 +22,33 @@ type FirmwareSource interface {
 	// Metadata returns the firmware document with the given id, reporting an error wrapping
 	// firmware.ErrNotFound when there is none.
 	Metadata(ctx context.Context, id string) (firmware.Record, error)
+}
+
+// FirmwareVersions resolves a firmware version to its metadata record. *firmware.Store satisfies
+// it, and the interface lives here because this package is where the resolution is consumed: a
+// device's previous firmware is known by version, not by id.
+type FirmwareVersions interface {
+	// MetadataByVersion returns the firmware document carrying version, reporting an error
+	// wrapping firmware.ErrNotFound when the registry holds none.
+	MetadataByVersion(ctx context.Context, version string) (firmware.Record, error)
+}
+
+// FirmwareInventory reconciles one device's recorded firmware version against the version the
+// device's workflow holds. *devices.Store satisfies it, and the interface lives here because this
+// package is where the reconciliation is consumed.
+type FirmwareInventory interface {
+	// ReconcileFirmware reports whether one device's recorded firmware version agreed, was
+	// corrected, or the fleet holds no record for the device.
+	ReconcileFirmware(ctx context.Context, deviceID, version string) (devices.FirmwareState, error)
+}
+
+// RollbackNotifier publishes one rollback announcement and reports whether the broker took it. A
+// telemetry notifier that waits for the broker's confirmation satisfies it, and the interface lives
+// here because this package is where the announcement is consumed.
+type RollbackNotifier interface {
+	// Announce publishes one rollback event, returning an error when the broker rejects it,
+	// cannot route it, or loses the connection under it.
+	Announce(ctx context.Context, event telemetry.RollbackEvent) error
 }
 
 // TargetResolver resolves a wave into the membership it records. *rollout.Store satisfies it.
@@ -169,6 +198,9 @@ type RecordRolloutRequest struct {
 	Model string `json:"model"`
 	// Status is the status to record.
 	Status rollout.RolloutStatus `json:"status"`
+	// Rollback is the rollback the rollout has run or is running, nil for a rollout that never
+	// entered rollback — which leaves a stored record alone.
+	Rollback *rollout.RollbackRecord `json:"rollback,omitempty"`
 }
 
 // NewRecordRolloutActivity returns the record-rollout-state activity bound to recorder. The write
@@ -183,6 +215,7 @@ func NewRecordRolloutActivity(recorder RolloutRecorder) func(ctx context.Context
 			WorkflowID: req.WorkflowID,
 			Region:     req.Region,
 			Model:      req.Model,
+			Rollback:   req.Rollback,
 		})
 		if err != nil {
 			return fmt.Errorf("record rollout %s as %s: %w", req.RolloutID, req.Status, err)

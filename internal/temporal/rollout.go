@@ -32,6 +32,17 @@ const (
 	// UpdateDeviceActivityName is the registered name of the update-device activity: it commands
 	// one device and waits for that device's reported result.
 	UpdateDeviceActivityName = "update-device"
+	// DowngradeDeviceActivityName is the registered name of the downgrade-device activity: it
+	// restores one device to the firmware version it ran before the deployed one and waits for
+	// that device's reported result.
+	DowngradeDeviceActivityName = "downgrade-device"
+	// ReconcileInventoryActivityName is the registered name of the reconcile-device-inventory
+	// activity: it reconciles one device's recorded firmware version against the version that
+	// device's workflow holds.
+	ReconcileInventoryActivityName = "reconcile-device-inventory"
+	// AnnounceRollbackActivityName is the registered name of the announce-rollback activity: it
+	// publishes one phase of a rollback's announcement into the broker.
+	AnnounceRollbackActivityName = "announce-rollback"
 	// DispatchWaveUpdateActivityName is the registered name of the dispatch-wave-update activity.
 	DispatchWaveUpdateActivityName = "dispatch-wave-update"
 	// EvaluateWaveHealthActivityName is the registered name of the evaluate-wave-health activity.
@@ -239,4 +250,57 @@ type RolloutView struct {
 	EndedBy string `json:"ended_by,omitempty"`
 	// Decision is the failing wave's measured health; nil unless a wave's gate ended the rollout.
 	Decision *WaveHealth `json:"decision,omitempty"`
+	// Rollback is the rollback the rollout derived and is running or ran, or nil while the
+	// rollout has never entered rollback.
+	Rollback *RollbackView `json:"rollback,omitempty"`
+}
+
+// RollbackView is the rollback a rollout reports: the plan with each step's status and what it
+// achieved, the inventory the reconciliation established, and the devices the rollback could not
+// restore.
+type RollbackView struct {
+	// Plan is the rollback's steps in plan order.
+	Plan []RollbackStepView `json:"plan"`
+	// Inventory is the reconciled inventory — how many of the devices the rollback touched were
+	// found on each firmware version — ordered by version; empty until the reconciliation has
+	// run.
+	Inventory []FirmwareCount `json:"inventory,omitempty"`
+	// UnrestoredDeviceIDs are the devices the rollback could not restore.
+	UnrestoredDeviceIDs []string `json:"unrestored_device_ids,omitempty"`
+}
+
+// RollbackStepView is one step of the rollback plan as the state query reports it: what it
+// compensates, where it stands, and what it achieved.
+type RollbackStepView struct {
+	// Kind is what the step does.
+	Kind rollout.RollbackStepKind `json:"kind"`
+	// WaveID is the wave a compensating step compensates; empty for a step that compensates no
+	// wave.
+	WaveID string `json:"wave_id,omitempty"`
+	// Status is where the step stands: pending, running, completed, or failed.
+	Status rollout.RollbackStepStatus `json:"status"`
+	// Devices is how many devices the step compensates or reconciles.
+	Devices int `json:"devices"`
+	// Restored, Failed, Unreported, Skipped, and Unavailable are the outcomes of a downgrade
+	// step's devices.
+	Restored    int `json:"restored"`
+	Failed      int `json:"failed"`
+	Unreported  int `json:"unreported"`
+	Skipped     int `json:"skipped"`
+	Unavailable int `json:"unavailable"`
+	// Agreed, Corrected, and Unverified are the outcomes of a reconciliation step's device
+	// records.
+	Agreed     int `json:"agreed"`
+	Corrected  int `json:"corrected"`
+	Unverified int `json:"unverified"`
+	// Detail is why a step failed; empty otherwise.
+	Detail string `json:"detail,omitempty"`
+}
+
+// FirmwareCount is how many of a rollback's devices run one firmware version.
+type FirmwareCount struct {
+	// Version is the firmware version devices were found on.
+	Version string `json:"version"`
+	// Devices is how many devices were found on it.
+	Devices int `json:"devices"`
 }
