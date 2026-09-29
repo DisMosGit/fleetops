@@ -33,7 +33,7 @@ Three durable exchanges carry every FleetOps event:
 
 | Exchange | Type | Carries |
 |---|---|---|
-| `fleetops.events` | topic | heartbeat events and rollout work |
+| `fleetops.events` | topic | heartbeat events, rollout work, and rollout notifications |
 | `fleetops.retry` | direct | a failed delivery, into the retry queue of the attempt that failed |
 | `fleetops.dead-letter` | direct | deliveries that exhausted their attempts, and deliveries the consumer cannot republish |
 
@@ -43,6 +43,7 @@ Routing keys follow one grammar:
 |---|---|---|
 | `heartbeat.<region>.<model>` | the control plane, for every accepted heartbeat | the heartbeat work queue, and any narrower binding such as `heartbeat.eu-west.#` |
 | `rollout.task.<kind>` | rollout work (no producer yet) | `fleetops.rollout.tasks` |
+| `rollout.notification.<kind>.<phase>` | a rollback's announcement | `fleetops.rollout.notifications`, and any narrower binding such as `rollout.notification.rollback.#` |
 | `retry.<work queue>` | the broker, when a retry queue's TTL expires | that work queue |
 | `<work queue>.dlq` | the control plane, on a terminal failure | that work queue's dead-letter queue |
 
@@ -53,9 +54,12 @@ Queues, one work queue per consumer family:
 | `fleetops.heartbeat.alerting` | work | heartbeat events for the alerting consumer |
 | `fleetops.heartbeat.alerting.retry.<n>` | retry | attempt `n`'s backoff queue, for `n` = 1 … `max_attempts - 1` |
 | `fleetops.heartbeat.alerting.dlq` | dead letter | terminal failures of that work queue |
-| `fleetops.rollout.tasks` | work | rollout work; declared and bound, with no producer or consumer until the rollout workflow lands |
+| `fleetops.rollout.tasks` | work | rollout work; declared and bound |
 | `fleetops.rollout.tasks.retry.<n>` | retry | as above, for rollout work |
 | `fleetops.rollout.tasks.dlq` | dead letter | as above, for rollout work |
+| `fleetops.rollout.notifications` | work | rollout notifications — a rollback's announcements today — declared and bound, with no consumer yet |
+| `fleetops.rollout.notifications.retry.<n>` | retry | as above, for notifications |
+| `fleetops.rollout.notifications.dlq` | dead letter | as above, for notifications |
 
 Every queue and exchange is durable and every published message is persistent, so the layout and
 its undelivered messages survive a broker restart. The whole topology is declared idempotently at
@@ -118,6 +122,87 @@ without decoding the body:
 | `x-attempt` | processing attempt, one-based; the publisher stamps `1` and every retry increments it |
 | `x-original-routing-key` | the key the event was first published under, so a retry or dead letter still says where it came from |
 | `x-death-reason` | present on a dead letter: why the event was dead-lettered |
+
+## Rollback announcements
+
+A rollback publishes two notifications into the same events exchange, under their own key space:
+`rollout.notification.rollback.started` when it enters its compensating phase and
+`rollout.notification.rollback.completed` when its compensations have run. A consumer therefore
+narrows with a binding alone — one phase by its key, every rollback announcement with
+`rollout.notification.rollback.#`, every rollout notification with `rollout.notification.#` — and
+receives no heartbeat and no rollout work, because the key spaces are disjoint. Nothing publishes
+rollout *work* yet, and nothing consumes notifications yet: the queue is declared and bound so the
+announcements are routable from the first rollback, and the dashboards and alerts the
+observability stage adds attach to it by binding.
+
+The notification is its own contract, with its own schema version — it carries no device and no
+sample, which is not what the heartbeat envelope describes:
+
+```json
+{
+  "schema_version": 1,
+  "event_id": "rollback-ro-42-completed",
+  "event_type": "rollback_notification",
+  "phase": "completed",
+  "occurred_at": "2026-03-04T05:06:07Z",
+  "rollout": {
+    "rollout_id": "ro-42",
+    "firmware_id": "fw-9",
+    "firmware_version": "2.0.0",
+    "region": "eu-west",
+    "model": "v3",
+    "wave_id": "ro-42-w1-5",
+    "outcome": "unhealthy_wave",
+    "decision": {
+      "verdict": "unhealthy",
+      "success_ratio": 0.72,
+      "sample_size": 140,
+      "window_start": "2026-03-04T05:00:07Z",
+      "window_end": "2026-03-04T05:06:07Z"
+    },
+    "plan_steps": 4,
+    "plan_devices": 12
+  },
+  "progress": {
+    "restored": 11,
+    "failed": 0,
+    "unreported": 1,
+    "skipped": 0,
+    "unavailable": 0,
+    "agreed": 9,
+    "corrected": 2,
+    "unverified": 1,
+    "inventory": [{"version": "1.0.0", "devices": 11}, {"version": "2.0.0", "devices": 1}],
+    "unrestored_device_ids": ["device-7"],
+    "steps": [
+      {"kind": "downgrade", "wave_id": "ro-42-w1-5", "status": "completed", "devices": 12,
+       "restored": 11, "unreported": 1, "skipped": 0, "failed": 0, "unavailable": 0,
+       "agreed": 0, "corrected": 0, "unverified": 0},
+      {"kind": "reconcile_inventory", "status": "completed", "devices": 12,
+       "restored": 0, "unreported": 0, "skipped": 0, "failed": 0, "unavailable": 0,
+       "agreed": 9, "corrected": 2, "unverified": 1}
+    ]
+  }
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `schema_version` | the announcement contract's revision; `1` in this build, independent of the envelope's |
+| `event_id` | `rollback-<rollout_id>-<phase>`: derived, so a retried publication republishes the same event and a consumer deduplicating by it applies it once |
+| `event_type` | `rollback_notification` |
+| `phase` | `started` or `completed` |
+| `occurred_at` | the workflow time the announcement was decided at, so a replay announces the same moment |
+| `rollout` | what is rolling back and why: the rollout, the firmware it deployed, its target group, the wave that ended it, the outcome, and — when the ending wave was measured — its decision |
+| `rollout.plan_steps`, `rollout.plan_devices` | how many steps and how many devices the rollback compensates |
+| `progress` | what the compensations achieved: the device outcomes, the record corrections, the reconciled inventory, the devices that could not be restored, and each step's own outcome. Absent on the `started` announcement, which precedes every compensation |
+
+An announcement is published *with the broker's confirmation* (`internal/telemetry.Notifier`, a
+supervised session that waits for the ack, the nack, or the returned message): the workflow records
+the announcement step as complete only once the broker has taken the event, and a rejection, an
+unroutable key, or a lost connection is an error the step retries. A publication that cannot
+succeed after its retries is recorded against that step and changes nothing else — the rollout's
+recorded rollback is authoritative, and an unannounced rollback is still a rollback.
 
 ## Consumer semantics
 
