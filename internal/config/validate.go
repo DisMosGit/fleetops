@@ -39,6 +39,28 @@ func (c Config) Validate() error {
 	validateDuration(add, "telemetry.flush_interval", c.Telemetry.FlushInterval)
 	validateDuration(add, "snapshots.interval", c.Snapshots.Interval)
 	validateScheme(add, "rabbitmq.url", c.RabbitMQ.URL, "amqp", "amqps")
+	if c.RabbitMQ.Prefetch <= 0 {
+		add("rabbitmq.prefetch", fmt.Sprintf("must be positive, got %d", c.RabbitMQ.Prefetch))
+	}
+	if c.RabbitMQ.PublishBuffer <= 0 {
+		add("rabbitmq.publish_buffer", fmt.Sprintf("must be positive, got %d", c.RabbitMQ.PublishBuffer))
+	}
+	if c.RabbitMQ.MaxAttempts <= 0 {
+		add("rabbitmq.max_attempts", fmt.Sprintf("must be positive, got %d", c.RabbitMQ.MaxAttempts))
+	}
+	validateDuration(add, "rabbitmq.retry_base", c.RabbitMQ.RetryBase)
+	validateDuration(add, "rabbitmq.retry_max", c.RabbitMQ.RetryMax)
+	// A cap below the base would flatten the ladder; comparing only parsed values keeps a
+	// malformed duration from reporting two violations for one field.
+	if !c.RabbitMQ.RetryBase.invalid && !c.RabbitMQ.RetryMax.invalid &&
+		c.RabbitMQ.RetryMax.Duration < c.RabbitMQ.RetryBase.Duration {
+		add("rabbitmq.retry_max", "must not be below rabbitmq.retry_base")
+	}
+	validateDuration(add, "rabbitmq.queue_depth_interval", c.RabbitMQ.QueueDepthInterval)
+	if !(c.Alerting.HealthThreshold >= 0 && c.Alerting.HealthThreshold <= 1) {
+		// The closed-range check rejects NaN along with every out-of-range threshold.
+		add("alerting.health_threshold", "must be in [0, 1]")
+	}
 	validateHostPort(add, "temporal.address", c.Temporal.Address)
 	validateNonEmpty(add, "temporal.namespace", c.Temporal.Namespace)
 	validateNonEmpty(add, "temporal.task_queue", c.Temporal.TaskQueue)

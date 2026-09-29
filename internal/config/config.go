@@ -33,6 +33,8 @@ type Config struct {
 	Snapshots Snapshots `yaml:"snapshots"`
 	// RabbitMQ configures the telemetry broker.
 	RabbitMQ RabbitMQ `yaml:"rabbitmq"`
+	// Alerting configures the heartbeat alerting consumer.
+	Alerting Alerting `yaml:"alerting"`
 	// Temporal configures the orchestration backend.
 	Temporal Temporal `yaml:"temporal"`
 	// Observability configures metrics, tracing, and probe endpoints.
@@ -91,6 +93,24 @@ type Snapshots struct {
 type RabbitMQ struct {
 	// URL is the RabbitMQ connection URL (amqp:// or amqps://).
 	URL string `yaml:"url"`
+	// Prefetch is the number of unacknowledged deliveries one consumer holds in flight.
+	Prefetch int `yaml:"prefetch"`
+	// PublishBuffer is the number of events buffered for publication before load shedding.
+	PublishBuffer int `yaml:"publish_buffer"`
+	// MaxAttempts is the number of processing attempts before a delivery is dead-lettered.
+	MaxAttempts int `yaml:"max_attempts"`
+	// RetryBase is the backoff delay of the first retry attempt.
+	RetryBase Duration `yaml:"retry_base"`
+	// RetryMax is the upper bound on a retry attempt's backoff delay.
+	RetryMax Duration `yaml:"retry_max"`
+	// QueueDepthInterval is the cadence of queue-depth sampling.
+	QueueDepthInterval Duration `yaml:"queue_depth_interval"`
+}
+
+// Alerting configures the heartbeat alerting consumer.
+type Alerting struct {
+	// HealthThreshold is the health score below which a degradation alert is recorded.
+	HealthThreshold float64 `yaml:"health_threshold"`
 }
 
 // Temporal configures the orchestration backend.
@@ -133,8 +153,17 @@ func Defaults() Config {
 			FlushInterval: Duration{Duration: time.Second},
 		},
 		Snapshots: Snapshots{Interval: Duration{Duration: time.Minute}},
-		RabbitMQ:  RabbitMQ{URL: "amqp://guest:guest@localhost:5672/"},
-		Temporal:  Temporal{Address: "localhost:7233", Namespace: "default", TaskQueue: "fleetops"},
+		RabbitMQ: RabbitMQ{
+			URL:                "amqp://guest:guest@localhost:5672/",
+			Prefetch:           32,
+			PublishBuffer:      1024,
+			MaxAttempts:        3,
+			RetryBase:          Duration{Duration: 5 * time.Second},
+			RetryMax:           Duration{Duration: time.Minute},
+			QueueDepthInterval: Duration{Duration: 15 * time.Second},
+		},
+		Alerting: Alerting{HealthThreshold: 0.6},
+		Temporal: Temporal{Address: "localhost:7233", Namespace: "default", TaskQueue: "fleetops"},
 		Observability: Observability{
 			OTelEndpoint: "localhost:4317",
 			MetricsAddr:  ":9091",

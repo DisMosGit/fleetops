@@ -84,6 +84,30 @@ func TestValidate(t *testing.T) {
 		{name: "rabbitmq url with wrong scheme", mutate: func(c *Config) {
 			c.RabbitMQ.URL = "https://localhost:5672/"
 		}, wantErrs: []string{"rabbitmq.url"}},
+		{name: "zero prefetch", mutate: func(c *Config) {
+			c.RabbitMQ.Prefetch = 0
+		}, wantErrs: []string{"rabbitmq.prefetch"}},
+		{name: "negative publish buffer", mutate: func(c *Config) {
+			c.RabbitMQ.PublishBuffer = -1
+		}, wantErrs: []string{"rabbitmq.publish_buffer"}},
+		{name: "negative max attempts", mutate: func(c *Config) {
+			c.RabbitMQ.MaxAttempts = -1
+		}, wantErrs: []string{"rabbitmq.max_attempts"}},
+		{name: "unparseable retry base", mutate: func(c *Config) {
+			c.RabbitMQ.RetryBase = Duration{invalid: true}
+		}, wantErrs: []string{"rabbitmq.retry_base"}},
+		{name: "retry max below retry base", mutate: func(c *Config) {
+			c.RabbitMQ.RetryMax = Duration{Duration: time.Second}
+		}, wantErrs: []string{"rabbitmq.retry_max"}},
+		{name: "zero queue depth interval", mutate: func(c *Config) {
+			c.RabbitMQ.QueueDepthInterval = Duration{}
+		}, wantErrs: []string{"rabbitmq.queue_depth_interval"}},
+		{name: "health threshold above one", mutate: func(c *Config) {
+			c.Alerting.HealthThreshold = 1.5
+		}, wantErrs: []string{"alerting.health_threshold"}},
+		{name: "negative health threshold", mutate: func(c *Config) {
+			c.Alerting.HealthThreshold = -0.1
+		}, wantErrs: []string{"alerting.health_threshold"}},
 		{name: "temporal addr without port", mutate: func(c *Config) {
 			c.Temporal.Address = "temporal"
 		}, wantErrs: []string{"temporal.address"}},

@@ -22,6 +22,45 @@ func TestLoadWithoutPathUsesDefaults(t *testing.T) {
 	}
 }
 
+// TestBrokerAndAlertingDefaults pins every pipeline default the file may omit: each field is
+// asserted on its own, so a missing default fails with the field's name.
+func TestBrokerAndAlertingDefaults(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	file := "simulation:\n  fleet_size: 250\n"
+	if err := os.WriteFile(path, []byte(file), 0o600); err != nil {
+		t.Fatalf("write test config: %v", err)
+	}
+	got, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	defaults := []struct {
+		field string
+		got   any
+		want  any
+	}{
+		{"rabbitmq.prefetch", got.RabbitMQ.Prefetch, 32},
+		{"rabbitmq.publish_buffer", got.RabbitMQ.PublishBuffer, 1024},
+		{"rabbitmq.max_attempts", got.RabbitMQ.MaxAttempts, 3},
+		{"rabbitmq.retry_base", got.RabbitMQ.RetryBase.Duration, 5 * time.Second},
+		{"rabbitmq.retry_max", got.RabbitMQ.RetryMax.Duration, time.Minute},
+		{"rabbitmq.queue_depth_interval", got.RabbitMQ.QueueDepthInterval.Duration, 15 * time.Second},
+		{"alerting.health_threshold", got.Alerting.HealthThreshold, 0.6},
+	}
+	for _, tc := range defaults {
+		t.Run(tc.field, func(t *testing.T) {
+			t.Parallel()
+
+			if diff := cmp.Diff(tc.want, tc.got); diff != "" {
+				t.Errorf("%s default mismatch (-want +got):\n%s", tc.field, diff)
+			}
+		})
+	}
+}
+
 func TestLoad(t *testing.T) {
 	t.Parallel()
 

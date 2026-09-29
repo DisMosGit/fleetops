@@ -43,6 +43,22 @@ snapshots:
 rabbitmq:
   # Connection URL (amqp:// or amqps://).
   url: "amqp://guest:guest@localhost:5672/"
+  # Unacknowledged deliveries one consumer holds in flight.
+  prefetch: 32
+  # Events buffered for publication before load shedding drops them (counted, never blocking).
+  publish_buffer: 1024
+  # Processing attempts before a delivery is dead-lettered.
+  max_attempts: 3
+  # Backoff delay of the first retry attempt (Go duration string).
+  retry_base: "5s"
+  # Upper bound on a retry attempt's backoff delay; must not be below retry_base.
+  retry_max: "1m"
+  # Cadence of queue-depth sampling (Go duration string).
+  queue_depth_interval: "15s"
+
+alerting:
+  # Health score below which a degraded heartbeat is recorded as an alert, in [0, 1].
+  health_threshold: 0.6
 
 temporal:
   # Temporal frontend address.
