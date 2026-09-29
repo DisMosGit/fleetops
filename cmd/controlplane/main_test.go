@@ -15,9 +15,15 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	"github.com/google/go-cmp/cmp"
+	temporalclient "go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/converter"
+
 	agentv1 "github.com/DisMosGit/fleetops/api/proto/agent/v1"
+	"github.com/DisMosGit/fleetops/internal/config"
 	"github.com/DisMosGit/fleetops/internal/devices"
 	"github.com/DisMosGit/fleetops/internal/telemetry"
+	"github.com/DisMosGit/fleetops/internal/temporal"
 )
 
 // fakeMarker is a hand-written StaleMarker double replaying scripted sweep results.
@@ -230,4 +236,219 @@ func TestMetricsHandlerExposesTheEventPipeline(t *testing.T) {
 			t.Errorf("scrape output is missing %s:\n%s", name, body)
 		}
 	}
+}
+
+// TestRolloutSettings pins the configuration mapping the control plane's start path uses: the
+// configured sequence and gate timing become the policy a rollout drives under, and a policy no
+// rollout could sequence is refused here rather than inside a running rollout.
+func TestRolloutSettings(t *testing.T) {
+	t.Parallel()
+
+	t.Run("the configured sequence and timing reach the policy", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := config.Defaults()
+		cfg.Rollout.HealthWindow = config.Duration{Duration: time.Minute}
+		cfg.Rollout.DecisionTimeout = config.Duration{Duration: 5 * time.Minute}
+		cfg.Rollout.ResultTimeout = config.Duration{Duration: 2 * time.Minute}
+		cfg.Rollout.Waves = []config.Wave{
+			{Percent: 10},
+			{Percent: 100, RequireApproval: true},
+		}
+
+		got, err := rolloutSettings(cfg.Rollout)
+		if err != nil {
+			t.Fatalf("rolloutSettings: %v", err)
+		}
+		if got.HealthWindow != time.Minute || got.DecisionTimeout != 5*time.Minute ||
+			got.ResultTimeout != 2*time.Minute {
+			t.Errorf("windows = %v/%v/%v, want the configured 1m/5m/2m",
+				got.HealthWindow, got.DecisionTimeout, got.ResultTimeout)
+		}
+		want := []temporal.RolloutWave{
+			{Percent: 10},
+			{Percent: 100, RequireApproval: true},
+		}
+		if diff := cmp.Diff(want, got.Waves); diff != "" {
+			t.Errorf("waves mismatch (-want +got):\n%s", diff)
+		}
+	})
+
+	t.Run("a policy no rollout could sequence is refused", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := config.Defaults()
+		// A result wait longer than the wave's own decision timeout: the wave's verdict would
+		// already be due while it still waited on devices.
+		cfg.Rollout.ResultTimeout = config.Duration{Duration: cfg.Rollout.DecisionTimeout.Duration + time.Minute}
+
+		if _, err := rolloutSettings(cfg.Rollout); err == nil {
+			t.Fatal("rolloutSettings = nil error, want the policy refused")
+		}
+	})
+
+	t.Run("the accepted start carries the settings to the workflow", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := config.Defaults()
+		cfg.Rollout.Waves = []config.Wave{{Percent: 100}}
+		settings, err := rolloutSettings(cfg.Rollout)
+		if err != nil {
+			t.Fatalf("rolloutSettings: %v", err)
+		}
+		fc := &recordingStartClient{}
+		req := temporal.RolloutRequest{
+			RolloutID: "ro-1", FirmwareID: "fw-1", Region: "eu-west", Model: "oak-s3",
+		}
+		if err := temporal.NewRolloutStarter(fc, cfg.Temporal.TaskQueue, settings).
+			Start(context.Background(), req); err != nil {
+			t.Fatalf("start rollout: %v", err)
+		}
+
+		if len(fc.inputs) != 1 {
+			t.Fatalf("started rollouts = %d, want 1", len(fc.inputs))
+		}
+		got := fc.inputs[0]
+		if got.RolloutRequest != req {
+			t.Errorf("start input request = %+v, want %+v", got.RolloutRequest, req)
+		}
+		if diff := cmp.Diff(settings, got.Settings); diff != "" {
+			t.Errorf("start input settings mismatch (-want +got):\n%s", diff)
+		}
+	})
+}
+
+// recordingStartClient is a hand-written startClient double recording the inputs it was handed.
+type recordingStartClient struct {
+	inputs []temporal.RolloutInput
+}
+
+func (c *recordingStartClient) ExecuteWorkflow(
+	_ context.Context, _ temporalclient.StartWorkflowOptions, _ any, args ...any,
+) (temporalclient.WorkflowRun, error) {
+	var input temporal.RolloutInput
+	if len(args) > 0 {
+		input, _ = args[0].(temporal.RolloutInput)
+	}
+	c.inputs = append(c.inputs, input)
+	return nil, nil
+}
+
+// TestGatewayHandler pins the composition of the gateway listener: the firmware and rollout APIs
+// answer on one mux under their own prefixes, neither shadows the other, and an unregistered path
+// is the mux's own 404.
+func TestGatewayHandler(t *testing.T) {
+	t.Parallel()
+
+	firmwareMux := http.NewServeMux()
+	firmwareMux.HandleFunc("POST /api/firmwares", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		if _, err := w.Write([]byte("firmware")); err != nil {
+			t.Errorf("write firmware response: %v", err)
+		}
+	})
+	rolloutMux := http.NewServeMux()
+	rolloutMux.HandleFunc("POST /api/rollouts", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusAccepted)
+		if _, err := w.Write([]byte("rollout")); err != nil {
+			t.Errorf("write rollout response: %v", err)
+		}
+	})
+	rolloutMux.HandleFunc("GET /api/rollouts/{id}", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		if _, err := w.Write([]byte("state")); err != nil {
+			t.Errorf("write state response: %v", err)
+		}
+	})
+
+	gateway := gatewayHandler(firmwareMux, rolloutMux)
+	tests := []struct {
+		name         string
+		method, path string
+		wantCode     int
+		wantBody     string
+	}{
+		{name: "a firmware upload reaches its own API", method: http.MethodPost,
+			path: "/api/firmwares", wantCode: http.StatusCreated, wantBody: "firmware"},
+		{name: "a rollout start reaches its own API", method: http.MethodPost,
+			path: "/api/rollouts", wantCode: http.StatusAccepted, wantBody: "rollout"},
+		{name: "a rollout read reaches its own API", method: http.MethodGet,
+			path: "/api/rollouts/ro-1", wantCode: http.StatusOK, wantBody: "state"},
+		{name: "an unregistered path is not found", method: http.MethodGet,
+			path: "/api/devices", wantCode: http.StatusNotFound},
+		{name: "a method mismatch is rejected", method: http.MethodGet,
+			path: "/api/rollouts", wantCode: http.StatusMethodNotAllowed},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			rec := httptest.NewRecorder()
+			gateway.ServeHTTP(rec, httptest.NewRequest(tc.method, tc.path, nil))
+			if rec.Code != tc.wantCode {
+				t.Errorf("status = %d, want %d (body %s)", rec.Code, tc.wantCode, rec.Body)
+			}
+			if tc.wantBody != "" && !strings.Contains(rec.Body.String(), tc.wantBody) {
+				t.Errorf("body = %q, want it to contain %q", rec.Body, tc.wantBody)
+			}
+		})
+	}
+}
+
+// TestNewRolloutAPI pins that the surface the control plane serves is built over the Temporal
+// client it was handed: every route answers, and the backend refusing a read is the surface's own
+// failure rather than a panic or a hang.
+func TestNewRolloutAPI(t *testing.T) {
+	t.Parallel()
+
+	cfg := config.Defaults()
+	handler, err := newRolloutAPI(cfg, &unreachableTemporalClient{}, testLogger())
+	if err != nil {
+		t.Fatalf("newRolloutAPI: %v", err)
+	}
+	for _, tc := range []struct{ method, path string }{
+		{http.MethodGet, "/api/rollouts/ro-1"},
+		{http.MethodPost, "/api/rollouts/ro-1/pause"},
+	} {
+		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
+			t.Parallel()
+
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, httptest.NewRequest(tc.method, tc.path, nil))
+			// The adapter's query fails: the surface answers a bounded, operator-safe failure
+			// rather than echoing anything about the backend.
+			if rec.Code != http.StatusInternalServerError {
+				t.Errorf("status = %d, want %d (body %s)",
+					rec.Code, http.StatusInternalServerError, rec.Body)
+			}
+		})
+	}
+}
+
+// unreachableTemporalClient is a Temporal client double implementing exactly the three calls the
+// rollout surface makes, each of them failing: it stands in for a frontend that is down.
+type unreachableTemporalClient struct{}
+
+func (c *unreachableTemporalClient) ExecuteWorkflow(
+	context.Context, temporalclient.StartWorkflowOptions, any, ...any,
+) (temporalclient.WorkflowRun, error) {
+	return nil, errors.New("temporal frontend is unavailable")
+}
+
+func (c *unreachableTemporalClient) QueryWorkflow(
+	context.Context, string, string, string, ...any,
+) (converter.EncodedValue, error) {
+	return nil, errors.New("temporal frontend is unavailable")
+}
+
+func (c *unreachableTemporalClient) SignalWorkflow(
+	context.Context, string, string, string, any,
+) error {
+	return errors.New("temporal frontend is unavailable")
+}
+
+// testLogger discards its output: the API logs every rejection at the boundary, and that noise
+// would drown the test output.
+func testLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }

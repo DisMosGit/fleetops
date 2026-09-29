@@ -20,6 +20,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 	"go.temporal.io/sdk/activity"
 	temporalclient "go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/converter"
 	"go.temporal.io/sdk/worker"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
@@ -34,6 +35,7 @@ import (
 	"github.com/DisMosGit/fleetops/internal/devices"
 	"github.com/DisMosGit/fleetops/internal/firmware"
 	"github.com/DisMosGit/fleetops/internal/health"
+	"github.com/DisMosGit/fleetops/internal/rolloutapi"
 	"github.com/DisMosGit/fleetops/internal/telemetry"
 	"github.com/DisMosGit/fleetops/internal/temporal"
 	"github.com/DisMosGit/fleetops/internal/wavehealth"
@@ -171,6 +173,84 @@ func newPipeline(cfg config.Config, db *mongo.Database, registry *prometheus.Reg
 	}, nil
 }
 
+// rolloutSettings maps the configured canary sequence and gate timing onto the policy a rollout
+// drives under: the settings the rollout start path hands to the workflow, so the sequence an
+// operator configures is the sequence the rollout drives, with the approval flags they set.
+//
+// The mapping lives here because this process is the one that starts rollouts. It follows the
+// pattern the rest of the entrypoints use: each maps the configuration sections it consumes onto
+// the library types it needs, so internal/config stays free of the orchestration SDK.
+func rolloutSettings(cfg config.Rollout) (temporal.RolloutSettings, error) {
+	waves := make([]temporal.RolloutWave, 0, len(cfg.Waves))
+	for _, wave := range cfg.Waves {
+		waves = append(waves, temporal.RolloutWave{
+			Percent:         wave.Percent,
+			RequireApproval: wave.RequireApproval,
+		})
+	}
+	settings, err := temporal.NewRolloutSettings(
+		cfg.HealthWindow.Duration,
+		cfg.DecisionTimeout.Duration,
+		cfg.ResultTimeout.Duration,
+		waves,
+	)
+	if err != nil {
+		return temporal.RolloutSettings{}, fmt.Errorf("map rollout settings: %w", err)
+	}
+	return settings, nil
+}
+
+// rolloutClient is the slice of the Temporal client the rollout surface needs: starting a
+// workflow, reading one's state query, and signalling one. *temporalclient.Client satisfies it,
+// and a test hand-writes a double.
+type rolloutClient interface {
+	// ExecuteWorkflow starts one workflow execution.
+	ExecuteWorkflow(
+		ctx context.Context, options temporalclient.StartWorkflowOptions,
+		workflow any, args ...any,
+	) (temporalclient.WorkflowRun, error)
+	// QueryWorkflow reads one workflow execution's query answer.
+	QueryWorkflow(
+		ctx context.Context, workflowID, queryType, runID string, queryArgs ...any,
+	) (converter.EncodedValue, error)
+	// SignalWorkflow delivers one signal to a workflow execution.
+	SignalWorkflow(ctx context.Context, workflowID, runID, signalName string, arg any) error
+}
+
+// newRolloutAPI builds the operator's rollout surface: the starter that begins a rollout, the
+// reader that answers with the workflow's own state, and the sender that delivers the workflow's
+// own signals, all over the control plane's Temporal client.
+func newRolloutAPI(cfg config.Config, tc rolloutClient, log *slog.Logger) (http.Handler, error) {
+	settings, err := rolloutSettings(cfg.Rollout)
+	if err != nil {
+		return nil, err
+	}
+	log.Info("rollout control configured",
+		"health_window", settings.HealthWindow,
+		"decision_timeout", settings.DecisionTimeout,
+		"result_timeout", settings.ResultTimeout,
+		"waves", len(settings.Waves),
+	)
+	return rolloutapi.NewHandler(
+		temporal.NewRolloutStarter(tc, cfg.Temporal.TaskQueue, settings),
+		temporal.NewRolloutStates(tc),
+		temporal.NewRolloutSignals(tc),
+		log,
+	), nil
+}
+
+// gatewayHandler composes the HTTP gateway's APIs on one listener: each package serves its own
+// routes under its own path prefix, so neither shadows the other and the mux answers a method or
+// path mismatch for both.
+func gatewayHandler(firmwares http.Handler, rollouts http.Handler) http.Handler {
+	mux := http.NewServeMux()
+	mux.Handle("/api/firmwares", firmwares)
+	mux.Handle("/api/firmwares/", firmwares)
+	mux.Handle("/api/rollouts", rollouts)
+	mux.Handle("/api/rollouts/", rollouts)
+	return mux
+}
+
 // newWaveHealthService builds the wave health query service the control plane serves: the
 // aggregation over the fleet database's rollouts, waves, and telemetry collection, evaluated at
 // the configured gating policy. The served window and thresholds are logged here, before the gRPC
@@ -242,12 +322,6 @@ func run(ctx context.Context, cfg config.Config, httpAddr string) error {
 		Addr:    cfg.Observability.MetricsAddr,
 		Handler: metricsHandler(metrics),
 	}
-	// The gateway is the operator API: firmware uploads land in the registry through it.
-	// Its routes are validated before anything is stored — see internal/firmware.
-	gatewaySrv := &http.Server{
-		Addr:    httpAddr,
-		Handler: firmware.NewHandler(firmwareStore, registry, log),
-	}
 
 	// The hub is the command seam the dispatch activity sends through; its registry records
 	// accepted registrations, and its sink is the ordered fan-out of the durable ingest write
@@ -272,6 +346,22 @@ func run(ctx context.Context, cfg config.Config, httpAddr string) error {
 	grpcServer := grpc.NewServer(agentserver.ServerOptions(log)...)
 	agentv1.RegisterAgentServiceServer(grpcServer, agentserver.NewServer(hub, registry, signaler, firmwareStore, log))
 	rolloutv1.RegisterRolloutServiceServer(grpcServer, newWaveHealthService(cfg, db, log))
+
+	// The gateway is the operator API: firmware uploads land in the registry through it, and a
+	// rollout is started, read, and commanded through it. Both APIs compose on this one listener,
+	// each under its own path prefix, and the firmware routes are validated before anything is
+	// stored — see internal/firmware.
+	rolloutHandler, err := newRolloutAPI(cfg, tc, log)
+	if err != nil {
+		return err
+	}
+	gatewaySrv := &http.Server{
+		Addr: httpAddr,
+		Handler: gatewayHandler(
+			firmware.NewHandler(firmwareStore, registry, log),
+			rolloutHandler,
+		),
+	}
 
 	// Activities live beside their side effects: dispatch-command needs the in-process hub,
 	// so it joins this process on the same task queue the workflow worker uses.

@@ -5,12 +5,16 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -25,6 +29,7 @@ import (
 	"github.com/DisMosGit/fleetops/internal/config"
 	"github.com/DisMosGit/fleetops/internal/mongotest"
 	"github.com/DisMosGit/fleetops/internal/rollout"
+	"github.com/DisMosGit/fleetops/internal/rolloutapi"
 	"github.com/DisMosGit/fleetops/internal/temporal"
 )
 
@@ -37,24 +42,115 @@ const (
 	smokePollInterval  = 150 * time.Millisecond
 	smokePollTimeout   = 3 * time.Minute
 	smokeTemporalStart = 60 * time.Second
+	// The update activity's observation interval is shrunk the same way the window is: the
+	// smoke drives the real activity, and a device that never reports must be provable in
+	// seconds rather than in the production interval's worth of polls.
+	smokeUpdatePollInterval = 50 * time.Millisecond
+	// smokeResultTimeout is how long a wave in the smoke waits for one device's reported result:
+	// long enough for a device that reports late to be found, short enough that a device which
+	// never reports is proven in seconds.
+	smokeResultTimeout = 3 * time.Second
+	// smokeBackendGrace is how long an operator request waits out a backend that is not answering,
+	// long enough to outlast a stall of the smoke's single-node Temporal storage.
+	smokeBackendGrace = 30 * time.Second
 )
 
 // commandRecorder stands in for the device command seam: it records every update command a wave
-// dispatches. The device side of the seam — the entity workflow that accepts a command and the
-// control-plane activity that streams it to an agent — has its own tests; what this smoke drives
-// for real is the rollout pipeline itself: the workflow, its six activities, the fleet database,
-// the configuration, and the start path.
+// dispatches and reports each commanded device as having concluded it successfully, which is the
+// device world a healthy wave is measured over. The device side of the seam — the entity workflow
+// that accepts a command and the control-plane activity that streams it to an agent — has its own
+// tests; what this smoke drives for real is the rollout pipeline itself: the workflow, its six
+// activities, the fleet database, the configuration, and the start path.
 type commandRecorder struct {
 	mu       sync.Mutex
 	commands []temporal.CommandIssuedSignal
+	// concluded records the outcome each device reported, keyed by command id.
+	concluded map[string]temporal.ConcludedCommand
+	// scripts is the device world the smoke drives: which devices fail, and which never report.
+	scripts *deviceScripts
 }
 
-// SignalCommandIssued implements temporal.DeviceCommander.
+// deviceScripts scripts the devices the smoke drives: the ones that report a failed update with
+// the detail they report, and the ones that never report at all.
+type deviceScripts struct {
+	// fail maps a device to the failure detail it reports.
+	fail map[string]string
+	// never marks a device that accepts its command and never reports a result.
+	never map[string]bool
+}
+
+// script returns the recorder's device world, creating it on first use.
+func (r *commandRecorder) script() *deviceScripts {
+	if r.scripts == nil {
+		r.scripts = &deviceScripts{}
+	}
+	if r.scripts.fail == nil {
+		r.scripts.fail = map[string]string{}
+	}
+	if r.scripts.never == nil {
+		r.scripts.never = map[string]bool{}
+	}
+	return r.scripts
+}
+
+// deliveredCommands returns the commands one device accepted, in delivery order.
+func (r *commandRecorder) deliveredCommands(deviceID string) []temporal.CommandIssuedSignal {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var delivered []temporal.CommandIssuedSignal
+	for _, cmd := range r.commands {
+		if cmd.DeviceID == deviceID {
+			delivered = append(delivered, cmd)
+		}
+	}
+	return delivered
+}
+
+// SignalCommandIssued implements temporal.DeviceCommander. It records the command and decides the
+// outcome the device will report: a success unless the device is scripted to fail or to stay
+// silent.
 func (r *commandRecorder) SignalCommandIssued(_ context.Context, cmd temporal.CommandIssuedSignal) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.commands = append(r.commands, cmd)
+	if r.scripts == nil {
+		r.scripts = &deviceScripts{}
+	}
+	if r.scripts.never[cmd.DeviceID] {
+		return nil
+	}
+	if r.concluded == nil {
+		r.concluded = map[string]temporal.ConcludedCommand{}
+	}
+	outcome, detail := temporal.OutcomeSucceeded, ""
+	if failed, ok := r.scripts.fail[cmd.DeviceID]; ok {
+		outcome, detail = temporal.OutcomeFailed, failed
+	}
+	r.concluded[cmd.CommandID] = temporal.ConcludedCommand{
+		Command: cmd, Outcome: outcome, Detail: detail,
+	}
 	return nil
+}
+
+// State implements temporal.DeviceStateReader: it reports the state of the device that accepted
+// the command, which is how the update activity's wait for a reported result ends.
+func (r *commandRecorder) State(_ context.Context, deviceID string) (temporal.State, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	state := temporal.State{DeviceID: deviceID, CurrentFw: "1.0.0"}
+	// The newest command this device accepted is the one its state reports on.
+	for i := len(r.commands) - 1; i >= 0; i-- {
+		if r.commands[i].DeviceID != deviceID {
+			continue
+		}
+		if concluded, ok := r.concluded[r.commands[i].CommandID]; ok {
+			state.LastCommand = &concluded
+			return state, nil
+		}
+		state.Pending = &temporal.PendingCommand{Command: r.commands[i], Dispatched: true}
+		return state, nil
+	}
+	return temporal.State{}, fmt.Errorf("device %s: %w", deviceID, temporal.ErrDeviceNotFound)
 }
 
 // recorded returns the commands the seam accepted, in delivery order.
@@ -83,12 +179,15 @@ func TestRolloutSmoke(t *testing.T) {
 	cfg.Temporal.Address = address
 	cfg.Rollout.HealthWindow = config.Duration{Duration: smokeHealthWindow}
 	cfg.Rollout.DecisionTimeout = config.Duration{Duration: 30 * time.Second}
+	// The result timeout is shrunk the same way the window is: the smoke drives the real
+	// per-device update activity, and a device that never reports has to be provable in seconds.
+	cfg.Rollout.ResultTimeout = config.Duration{Duration: smokeResultTimeout}
 	cfg.Rollout.MinSamples = smokeMinSamples
 	cfg.Rollout.SampleHealthThreshold = 0.6
 	cfg.Rollout.MinSuccessRatio = 0.95
 
 	dispatcher := &commandRecorder{}
-	tc := startSmokeWorker(t, cfg, db, dispatcher)
+	tc := startSmokeWorker(t, cfg, db, dispatcher, dispatcher)
 	ctx := context.Background()
 
 	// The fleet: devices to canary in one region and two smaller fleets in others, all of the
@@ -114,7 +213,7 @@ func TestRolloutSmoke(t *testing.T) {
 	canary := temporal.RolloutRequest{
 		RolloutID: "ro-smoke-canary", FirmwareID: "fw-smoke", Region: "eu-west", Model: "oak-s3",
 	}
-	canarySettings := rolloutSettings(cfg.Rollout)
+	canarySettings := smokeRolloutSettings(t, cfg)
 	canarySettings.Waves = []temporal.RolloutWave{{Percent: 25}, {Percent: 100}}
 	if err := temporal.NewRolloutStarter(tc, cfg.Temporal.TaskQueue, canarySettings).
 		Start(ctx, canary); err != nil {
@@ -150,7 +249,7 @@ func TestRolloutSmoke(t *testing.T) {
 	gated := temporal.RolloutRequest{
 		RolloutID: "ro-smoke-gated", FirmwareID: "fw-smoke", Region: "us-east", Model: "oak-s3",
 	}
-	gatedSettings := rolloutSettings(cfg.Rollout)
+	gatedSettings := smokeRolloutSettings(t, cfg)
 	gatedSettings.Waves = []temporal.RolloutWave{{Percent: 100, RequireApproval: true}}
 	if err := temporal.NewRolloutStarter(tc, cfg.Temporal.TaskQueue, gatedSettings).
 		Start(ctx, gated); err != nil {
@@ -173,7 +272,7 @@ func TestRolloutSmoke(t *testing.T) {
 	broken := temporal.RolloutRequest{
 		RolloutID: "ro-smoke-broken", FirmwareID: "fw-smoke", Region: "ap-south", Model: "oak-s3",
 	}
-	brokenSettings := rolloutSettings(cfg.Rollout)
+	brokenSettings := smokeRolloutSettings(t, cfg)
 	brokenSettings.Waves = []temporal.RolloutWave{{Percent: 100}}
 	if err := temporal.NewRolloutStarter(tc, cfg.Temporal.TaskQueue, brokenSettings).
 		Start(ctx, broken); err != nil {
@@ -194,6 +293,145 @@ func TestRolloutSmoke(t *testing.T) {
 	if record.WorkflowID != temporal.RolloutWorkflowID(broken.RolloutID) {
 		t.Errorf("rollout workflow id = %q, want %q",
 			record.WorkflowID, temporal.RolloutWorkflowID(broken.RolloutID))
+	}
+
+	// 4. Every target device is commanded, and the wave records how each of them ended: one
+	// succeeded, one reported a failure, and one never reported before the result timeout.
+	outcomesFleet := seedFleet(t, db, "sa-east", 3)
+	stopOutcomes := startHeartbeats(t, db, map[string][]string{"sa-east": outcomesFleet}, 0.95)
+	t.Cleanup(stopOutcomes)
+	scripts := dispatcher.script()
+	scripts.fail[outcomesFleet[1]] = "flash write failed"
+	scripts.never[outcomesFleet[2]] = true
+
+	outcomes := temporal.RolloutRequest{
+		RolloutID: "ro-smoke-outcomes", FirmwareID: "fw-smoke", Region: "sa-east", Model: "oak-s3",
+	}
+	outcomesSettings := smokeRolloutSettings(t, cfg)
+	outcomesSettings.Waves = []temporal.RolloutWave{{Percent: 100}}
+	if err := temporal.NewRolloutStarter(tc, cfg.Temporal.TaskQueue, outcomesSettings).
+		Start(ctx, outcomes); err != nil {
+		t.Fatalf("start outcomes rollout: %v", err)
+	}
+	waitForRolloutStatus(t, rollouts, outcomes.RolloutID, rollout.RolloutCompleted)
+
+	recorded := waitForWave(t, waves, rollout.WaveID(outcomes.RolloutID, 0, 100))
+	if want := []string{outcomesFleet[1]}; !slices.Equal(recorded.FailedDeviceIDs, want) {
+		t.Errorf("wave failed_device_ids = %v, want %v", recorded.FailedDeviceIDs, want)
+	}
+	if want := []string{outcomesFleet[2]}; !slices.Equal(recorded.UnreportedDeviceIDs, want) {
+		t.Errorf("wave unreported_device_ids = %v, want %v", recorded.UnreportedDeviceIDs, want)
+	}
+	// The devices that did not take the update do not decide the wave: the health gate still
+	// promoted it, which is what the configured ratio is for.
+	if recorded.Status != rollout.WaveHealthy {
+		t.Errorf("wave status = %q, want healthy: a device outcome is recorded, not gating",
+			recorded.Status)
+	}
+	for _, deviceID := range outcomesFleet {
+		assertCommandedUnderOneID(t, dispatcher, recorded.ID, deviceID)
+	}
+
+	// 5. The operator's HTTP surface, over the real client adapters: the same rollout's state,
+	// and its approve, pause, and resume commands delivered as the workflow's own signals.
+	operatorAPI := rolloutapi.NewHandler(
+		temporal.NewRolloutStarter(tc, cfg.Temporal.TaskQueue, outcomesSettings),
+		temporal.NewRolloutStates(tc),
+		temporal.NewRolloutSignals(tc),
+		smokeLogger(),
+	)
+	statePath := "/api/rollouts/" + outcomes.RolloutID
+	if status, body := doRequest(t, operatorAPI, http.MethodGet, statePath); status != http.StatusOK {
+		t.Errorf("GET %s = %d (body %s), want 200", statePath, status, body)
+	} else {
+		var view temporal.RolloutView
+		if err := json.Unmarshal([]byte(body), &view); err != nil {
+			t.Errorf("decode state body %s: %v", body, err)
+		} else {
+			if view.Status != rollout.RolloutCompleted {
+				t.Errorf("state status = %q, want %q", view.Status, rollout.RolloutCompleted)
+			}
+			if len(view.Waves) != 1 || view.Waves[0].FailedCount != 1 ||
+				view.Waves[0].UnreportedCount != 1 {
+				t.Errorf("state waves = %+v, want 1 failed and 1 unreported device", view.Waves)
+			}
+		}
+	}
+
+	// A command on a rollout that already concluded is refused rather than accepted, and a
+	// command on a rollout that does not exist is not found.
+	if status, body := doRequest(t, operatorAPI, http.MethodPost, statePath+"/pause"); status != http.StatusConflict {
+		t.Errorf("POST pause on a concluded rollout = %d (body %s), want 409", status, body)
+	}
+	missing := "/api/rollouts/ro-smoke-missing"
+	if status, body := doRequest(t, operatorAPI, http.MethodPost, missing+"/pause"); status != http.StatusNotFound {
+		t.Errorf("POST pause on an unknown rollout = %d (body %s), want 404", status, body)
+	}
+
+	// A pause on a running rollout is delivered and visible, and a resume continues it.
+	live := temporal.RolloutRequest{
+		RolloutID: "ro-smoke-http", FirmwareID: "fw-smoke", Region: "eu-west", Model: "oak-s3",
+	}
+	liveSettings := smokeRolloutSettings(t, cfg)
+	liveSettings.Waves = []temporal.RolloutWave{{Percent: 25}, {Percent: 100, RequireApproval: true}}
+	if err := temporal.NewRolloutStarter(tc, cfg.Temporal.TaskQueue, liveSettings).
+		Start(ctx, live); err != nil {
+		t.Fatalf("start http rollout: %v", err)
+	}
+	livePath := "/api/rollouts/" + live.RolloutID
+	waitForRolloutStatus(t, rollouts, live.RolloutID, rollout.RolloutAwaitingApproval)
+
+	if status, body := doRequest(t, operatorAPI, http.MethodPost, livePath+"/pause"); status != http.StatusAccepted {
+		t.Fatalf("POST pause = %d (body %s), want 202", status, body)
+	}
+	if status, body := doRequest(t, operatorAPI, http.MethodPost, livePath+"/pause"); status != http.StatusAccepted {
+		t.Fatalf("POST repeated pause = %d (body %s), want 202", status, body)
+	}
+	waitForRolloutStatus(t, rollouts, live.RolloutID, rollout.RolloutPaused)
+
+	if status, body := doRequest(t, operatorAPI, http.MethodPost, livePath+"/approve"); status != http.StatusAccepted {
+		t.Fatalf("POST approve = %d (body %s), want 202", status, body)
+	}
+	if status, body := doRequest(t, operatorAPI, http.MethodPost, livePath+"/resume"); status != http.StatusAccepted {
+		t.Fatalf("POST resume = %d (body %s), want 202", status, body)
+	}
+	// The banked approval carries the gated wave, so the rollout runs to completion after the
+	// resume rather than holding for a second approval.
+	waitForRolloutStatus(t, rollouts, live.RolloutID, rollout.RolloutCompleted)
+	if wave := waitForWave(t, waves, rollout.WaveID(live.RolloutID, 1, 100)); wave.Status != rollout.WaveHealthy {
+		t.Errorf("gated wave after the resume = %q, want healthy", wave.Status)
+	}
+}
+
+// smokeLogger is the logger the operator surface is driven with: the smoke runs the surface as the
+// test binary would in production, and a boundary log is the only place a backend failure's reason
+// survives the handler's operator-safe response.
+func smokeLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+}
+
+// doRequest runs one request against handler and returns its status and body, retrying while the
+// handler answers 5xx.
+//
+// The 5xx the surface has is a backend the handler could not reach in time, and the smoke's backend
+// is the Temporal dev server's single-node storage, which stalls under this fleet's load and on its
+// own system workflows. A stalled read is not an answer about the operator surface, so the request
+// is repeated rather than reported as one; a backend that is truly down exhausts the window and the
+// last status is returned, which fails the assertion that follows.
+func doRequest(t *testing.T, handler http.Handler, method, path string) (int, string) {
+	t.Helper()
+	deadline := time.Now().Add(smokeBackendGrace)
+	var status int
+	var body string
+	for {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(method, path, nil))
+		status, body = rec.Code, rec.Body.String()
+		if status < http.StatusInternalServerError || !time.Now().Before(deadline) {
+			return status, body
+		}
+		t.Logf("%s %s = %d (body %s), retrying: the backend did not answer", method, path, status, body)
+		time.Sleep(smokePollInterval)
 	}
 }
 
@@ -278,11 +516,41 @@ func portOf(t *testing.T, address string) string {
 // server, over the real fleet database and the configured policy. It returns a connected Temporal
 // client and waits until the frontend answers, so a rollout started afterwards cannot race the
 // server's own startup.
+// smokeRolloutSettings builds the canary policy the smoke drives from the same configuration the
+// control plane maps, so what the smoke exercises is what a real start path hands the workflow.
+// The waves are replaced per scenario by the caller; this supplies the configured timing.
+func smokeRolloutSettings(t *testing.T, cfg config.Config) temporal.RolloutSettings {
+	t.Helper()
+	settings, err := temporal.NewRolloutSettings(
+		cfg.Rollout.HealthWindow.Duration,
+		cfg.Rollout.DecisionTimeout.Duration,
+		cfg.Rollout.ResultTimeout.Duration,
+		smokeWaves(cfg.Rollout.Waves),
+	)
+	if err != nil {
+		t.Fatalf("build rollout settings: %v", err)
+	}
+	return settings
+}
+
+// smokeWaves maps the configured sequence onto the workflow's own wave type.
+func smokeWaves(waves []config.Wave) []temporal.RolloutWave {
+	mapped := make([]temporal.RolloutWave, 0, len(waves))
+	for _, wave := range waves {
+		mapped = append(mapped, temporal.RolloutWave{
+			Percent:         wave.Percent,
+			RequireApproval: wave.RequireApproval,
+		})
+	}
+	return mapped
+}
+
 func startSmokeWorker(
 	t *testing.T,
 	cfg config.Config,
 	db *mongo.Database,
 	commands temporal.DeviceCommander,
+	devices temporal.DeviceStateReader,
 ) temporalclient.Client {
 	t.Helper()
 	ctx := context.Background()
@@ -308,7 +576,17 @@ func startSmokeWorker(
 	}
 
 	w := worker.New(tc, cfg.Temporal.TaskQueue, worker.Options{})
-	registerRollout(w, newRolloutDeps(db, commands, rolloutHealthSettings(cfg.Rollout)))
+	// The namespace bootstrap is part of startup, so the smoke runs it against a real frontend:
+	// the attributes a workflow can upsert are the ones this registers.
+	if err := bootstrapNamespace(ctx, tc.OperatorService(), cfg.Temporal.Namespace); err != nil {
+		t.Fatalf("bootstrap namespace: %v", err)
+	}
+
+	deps := newRolloutDeps(db, commands, devices, rolloutHealthSettings(cfg.Rollout))
+	deps.updateOptions = []temporal.UpdateDeviceOption{
+		temporal.WithUpdatePollInterval(smokeUpdatePollInterval),
+	}
+	registerRollout(w, deps)
 
 	stop := make(chan any)
 	done := make(chan struct{})
@@ -491,8 +769,8 @@ func countWaves(t *testing.T, coll *mongo.Collection, rolloutID string) int64 {
 	return count
 }
 
-// assertDispatched checks that every targeted device was commanded exactly once, carrying the
-// firmware the rollout deploys, under the command id its wave and device derive.
+// assertDispatched checks that every targeted device was commanded, carrying the firmware the
+// rollout deploys, under the command id its wave and device derive.
 func assertDispatched(t *testing.T, dispatcher *commandRecorder, waves []rollout.WaveRecord) {
 	t.Helper()
 	want := make(map[string]string)
@@ -503,8 +781,9 @@ func assertDispatched(t *testing.T, dispatcher *commandRecorder, waves []rollout
 	}
 
 	commands := dispatcher.recorded()
-	if len(commands) != len(want) {
-		t.Fatalf("dispatched commands = %d, want one per targeted device (%d)", len(commands), len(want))
+	if len(commands) < len(want) {
+		t.Fatalf("dispatched commands = %d, want at least one per targeted device (%d)",
+			len(commands), len(want))
 	}
 	seen := make(map[string]bool, len(commands))
 	for _, cmd := range commands {
@@ -512,9 +791,6 @@ func assertDispatched(t *testing.T, dispatcher *commandRecorder, waves []rollout
 		if !ok {
 			t.Errorf("command %s targets no recorded membership", cmd.CommandID)
 			continue
-		}
-		if seen[cmd.CommandID] {
-			t.Errorf("command %s was dispatched twice", cmd.CommandID)
 		}
 		seen[cmd.CommandID] = true
 		if cmd.DeviceID != device {
@@ -524,6 +800,35 @@ func assertDispatched(t *testing.T, dispatcher *commandRecorder, waves []rollout
 			cmd.Version != "2.0.0" || cmd.Checksum != "sha256:smoke" {
 			t.Errorf("command %s carries %q/%q/%q/%q, want the deployed firmware update",
 				cmd.CommandID, cmd.Kind, cmd.FirmwareID, cmd.Version, cmd.Checksum)
+		}
+	}
+	for commandID, device := range want {
+		if !seen[commandID] {
+			t.Errorf("device %s was never commanded for wave %s", device, commandID)
+		}
+	}
+}
+
+// assertCommandedUnderOneID checks that a device's update reached the device — at least once, since
+// an attempt that dies while it waits is retried — always under the one command id its wave and
+// device derive. Every delivery carries the same reference, which is what makes a retried attempt a
+// no-op for a device that already accepted it, so a device that reports no result must still have
+// seen exactly one command id.
+func assertCommandedUnderOneID(
+	t *testing.T,
+	dispatcher *commandRecorder,
+	waveID, deviceID string,
+) {
+	t.Helper()
+	commands := dispatcher.deliveredCommands(deviceID)
+	if len(commands) == 0 {
+		t.Errorf("device %s was never commanded", deviceID)
+		return
+	}
+	want := temporal.CommandID(waveID, deviceID)
+	for _, cmd := range commands {
+		if cmd.CommandID != want {
+			t.Errorf("device %s was commanded with id %q, want %q", deviceID, cmd.CommandID, want)
 		}
 	}
 }
