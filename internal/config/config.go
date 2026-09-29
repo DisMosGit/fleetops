@@ -158,6 +158,11 @@ type Temporal struct {
 	Namespace string `yaml:"namespace"`
 	// TaskQueue is the task queue the workers poll.
 	TaskQueue string `yaml:"task_queue"`
+	// DispatchTaskQueue is the task queue the control plane polls for device command dispatch.
+	// It is separate from TaskQueue because a Temporal task is delivered to any poller of its
+	// queue rather than to one that registered its type, so a process must never poll a queue
+	// carrying task types it does not host.
+	DispatchTaskQueue string `yaml:"dispatch_task_queue"`
 }
 
 // Observability configures metrics, tracing, and probe endpoints.
@@ -219,7 +224,12 @@ func Defaults() Config {
 			// measured them.
 			ResultTimeout: Duration{Duration: 5 * time.Minute},
 		},
-		Temporal: Temporal{Address: "localhost:7233", Namespace: "default", TaskQueue: "fleetops"},
+		Temporal: Temporal{
+			Address:           "localhost:7233",
+			Namespace:         "default",
+			TaskQueue:         "fleetops",
+			DispatchTaskQueue: "fleetops-controlplane",
+		},
 		Observability: Observability{
 			OTelEndpoint: "localhost:4317",
 			MetricsAddr:  ":9091",

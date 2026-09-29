@@ -197,6 +197,16 @@ func TestValidate(t *testing.T) {
 		{name: "empty task queue", mutate: func(c *Config) {
 			c.Temporal.TaskQueue = ""
 		}, wantErrs: []string{"temporal.task_queue"}},
+		{name: "empty dispatch task queue", mutate: func(c *Config) {
+			c.Temporal.DispatchTaskQueue = ""
+		}, wantErrs: []string{"temporal.dispatch_task_queue"}},
+		{name: "blank dispatch task queue", mutate: func(c *Config) {
+			c.Temporal.DispatchTaskQueue = "   "
+		}, wantErrs: []string{"temporal.dispatch_task_queue"}},
+		{name: "both queues empty are reported together", mutate: func(c *Config) {
+			c.Temporal.TaskQueue = ""
+			c.Temporal.DispatchTaskQueue = ""
+		}, wantErrs: []string{"temporal.task_queue", "temporal.dispatch_task_queue"}},
 		{name: "bad otel endpoint", mutate: func(c *Config) {
 			c.Observability.OTelEndpoint = "collector:grpc"
 		}, wantErrs: []string{"observability.otel_endpoint"}},

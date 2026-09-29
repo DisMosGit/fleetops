@@ -105,6 +105,48 @@ func TestRolloutDefaults(t *testing.T) {
 	}
 }
 
+// TestTemporalQueueDefaults pins the two queue names an absent temporal section yields: the work
+// queue the workers poll and the separate queue the control plane polls for command dispatch.
+// Each is asserted on its own, so a drifted default fails with the queue's name.
+func TestTemporalQueueDefaults(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	file := "simulation:\n  fleet_size: 250\n"
+	if err := os.WriteFile(path, []byte(file), 0o600); err != nil {
+		t.Fatalf("write test config: %v", err)
+	}
+	got, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	defaults := []struct {
+		field string
+		got   any
+		want  any
+	}{
+		{"temporal.task_queue", got.Temporal.TaskQueue, "fleetops"},
+		{"temporal.dispatch_task_queue", got.Temporal.DispatchTaskQueue, "fleetops-controlplane"},
+	}
+	for _, tc := range defaults {
+		t.Run(tc.field, func(t *testing.T) {
+			t.Parallel()
+
+			if diff := cmp.Diff(tc.want, tc.got); diff != "" {
+				t.Errorf("%s default mismatch (-want +got):\n%s", tc.field, diff)
+			}
+		})
+	}
+	// The separation only holds while the two names differ: a config whose dispatch queue
+	// collapsed onto the work queue would put dispatch tasks back in front of every worker
+	// poller, which is the defect this value exists to remove.
+	if got.Temporal.DispatchTaskQueue == got.Temporal.TaskQueue {
+		t.Errorf("dispatch queue = work queue %q, want two distinct queues",
+			got.Temporal.TaskQueue)
+	}
+}
+
 func TestLoad(t *testing.T) {
 	t.Parallel()
 
@@ -238,6 +280,21 @@ func TestLoad(t *testing.T) {
 			// A result wait longer than the wave's own decision timeout would let the
 			// deadline pass while the wave still waits on devices.
 			wantErr: "rollout.result_timeout",
+		},
+		{
+			name: "temporal dispatch queue overrides the default",
+			file: "temporal:\n" +
+				"  task_queue: work\n" +
+				"  dispatch_task_queue: dispatch\n",
+			mutate: func(c *Config) {
+				c.Temporal.TaskQueue = "work"
+				c.Temporal.DispatchTaskQueue = "dispatch"
+			},
+		},
+		{
+			name:    "empty dispatch task queue is rejected by field name",
+			file:    "temporal:\n  dispatch_task_queue: \"\"\n",
+			wantErr: "temporal.dispatch_task_queue",
 		},
 		{
 			name:    "malformed duration is rejected by field name",

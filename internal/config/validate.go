@@ -91,6 +91,7 @@ func (c Config) Validate() error {
 	validateHostPort(add, "temporal.address", c.Temporal.Address)
 	validateNonEmpty(add, "temporal.namespace", c.Temporal.Namespace)
 	validateNonEmpty(add, "temporal.task_queue", c.Temporal.TaskQueue)
+	validateNonEmpty(add, "temporal.dispatch_task_queue", c.Temporal.DispatchTaskQueue)
 	if c.Observability.OTelEndpoint != "" {
 		validateHostPort(add, "observability.otel_endpoint", c.Observability.OTelEndpoint)
 	}

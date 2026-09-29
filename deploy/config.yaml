@@ -104,6 +104,13 @@ temporal:
   namespace: "default"
   # Task queue the workers poll.
   task_queue: "fleetops"
+  # Task queue the control plane polls for device command dispatch. It carries the
+  # dispatch-command activity, whose side effect is the agent hub inside the control plane,
+  # so the control plane polls this queue and not the work queue above. Must differ from
+  # task_queue: two processes sharing one queue would each be handed task types they do not
+  # host, because Temporal delivers a task to any poller of its queue rather than to one that
+  # registered its type.
+  dispatch_task_queue: "fleetops-controlplane"
 
 observability:
   # OTLP collector endpoint; empty disables trace export.
