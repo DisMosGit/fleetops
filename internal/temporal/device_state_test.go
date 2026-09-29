@@ -204,21 +204,25 @@ func TestDeviceStateApply(t *testing.T) {
 			applied: 2,
 		},
 		{
-			name:  "matching result clears the pending command",
+			name:  "matching result clears the pending command and records the conclusion",
 			setup: heardWithPending,
 			apply: func(s *deviceState) {
 				s.applyCommandResult(CommandResultSignal{
 					DeviceID: "dev-1", CommandID: "cmd-1", Outcome: OutcomeFailed, Detail: "boom",
 				})
 			},
-			want:    State{DeviceID: "dev-1", CurrentFw: "fw-1", LastHeartbeatAt: base},
+			want: State{DeviceID: "dev-1", CurrentFw: "fw-1", LastHeartbeatAt: base,
+				LastCommand: &ConcludedCommand{
+					Command: issued, Outcome: OutcomeFailed, Detail: "boom",
+				}},
 			applied: 2,
 		},
 		{
-			name:    "success adopts the commanded firmware",
-			setup:   heardWithPending,
-			apply:   func(s *deviceState) { s.applyCommandResult(result) },
-			want:    State{DeviceID: "dev-1", CurrentFw: "fw-2", LastHeartbeatAt: base},
+			name:  "success adopts the commanded firmware and records the conclusion",
+			setup: heardWithPending,
+			apply: func(s *deviceState) { s.applyCommandResult(result) },
+			want: State{DeviceID: "dev-1", CurrentFw: "fw-2", LastHeartbeatAt: base,
+				LastCommand: &ConcludedCommand{Command: issued, Outcome: OutcomeSucceeded}},
 			applied: 2,
 		},
 		{
@@ -228,7 +232,8 @@ func TestDeviceStateApply(t *testing.T) {
 				s.applyCommandResult(result)
 				s.applyCommandResult(result)
 			},
-			want:    State{DeviceID: "dev-1", CurrentFw: "fw-2", LastHeartbeatAt: base},
+			want: State{DeviceID: "dev-1", CurrentFw: "fw-2", LastHeartbeatAt: base,
+				LastCommand: &ConcludedCommand{Command: issued, Outcome: OutcomeSucceeded}},
 			applied: 3,
 		},
 		{
@@ -239,7 +244,7 @@ func TestDeviceStateApply(t *testing.T) {
 			applied: 1,
 		},
 		{
-			name:  "abort success leaves firmware unchanged",
+			name:  "successful abort leaves firmware unchanged and is recorded",
 			setup: heardWithPending,
 			apply: func(s *deviceState) {
 				s.applyCommandIssued(CommandIssuedSignal{
@@ -249,7 +254,13 @@ func TestDeviceStateApply(t *testing.T) {
 					DeviceID: "dev-1", CommandID: "cmd-2", Outcome: OutcomeSucceeded,
 				})
 			},
-			want:    State{DeviceID: "dev-1", CurrentFw: "fw-1", LastHeartbeatAt: base},
+			want: State{DeviceID: "dev-1", CurrentFw: "fw-1", LastHeartbeatAt: base,
+				LastCommand: &ConcludedCommand{
+					Command: CommandIssuedSignal{
+						CommandID: "cmd-2", DeviceID: "dev-1", Kind: CommandKindAbort, Reason: "stop",
+					},
+					Outcome: OutcomeSucceeded,
+				}},
 			applied: 3,
 		},
 		{
@@ -362,6 +373,25 @@ func TestDeviceStateValidate(t *testing.T) {
 		}
 		if err := s.validate(); !errors.Is(err, ErrUnsupportedCarryVersion) {
 			t.Errorf("validate() on a v1 payload = %v, want ErrUnsupportedCarryVersion", err)
+		}
+	})
+
+	t.Run("carry version 3 payload is refused", func(t *testing.T) {
+		t.Parallel()
+		// The schema before this change: complete in every field it knew, but with no way
+		// to say what a device's last command concluded. Accepting it would leave every
+		// in-flight device unable to answer the update wait, so it is refused loudly.
+		const v3 = `{"carry_version":3,"device_id":"dev-1","current_fw":"fw-1",` +
+			`"settings":{"snapshot_interval":60000000000,"offline_threshold":30000000000}}`
+		var s deviceState
+		if err := json.Unmarshal([]byte(v3), &s); err != nil {
+			t.Fatalf("decode v3 payload: %v", err)
+		}
+		if s.LastCommand != nil {
+			t.Errorf("a v3 payload decoded a last command: %+v", s.LastCommand)
+		}
+		if err := s.validate(); !errors.Is(err, ErrUnsupportedCarryVersion) {
+			t.Errorf("validate() on a v3 payload = %v, want ErrUnsupportedCarryVersion", err)
 		}
 	})
 }
@@ -666,6 +696,11 @@ func TestCarryRoundTrip(t *testing.T) {
 	s.Pending = &PendingCommand{
 		Command:    CommandIssuedSignal{CommandID: "cmd-1", DeviceID: "dev-1", Kind: CommandKindUpdate, FirmwareID: "fw-2", Version: "fw-2", Checksum: "sum"},
 		Dispatched: true,
+	}
+	s.LastCommand = &ConcludedCommand{
+		Command: CommandIssuedSignal{CommandID: "cmd-0", DeviceID: "dev-1", Kind: CommandKindUpdate, FirmwareID: "fw-1", Version: "fw-1"},
+		Outcome: OutcomeFailed,
+		Detail:  "download digest mismatch",
 	}
 	s.Config = ConfigSnapshot{Version: 3, Data: json.RawMessage(`{"interval":"5s"}`)}
 	s.RecentEventIDs.push("evt-1", maxRecentEventIDs)

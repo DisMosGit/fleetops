@@ -11,8 +11,8 @@ import (
 // carryVersion is the schema version stamped on every carried-over state. A run refuses a
 // state it cannot understand instead of guessing at a foreign shape. Version 2 added the
 // identity attributes, the liveness status, and the settings to the carried state; version 3
-// added the update status.
-const carryVersion = 3
+// added the update status; version 4 added the last concluded command.
+const carryVersion = 4
 
 // Bounds of the dedup memory carried across continuations. The rings are the fast path of
 // signal idempotency; the structural guards in the apply methods are the backstop.
@@ -175,6 +175,19 @@ type PendingCommand struct {
 	Dispatched bool `json:"dispatched"`
 }
 
+// ConcludedCommand is a command the workflow has concluded, with the outcome it reported. A
+// cleared pending command alone cannot say whether it succeeded or failed — a device that
+// failed to reach the commanded version has no pending command either — so a caller that
+// dispatched the command reads its result here.
+type ConcludedCommand struct {
+	// Command is the command as it was issued.
+	Command CommandIssuedSignal `json:"command"`
+	// Outcome is the terminal outcome the device reported.
+	Outcome CommandOutcome `json:"outcome"`
+	// Detail is operator-safe failure detail; set for OutcomeFailed only.
+	Detail string `json:"detail,omitempty"`
+}
+
 // ConfigSnapshot is a versioned device configuration snapshot.
 type ConfigSnapshot struct {
 	// Version is the snapshot's monotonically increasing version.
@@ -211,6 +224,9 @@ type State struct {
 	LastHeartbeatAt time.Time `json:"last_heartbeat_at"`
 	// Pending is the outstanding command, or nil when none is outstanding.
 	Pending *PendingCommand `json:"pending,omitempty"`
+	// LastCommand is the last command that concluded, or nil when none has — what a caller
+	// waiting on a dispatched command reads its result from.
+	LastCommand *ConcludedCommand `json:"last_command,omitempty"`
 	// Update is the latest firmware-update progress the device reported, or nil when none
 	// was reported.
 	Update *UpdateStatus `json:"update_status,omitempty"`
@@ -240,6 +256,8 @@ type deviceState struct {
 	LastHeartbeatAt time.Time `json:"last_heartbeat_at"`
 	// Pending is the outstanding command, or nil when none is outstanding.
 	Pending *PendingCommand `json:"pending,omitempty"`
+	// LastCommand is the last command that concluded, or nil when none has.
+	LastCommand *ConcludedCommand `json:"last_command,omitempty"`
 	// Update is the latest firmware-update progress the device reported, or nil when none
 	// was reported.
 	Update *UpdateStatus `json:"update_status,omitempty"`
@@ -351,6 +369,10 @@ func (s deviceState) view() State {
 		pending := *s.Pending
 		out.Pending = &pending
 	}
+	if s.LastCommand != nil {
+		concluded := *s.LastCommand
+		out.LastCommand = &concluded
+	}
 	if s.Update != nil {
 		update := *s.Update
 		out.Update = &update
@@ -418,8 +440,9 @@ func (s *deviceState) applyCommandIssued(c CommandIssuedSignal) transitions {
 }
 
 // applyCommandResult folds one command_result signal into the state: a result matching the
-// pending command concludes it — adopting the commanded firmware on success — and any other
-// result changes nothing, so a redelivered result can never conclude twice.
+// pending command concludes it — recording the command with the outcome it reported and, on
+// success, adopting the commanded firmware — and any other result changes nothing, so a
+// redelivered result can never conclude twice.
 func (s *deviceState) applyCommandResult(r CommandResultSignal) transitions {
 	s.SignalsApplied++
 	if s.Pending == nil || s.Pending.Command.CommandID != r.CommandID {
@@ -429,6 +452,11 @@ func (s *deviceState) applyCommandResult(r CommandResultSignal) transitions {
 	if r.Outcome == OutcomeSucceeded && s.Pending.Command.Version != "" {
 		s.CurrentFw = s.Pending.Command.Version
 		tr.Firmware = true
+	}
+	s.LastCommand = &ConcludedCommand{
+		Command: s.Pending.Command,
+		Outcome: r.Outcome,
+		Detail:  r.Detail,
 	}
 	s.Pending = nil
 	tr.Pending = true

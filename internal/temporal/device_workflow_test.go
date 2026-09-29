@@ -170,6 +170,13 @@ func finishRun(t *testing.T, env *testsuite.TestWorkflowEnvironment) deviceState
 func TestDeviceWorkflowStateQuery(t *testing.T) {
 	t.Parallel()
 
+	// The update the query's run concludes: its recorded outcome is what a rollout's
+	// waiting update activity reads back through this query.
+	update := CommandIssuedSignal{
+		CommandID: "cmd-1", DeviceID: "dev-1", Kind: CommandKindUpdate,
+		FirmwareID: "fw-2", Version: "fw-2", Checksum: "sum",
+	}
+
 	var queried State
 	env := newDeviceWorkflowEnv(&dispatchRecorder{}, &snapshotRecorder{})
 	env.RegisterDelayedCallback(func() {
@@ -178,10 +185,18 @@ func TestDeviceWorkflowStateQuery(t *testing.T) {
 		})
 	}, time.Millisecond)
 	env.RegisterDelayedCallback(func() {
+		env.SignalWorkflow(CommandIssuedSignalName, update)
+	}, 2*time.Millisecond)
+	env.RegisterDelayedCallback(func() {
+		env.SignalWorkflow(CommandResultSignalName, CommandResultSignal{
+			DeviceID: "dev-1", CommandID: "cmd-1", Outcome: OutcomeFailed, Detail: "flash error",
+		})
+	}, 3*time.Millisecond)
+	env.RegisterDelayedCallback(func() {
 		env.SignalWorkflow(ConfigChangedSignalName, ConfigChangedSignal{
 			DeviceID: "dev-1", Version: 1, Snapshot: json.RawMessage(`{"interval":"5s"}`),
 		})
-	}, 2*time.Millisecond)
+	}, 4*time.Millisecond)
 	env.RegisterDelayedCallback(func() {
 		value, err := env.QueryWorkflow(GetStateQueryType)
 		if err != nil {
@@ -191,8 +206,8 @@ func TestDeviceWorkflowStateQuery(t *testing.T) {
 		if err := value.Get(&queried); err != nil {
 			t.Errorf("decode state query: %v", err)
 		}
-	}, 3*time.Millisecond)
-	padToRollover(env, 2)
+	}, 5*time.Millisecond)
+	padToRollover(env, 4)
 	env.ExecuteWorkflow(DeviceWorkflow, newDeviceState("dev-1", testSettings()))
 
 	want := State{
@@ -200,10 +215,15 @@ func TestDeviceWorkflowStateQuery(t *testing.T) {
 		CurrentFw:       "fw-1",
 		LastHeartbeatAt: time.Unix(1000, 0),
 		Config:          ConfigSnapshot{Version: 1, Data: json.RawMessage(`{"interval":"5s"}`)},
+		LastCommand: &ConcludedCommand{
+			Command: update, Outcome: OutcomeFailed, Detail: "flash error",
+		},
 	}
 	if diff := cmp.Diff(want, queried); diff != "" {
 		t.Errorf("state query mismatch (-want +got):\n%s", diff)
 	}
+	// The concluded command is device state, not run bookkeeping: it travels with the
+	// entity across its rolling continuation.
 	if diff := cmp.Diff(want, finishRun(t, env).view()); diff != "" {
 		t.Errorf("carried state mismatch (-want +got):\n%s", diff)
 	}
@@ -343,6 +363,7 @@ func TestDeviceWorkflowCommandLifecycle(t *testing.T) {
 			DeviceID:        "dev-1",
 			CurrentFw:       "fw-2",
 			LastHeartbeatAt: time.Unix(1000, 0),
+			LastCommand:     &ConcludedCommand{Command: update, Outcome: OutcomeSucceeded},
 		}
 		if diff := cmp.Diff(want, carried.view()); diff != "" {
 			t.Errorf("state mismatch (-want +got):\n%s", diff)
@@ -364,6 +385,41 @@ func TestDeviceWorkflowCommandLifecycle(t *testing.T) {
 			DeviceID:        "dev-1",
 			CurrentFw:       "fw-1",
 			LastHeartbeatAt: time.Unix(1000, 0),
+			LastCommand: &ConcludedCommand{
+				Command: update, Outcome: OutcomeFailed, Detail: "flash error",
+			},
+		}
+		if diff := cmp.Diff(want, carried.view()); diff != "" {
+			t.Errorf("state mismatch (-want +got):\n%s", diff)
+		}
+	})
+
+	t.Run("a redelivered result leaves the concluded command alone", func(t *testing.T) {
+		t.Parallel()
+		rec := &dispatchRecorder{}
+		result := testSignal{CommandResultSignalName, CommandResultSignal{
+			DeviceID: "dev-1", CommandID: "cmd-1", Outcome: OutcomeFailed, Detail: "flash error",
+		}}
+		carried := runDevice(t, newDeviceState("dev-1", testSettings()), rec, &snapshotRecorder{},
+			heartbeat,
+			testSignal{CommandIssuedSignalName, update},
+			result,
+			// The same delivery again, and a later one claiming success: neither can
+			// reach the concluded command, which is what a caller reading its result
+			// for a dispatched command depends on.
+			result,
+			testSignal{CommandResultSignalName, CommandResultSignal{
+				DeviceID: "dev-1", CommandID: "cmd-1", Outcome: OutcomeSucceeded,
+			}},
+		)
+
+		want := State{
+			DeviceID:        "dev-1",
+			CurrentFw:       "fw-1",
+			LastHeartbeatAt: time.Unix(1000, 0),
+			LastCommand: &ConcludedCommand{
+				Command: update, Outcome: OutcomeFailed, Detail: "flash error",
+			},
 		}
 		if diff := cmp.Diff(want, carried.view()); diff != "" {
 			t.Errorf("state mismatch (-want +got):\n%s", diff)

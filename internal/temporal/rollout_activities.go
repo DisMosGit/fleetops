@@ -48,6 +48,15 @@ type DeviceCommander interface {
 	SignalCommandIssued(ctx context.Context, cmd CommandIssuedSignal) error
 }
 
+// DeviceStateReader reads one device's authoritative state from its entity workflow.
+// *DeviceStates satisfies it. It is what the update activity observes while it waits for a
+// device to report, so it reads the workflow that owns the device rather than a projection.
+type DeviceStateReader interface {
+	// State returns the state of one device's entity workflow, reporting an error wrapping
+	// ErrDeviceNotFound when the device has no workflow execution.
+	State(ctx context.Context, deviceID string) (State, error)
+}
+
 // HealthEvaluator evaluates one wave's measured health. *wavehealth.Aggregator satisfies it.
 type HealthEvaluator interface {
 	// Evaluate measures the wave over its recorded membership and start time, ending the

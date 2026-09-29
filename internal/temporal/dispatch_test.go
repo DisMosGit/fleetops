@@ -208,7 +208,8 @@ func TestWorkflowSupersededDispatchIsHarmless(t *testing.T) {
 		}},
 	)
 
-	want := State{DeviceID: "dev-1", CurrentFw: "fw-3"}
+	want := State{DeviceID: "dev-1", CurrentFw: "fw-3",
+		LastCommand: &ConcludedCommand{Command: second, Outcome: OutcomeSucceeded}}
 	if diff := cmp.Diff(want, carried.view()); diff != "" {
 		t.Errorf("state mismatch (-want +got):\n%s", diff)
 	}

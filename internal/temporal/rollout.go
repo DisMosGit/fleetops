@@ -17,6 +17,10 @@ const (
 	GetRolloutStateQueryType = "get-rollout-state"
 	// ApproveNextWaveSignalName carries an ApproveNextWaveSignal.
 	ApproveNextWaveSignalName = "approve_next_wave"
+	// PauseRolloutSignalName carries a PauseRolloutSignal.
+	PauseRolloutSignalName = "pause_rollout"
+	// ResumeRolloutSignalName carries a ResumeRolloutSignal.
+	ResumeRolloutSignalName = "resume_rollout"
 	// LoadFirmwareActivityName is the registered name of the load-firmware activity.
 	LoadFirmwareActivityName = "load-firmware"
 	// ResolveWaveTargetsActivityName is the registered name of the resolve-wave-targets activity.
@@ -25,6 +29,9 @@ const (
 	RecordRolloutStateActivityName = "record-rollout-state"
 	// RecordWaveStateActivityName is the registered name of the record-wave-state activity.
 	RecordWaveStateActivityName = "record-wave-state"
+	// UpdateDeviceActivityName is the registered name of the update-device activity: it commands
+	// one device and waits for that device's reported result.
+	UpdateDeviceActivityName = "update-device"
 	// DispatchWaveUpdateActivityName is the registered name of the dispatch-wave-update activity.
 	DispatchWaveUpdateActivityName = "dispatch-wave-update"
 	// EvaluateWaveHealthActivityName is the registered name of the evaluate-wave-health activity.
@@ -75,6 +82,29 @@ type RolloutInput struct {
 	Settings RolloutSettings `json:"settings"`
 }
 
+// NewRolloutSettings builds the canary policy a rollout drives under from a deployment's
+// configured values: the health window, the decision timeout, how long a wave waits for each
+// device's reported result, and the wave sequence with its approval flags.
+//
+// It validates what it builds, so a policy no rollout could sequence fails at the entrypoint that
+// read the configuration rather than inside a running rollout, and every entrypoint that starts a
+// rollout maps its configuration through this one function.
+func NewRolloutSettings(
+	healthWindow, decisionTimeout, resultTimeout time.Duration,
+	waves []RolloutWave,
+) (RolloutSettings, error) {
+	settings := RolloutSettings{
+		HealthWindow:    healthWindow,
+		DecisionTimeout: decisionTimeout,
+		ResultTimeout:   resultTimeout,
+		Waves:           waves,
+	}
+	if err := settings.validate(); err != nil {
+		return RolloutSettings{}, err
+	}
+	return settings, nil
+}
+
 // RolloutSettings are the configured canary policy one rollout decides under.
 type RolloutSettings struct {
 	// HealthWindow is the width of the durable window each wave's health is measured over.
@@ -82,6 +112,10 @@ type RolloutSettings struct {
 	// DecisionTimeout is the longest a wave may stay undecided before its gate treats it as
 	// unhealthy, measured from the wave's recorded start.
 	DecisionTimeout time.Duration `json:"decision_timeout"`
+	// ResultTimeout is the longest a wave waits for one device's reported update result before
+	// that device counts as unreported and the wave stops waiting on it, measured from the
+	// wave's dispatch.
+	ResultTimeout time.Duration `json:"result_timeout"`
 	// Waves is the canary sequence the rollout drives, in sequence order.
 	Waves []RolloutWave `json:"waves"`
 }
@@ -99,6 +133,16 @@ type RolloutWave struct {
 // there is no identity to carry and the signal's arrival is the decision — and an operator sends
 // it with the Temporal CLI or UI.
 type ApproveNextWaveSignal struct{}
+
+// PauseRolloutSignal is the pause_rollout signal payload: an operator holding the rollout so it
+// starts no further wave. It carries nothing: the signal's arrival is the decision, and a pause
+// holds the rollout until a resume arrives.
+type PauseRolloutSignal struct{}
+
+// ResumeRolloutSignal is the resume_rollout signal payload: an operator letting a paused rollout
+// continue from exactly where it stopped. It carries nothing, and a resume of a rollout that is
+// not paused changes nothing.
+type ResumeRolloutSignal struct{}
 
 // RolloutOutcome names why a rollout reached a terminal state.
 type RolloutOutcome string
@@ -158,6 +202,11 @@ type WaveView struct {
 	SuccessRate float64 `json:"success_rate"`
 	// TargetCount is how many devices the wave targets; zero before it is resolved.
 	TargetCount int `json:"target_count"`
+	// FailedCount is how many of the wave's devices reported a failed update.
+	FailedCount int `json:"failed_count"`
+	// UnreportedCount is how many of the wave's devices never reported a result before the
+	// wave stopped waiting on them.
+	UnreportedCount int `json:"unreported_count"`
 }
 
 // RolloutView is what a rollout's state query reports: where the rollout stands, what it deploys,
@@ -169,6 +218,9 @@ type RolloutView struct {
 	Status rollout.RolloutStatus `json:"status"`
 	// FirmwareID is the firmware the rollout deploys.
 	FirmwareID string `json:"firmware_id"`
+	// FirmwareVersion is the deployed firmware's version, empty until its metadata has been
+	// loaded. It is what the run's RolloutFirmware search attribute holds.
+	FirmwareVersion string `json:"firmware_version,omitempty"`
 	// Region is the target selector's region.
 	Region string `json:"region"`
 	// Model is the target selector's device model.

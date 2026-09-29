@@ -119,6 +119,14 @@ func TestSignalPathEndToEnd(t *testing.T) {
 		CurrentFw:       "fw-2",
 		LastHeartbeatAt: hbTime,
 		Config:          ConfigSnapshot{Version: 1, Data: json.RawMessage(`{"interval":"5s"}`)},
+		// The success the agent reported, untouched by the duplicate claiming failure.
+		LastCommand: &ConcludedCommand{
+			Command: CommandIssuedSignal{
+				CommandID: "cmd-1", DeviceID: "dev-1", Kind: CommandKindUpdate,
+				FirmwareID: "fw-2", Version: "fw-2", Checksum: "sum",
+			},
+			Outcome: OutcomeSucceeded,
+		},
 	}
 	if diff := cmp.Diff(want, carried.view()); diff != "" {
 		t.Errorf("end-state mismatch (-want +got):\n%s", diff)
