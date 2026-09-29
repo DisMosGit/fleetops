@@ -129,6 +129,13 @@ ensureCollection("firmware", {
 fleet.firmware.createIndex({ version: 1 }, { name: "idx_version", unique: true });
 
 // rollouts: one document per rollout, _id = rollout id.
+// status gains the non-terminal rolling_back: a rollout that has stopped deciding and is running
+// the compensations it derived from the wave that failed it. The terminal rolled_back status is
+// recorded only once every compensating step has run.
+// rollback is the rollback the workflow writes as it compensates: why it happened, the plan's steps
+// with what each achieved, the inventory the reconciliation established, and the devices it could
+// not restore. It is deliberately optional, so a document written before it existed stays updatable
+// by the new build and a document written with it stays valid for the previous validator.
 ensureCollection("rollouts", {
   validationAction: "error",
   validationLevel: "strict",
@@ -142,6 +149,52 @@ ensureCollection("rollouts", {
         temporal_wf_id: { bsonType: "string" },
         region: { bsonType: "string" },
         model: { bsonType: "string" },
+        rollback: {
+          bsonType: "object",
+          required: ["outcome", "steps", "inventory", "unrestored_device_ids"],
+          properties: {
+            outcome: { bsonType: "string" },
+            steps: {
+              bsonType: "array",
+              items: {
+                bsonType: "object",
+                required: ["kind", "status", "devices"],
+                properties: {
+                  kind: { bsonType: "string" },
+                  // The wave a compensating step compensates; absent for the steps that
+                  // compensate the bookkeeping or announce the rollback.
+                  wave_id: { bsonType: "string" },
+                  status: { bsonType: "string" },
+                  devices: { bsonType: ["int", "long"] },
+                  restored: { bsonType: ["int", "long"] },
+                  failed: { bsonType: ["int", "long"] },
+                  unreported: { bsonType: ["int", "long"] },
+                  skipped: { bsonType: ["int", "long"] },
+                  unavailable: { bsonType: ["int", "long"] },
+                  agreed: { bsonType: ["int", "long"] },
+                  corrected: { bsonType: ["int", "long"] },
+                  unverified: { bsonType: ["int", "long"] },
+                  detail: { bsonType: "string" },
+                },
+              },
+            },
+            inventory: {
+              bsonType: "array",
+              items: {
+                bsonType: "object",
+                required: ["version", "devices"],
+                properties: {
+                  version: { bsonType: "string" },
+                  devices: { bsonType: ["int", "long"] },
+                },
+              },
+            },
+            unrestored_device_ids: {
+              bsonType: "array",
+              items: { bsonType: "string" },
+            },
+          },
+        },
       },
     },
   },

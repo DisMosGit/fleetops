@@ -45,11 +45,21 @@ Indexes: `_id_` (unique, device identity), `idx_region_model {region, model}` (e
 rollout target-group queries), `idx_status {status}` (UI device list filtering). No TTL — device
 records never expire.
 
+`current_fw` is the fleet's record of the firmware version a device runs, kept from the device's own
+reports — the registration that enrolled it and the heartbeats that followed — and is never the
+authority: the device's workflow owns the version the device runs. A rollback's inventory
+reconciliation compares the two and corrects the record where they disagree, writing only a version
+the device's workflow reported and only where the record differs, so a rerun writes nothing. That
+correction touches `current_fw` alone; `status` and `last_heartbeat` belong to heartbeat ingestion
+and the staleness sweep.
+
 ### `device_state_snapshots` — one projected device-workflow state per device
 
 Written by the device workflow's snapshot activity; the write is monotone in `snapshot_at`, so
 the document always holds the newest projected state and an out-of-order write converges instead
-of regressing it.
+of regressing it. The projection is a subset of the workflow's state: fields no reader of this
+collection needs — the last concluded command and the firmware version the device ran before its
+current one — stay in the workflow, which owns them.
 
 | Field | Type | Meaning |
 |---|---|---|
@@ -86,6 +96,14 @@ the schema validator enforces the required fields and types).
 
 Indexes: `_id_` (unique), `idx_version {version}` (unique). No TTL.
 
+The registry is read by id and by version. By id, `Metadata` returns the record and `Open` returns
+it together with a reader over the stored binary; by version, `MetadataByVersion` returns the record
+alone, which is how a caller that knows only a version — a device reporting the firmware it ran, or
+a rollback restoring a device to it — obtains the id, checksum, and target models to command it.
+Because `version` is unique, a version resolves to exactly one record, and a version no document
+carries is reported as not found rather than as an empty record. Neither lookup reads a payload:
+binaries are streamed from GridFS only when a caller opens one by id.
+
 ### `rollouts` — one document per rollout
 
 Written by the rollout workflow: the document is created when the rollout starts — carrying the
@@ -100,13 +118,32 @@ the rollout progresses.
 | `temporal_wf_id` | string | id of the workflow execution driving the rollout (required) |
 | `region` | string | target group region (required) |
 | `model` | string | target group model (required) |
+| `rollback` | object | the rollback the rollout ran, written as it compensates (optional; absent on a rollout that never entered rollback) |
 
 `status` is one of `running`, `paused` (an operator held the rollout: it starts no further wave),
-`awaiting_approval` (holding at a wave that requires an operator approval), `rolled_back`,
-`completed`, or `failed`. The last three are terminal: a later write never moves the document out
-of one, so a retried or late transition leaves a concluded rollout's record as it stands. `paused`
-is never terminal — a resumed rollout reports `running` again. Every write is idempotent —
-recording a status the document already holds changes nothing.
+`awaiting_approval` (holding at a wave that requires an operator approval), `rolling_back` (the
+rollout has stopped deciding and is running the compensations it derived from the wave that failed
+it), `rolled_back`, `completed`, or `failed`. The last three are terminal: a later write never moves
+the document out of one, so a retried or late transition leaves a concluded rollout's record as it
+stands. `paused` and `rolling_back` are never terminal — a resumed rollout reports `running` again,
+and a compensating one records `rolled_back` only once every step of its plan has run. Every write
+is idempotent — recording a status the document already holds changes nothing.
+
+The `rollback` sub-document is the rollback's own record, written by every write from the moment the
+rollout enters rollback:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `outcome` | string | why the compensations ran: the outcome that ended the rollout (`unhealthy_wave`, `decision_timeout`, `dispatch_failed`) |
+| `steps` | array | the plan in plan order, each with its `kind` (`notify_started`, `downgrade`, `reconcile_inventory`, `notify_completed`), the `wave_id` a compensating step compensates (absent for the steps that compensate no wave), its `status` (`pending`, `running`, `completed`, `failed`), how many `devices` it targeted, the device outcomes of a downgrade step (`restored`, `failed`, `unreported`, `skipped`, `unavailable`), the record outcomes of the reconciliation (`agreed`, `corrected`, `unverified`), and a `detail` on a failed step |
+| `inventory` | array | the inventory the reconciliation established: one `{version, devices}` entry per firmware version the rollback's devices were found on, ordered by version |
+| `unrestored_device_ids` | array of string | the devices left on the rolled-back firmware: the ones that reported a failed restore, never reported, or could not be restored at all |
+
+The steps are replaced whole by every write, so a step transition recorded twice converges on the
+same document rather than appending to it, and the record of a rollout interrupted mid-plan stays
+readable: the steps that ran carry their counts and the rest are still `pending`. The sub-document
+is deliberately optional in the validator, so a document written before it existed stays updatable
+by the new build and a document written with it stays valid for the previous validator.
 
 Indexes: `_id_` (unique), `idx_status {status}` (rollout list filtering), `idx_firmware_id
 {firmware_id}` (rollouts per firmware). No TTL.

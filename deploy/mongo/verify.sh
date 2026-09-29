@@ -133,6 +133,92 @@ try {
 check(legacyWaveUpdated, "a wave document without the outcome sets stays updatable");
 fleet.waves.deleteMany({ _id: waveID });
 
+// --- the rollback record: optional, with the plan, the inventory, and the unrestored ids ---
+const rolloutProps = propertiesOf("rollouts");
+check(rolloutProps.rollback !== undefined, "rollouts validator describes rollback");
+check(!expectedRequired.rollouts.includes("rollback"), "rollouts.rollback is not a required field");
+const rollbackRequired = (rolloutProps.rollback && rolloutProps.rollback.required) || [];
+check(
+  ["outcome", "steps", "inventory", "unrestored_device_ids"].every((f) => rollbackRequired.includes(f)),
+  "rollouts.rollback requires outcome, steps, inventory, unrestored_device_ids",
+);
+const stepProps = ((rolloutProps.rollback || {}).properties || {}).steps;
+const stepFields = ((stepProps || {}).items || {}).properties || {};
+for (const field of ["kind", "wave_id", "status", "devices", "restored", "failed", "unreported",
+  "skipped", "unavailable", "agreed", "corrected", "unverified", "detail"]) {
+  check(stepFields[field] !== undefined, "rollouts.rollback step describes " + field);
+}
+check(stepProps.items.required.includes("kind") && stepProps.items.required.includes("status"),
+  "rollouts.rollback step requires its kind and status");
+check(
+  ((rolloutProps.rollback || {}).properties || {}).inventory !== undefined,
+  "rollouts.rollback describes the reconciled inventory",
+);
+
+// --- the rollback record round-trips through the validator ---
+const rolloutID = "verify-rollout-" + Date.now();
+fleet.rollouts.insertOne({
+  _id: rolloutID,
+  firmware_id: "verify-fw",
+  status: "rolling_back",
+  temporal_wf_id: "rollout-" + rolloutID,
+  region: "verify",
+  model: "verify",
+  rollback: {
+    outcome: "unhealthy_wave",
+    steps: [
+      { kind: "notify_started", status: "completed", devices: 0 },
+      { kind: "downgrade", wave_id: "verify-wave-" + Date.now(), status: "completed",
+        devices: 2, restored: 1, unreported: 1 },
+      { kind: "reconcile_inventory", status: "completed", devices: 2, agreed: 1, corrected: 1 },
+      { kind: "notify_completed", status: "failed", devices: 0, detail: "broker is unreachable" },
+    ],
+    inventory: [{ version: "1.0.0", devices: 1 }, { version: "2.0.0", devices: 1 }],
+    unrestored_device_ids: ["verify-b"],
+  },
+});
+const storedRollout = fleet.rollouts.findOne({ _id: rolloutID });
+check(storedRollout.status === "rolling_back", "rollouts stores the compensating status");
+check(storedRollout.rollback.steps.length === 4, "rollouts stores a rollback record with its plan");
+check(storedRollout.rollback.steps[3].detail === "broker is unreachable",
+  "rollouts stores why a step failed");
+check(storedRollout.rollback.inventory.length === 2,
+  "rollouts stores the reconciled inventory");
+check(storedRollout.rollback.unrestored_device_ids[0] === "verify-b",
+  "rollouts stores the devices the rollback could not restore");
+
+// A record missing a required piece is refused, the terminal status is storable with a record,
+// and a document written without one stays updatable by the new build.
+let incompleteRecordRejected = false;
+try {
+  fleet.rollouts.updateOne({ _id: rolloutID }, { $set: { rollback: { outcome: "unhealthy_wave" } } });
+} catch (e) {
+  incompleteRecordRejected = e.code === 121;
+}
+check(incompleteRecordRejected, "a rollback record without its plan is refused");
+let concludedWithRecord = true;
+try {
+  fleet.rollouts.updateOne({ _id: rolloutID }, { $set: { status: "rolled_back" } });
+} catch (e) {
+  concludedWithRecord = false;
+}
+check(concludedWithRecord, "a rollback record is storable with the terminal status");
+let legacyRolloutUpdated = true;
+try {
+  fleet.rollouts.updateOne({ _id: rolloutID }, { $unset: { rollback: "" } });
+} catch (e) {
+  legacyRolloutUpdated = false;
+}
+check(legacyRolloutUpdated, "a rollout document without a rollback record stays updatable");
+let missingFieldRejected = false;
+try {
+  fleet.rollouts.insertOne({ _id: rolloutID + "-bad", firmware_id: "verify-fw", status: "running" });
+} catch (e) {
+  missingFieldRejected = e.code === 121;
+}
+check(missingFieldRejected, "a rollout document missing a required field is refused");
+fleet.rollouts.deleteMany({ _id: { $in: [rolloutID, rolloutID + "-bad"] } });
+
 // --- index set ---
 function indexMap(name) {
   const map = {};
