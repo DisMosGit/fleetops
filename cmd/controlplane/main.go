@@ -28,6 +28,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	agentv1 "github.com/DisMosGit/fleetops/api/proto/agent/v1"
+	rolloutv1 "github.com/DisMosGit/fleetops/api/proto/rollout/v1"
 	"github.com/DisMosGit/fleetops/internal/agentserver"
 	"github.com/DisMosGit/fleetops/internal/config"
 	"github.com/DisMosGit/fleetops/internal/devices"
@@ -35,6 +36,7 @@ import (
 	"github.com/DisMosGit/fleetops/internal/health"
 	"github.com/DisMosGit/fleetops/internal/telemetry"
 	"github.com/DisMosGit/fleetops/internal/temporal"
+	"github.com/DisMosGit/fleetops/internal/wavehealth"
 )
 
 // shutdownTimeout bounds graceful shutdown of the probe server.
@@ -169,11 +171,34 @@ func newPipeline(cfg config.Config, db *mongo.Database, registry *prometheus.Reg
 	}, nil
 }
 
+// newWaveHealthService builds the wave health query service the control plane serves: the
+// aggregation over the fleet database's rollouts, waves, and telemetry collection, evaluated at
+// the configured gating policy. The served window and thresholds are logged here, before the gRPC
+// listener starts, so what the process answers with is visible in its startup output.
+func newWaveHealthService(cfg config.Config, db *mongo.Database, log *slog.Logger) *wavehealth.Service {
+	settings := wavehealth.Settings{
+		HealthWindow:          cfg.Rollout.HealthWindow.Duration,
+		SampleHealthThreshold: cfg.Rollout.SampleHealthThreshold,
+		MinSuccessRatio:       cfg.Rollout.MinSuccessRatio,
+		MinSamples:            cfg.Rollout.MinSamples,
+	}
+	log.Info("wave health gating configured",
+		"health_window", settings.HealthWindow,
+		"sample_health_threshold", settings.SampleHealthThreshold,
+		"min_success_ratio", settings.MinSuccessRatio,
+		"min_samples", settings.MinSamples,
+	)
+	// One store serves both consumed interfaces: it resolves the wave and counts its samples.
+	store := wavehealth.NewStore(db)
+	return wavehealth.NewService(wavehealth.New(store, store, settings), log)
+}
+
 // run serves the liveness/readiness probes on the configured health address and AgentService
 // on the configured gRPC address until ctx is cancelled. Accepted streams persist device
 // records and heartbeats through the batched ingest pipeline and signal the device workflow,
 // the dispatch-command activity delivers the workflow's commands back onto the streams, and
-// firmware binaries stream to agents over their download RPC. The HTTP gateway serves the
+// firmware binaries stream to agents over their download RPC. RolloutService answers the
+// operator's wave health query on the same listener. The HTTP gateway serves the
 // firmware upload API on httpAddr; its SSE routes join the same lifecycle at stage 5.
 
 func run(ctx context.Context, cfg config.Config, httpAddr string) error {
@@ -246,6 +271,7 @@ func run(ctx context.Context, cfg config.Config, httpAddr string) error {
 	hub := agentserver.NewHub(events.sink, log)
 	grpcServer := grpc.NewServer(agentserver.ServerOptions(log)...)
 	agentv1.RegisterAgentServiceServer(grpcServer, agentserver.NewServer(hub, registry, signaler, firmwareStore, log))
+	rolloutv1.RegisterRolloutServiceServer(grpcServer, newWaveHealthService(cfg, db, log))
 
 	// Activities live beside their side effects: dispatch-command needs the in-process hub,
 	// so it joins this process on the same task queue the workflow worker uses.
