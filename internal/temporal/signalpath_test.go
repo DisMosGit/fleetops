@@ -117,6 +117,7 @@ func TestSignalPathEndToEnd(t *testing.T) {
 		Region:          "eu-west",
 		Model:           "oak-s3",
 		CurrentFw:       "fw-2",
+		PreviousFw:      "fw-1",
 		LastHeartbeatAt: hbTime,
 		Config:          ConfigSnapshot{Version: 1, Data: json.RawMessage(`{"interval":"5s"}`)},
 		// The success the agent reported, untouched by the duplicate claiming failure.

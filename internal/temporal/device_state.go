@@ -11,8 +11,9 @@ import (
 // carryVersion is the schema version stamped on every carried-over state. A run refuses a
 // state it cannot understand instead of guessing at a foreign shape. Version 2 added the
 // identity attributes, the liveness status, and the settings to the carried state; version 3
-// added the update status; version 4 added the last concluded command.
-const carryVersion = 4
+// added the update status; version 4 added the last concluded command; version 5 added the
+// firmware version the device ran before its current one.
+const carryVersion = 5
 
 // Bounds of the dedup memory carried across continuations. The rings are the fast path of
 // signal idempotency; the structural guards in the apply methods are the backstop.
@@ -218,6 +219,9 @@ type State struct {
 	Model string `json:"model,omitempty"`
 	// CurrentFw is the firmware version the device is considered to run.
 	CurrentFw string `json:"current_fw"`
+	// PreviousFw is the firmware version the device ran immediately before its current one, empty
+	// while its firmware has never changed. It is what a rollback restores the device to.
+	PreviousFw string `json:"previous_fw,omitempty"`
 	// Online is the liveness status derived from heartbeat recency.
 	Online bool `json:"online"`
 	// LastHeartbeatAt is the timestamp of the newest applied heartbeat.
@@ -250,6 +254,9 @@ type deviceState struct {
 	Model string `json:"model,omitempty"`
 	// CurrentFw is the firmware version the device is considered to run.
 	CurrentFw string `json:"current_fw"`
+	// PreviousFw is the firmware version the device ran immediately before its current one, empty
+	// while its firmware has never changed.
+	PreviousFw string `json:"previous_fw,omitempty"`
 	// Online is the liveness status derived from heartbeat recency; see refreshLiveness.
 	Online bool `json:"online"`
 	// LastHeartbeatAt is the timestamp of the newest applied heartbeat.
@@ -361,6 +368,7 @@ func (s deviceState) view() State {
 		Region:          s.Region,
 		Model:           s.Model,
 		CurrentFw:       s.CurrentFw,
+		PreviousFw:      s.PreviousFw,
 		Online:          s.Online,
 		LastHeartbeatAt: s.LastHeartbeatAt,
 		Config:          s.Config,
@@ -418,11 +426,24 @@ func (s *deviceState) applyHeartbeat(h HeartbeatSignal) transitions {
 		s.Model = h.Model
 		tr.Identity = true
 	}
-	if h.CurrentFw != "" && h.CurrentFw != s.CurrentFw {
-		s.CurrentFw = h.CurrentFw
+	if h.CurrentFw != "" && s.adoptFirmware(h.CurrentFw) {
 		tr.Firmware = true
 	}
 	return tr
+}
+
+// adoptFirmware moves the device onto version and reports whether it moved. One rule maintains both
+// firmware fields — the version being left becomes the previous one — so a report and a command
+// conclusion that adopt the same version leave the same history behind, whichever lands first. A
+// version the device already runs changes nothing, so a report that names it cannot make the device
+// look as though it had been restored to itself.
+func (s *deviceState) adoptFirmware(version string) bool {
+	if version == "" || version == s.CurrentFw {
+		return false
+	}
+	s.PreviousFw = s.CurrentFw
+	s.CurrentFw = version
+	return true
 }
 
 // applyCommandIssued folds one command_issued signal into the state: the command becomes the
@@ -449,9 +470,8 @@ func (s *deviceState) applyCommandResult(r CommandResultSignal) transitions {
 		return transitions{}
 	}
 	var tr transitions
-	if r.Outcome == OutcomeSucceeded && s.Pending.Command.Version != "" {
-		s.CurrentFw = s.Pending.Command.Version
-		tr.Firmware = true
+	if r.Outcome == OutcomeSucceeded {
+		tr.Firmware = s.adoptFirmware(s.Pending.Command.Version)
 	}
 	s.LastCommand = &ConcludedCommand{
 		Command: s.Pending.Command,

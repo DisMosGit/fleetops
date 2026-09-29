@@ -229,6 +229,67 @@ func TestDeviceWorkflowStateQuery(t *testing.T) {
 	}
 }
 
+// TestDeviceWorkflowPreviousFirmware pins what a rollback reads from the entity: the version the
+// device ran before its current one is recorded when its firmware changes, is readable through the
+// state query, is untouched by a redelivered conclusion, and travels with the entity across its
+// rolling continuation.
+func TestDeviceWorkflowPreviousFirmware(t *testing.T) {
+	t.Parallel()
+
+	update := CommandIssuedSignal{
+		CommandID: "cmd-1", DeviceID: "dev-1", Kind: CommandKindUpdate,
+		FirmwareID: "fw-2", Version: "fw-2", Checksum: "sum",
+	}
+	result := CommandResultSignal{DeviceID: "dev-1", CommandID: "cmd-1", Outcome: OutcomeSucceeded}
+
+	var queried State
+	env := newDeviceWorkflowEnv(&dispatchRecorder{}, &snapshotRecorder{})
+	env.RegisterDelayedCallback(func() {
+		env.SignalWorkflow(HeartbeatSignalName, HeartbeatSignal{
+			EventID: "evt-1", DeviceID: "dev-1", CurrentFw: "fw-1", Timestamp: time.Unix(1000, 0),
+		})
+	}, time.Millisecond)
+	env.RegisterDelayedCallback(func() {
+		env.SignalWorkflow(CommandIssuedSignalName, update)
+	}, 2*time.Millisecond)
+	env.RegisterDelayedCallback(func() {
+		env.SignalWorkflow(CommandResultSignalName, result)
+	}, 3*time.Millisecond)
+	env.RegisterDelayedCallback(func() {
+		// A redelivery of the conclusion that moved the device: the command is no longer
+		// pending, so it concludes nothing and the recorded history stands.
+		env.SignalWorkflow(CommandResultSignalName, result)
+	}, 4*time.Millisecond)
+	env.RegisterDelayedCallback(func() {
+		value, err := env.QueryWorkflow(GetStateQueryType)
+		if err != nil {
+			t.Errorf("query state: %v", err)
+			return
+		}
+		if err := value.Get(&queried); err != nil {
+			t.Errorf("decode state query: %v", err)
+		}
+	}, 5*time.Millisecond)
+	// Four signals were delivered above; the rollover is padded from there. The query is not
+	// a signal and does not count towards the run's history budget.
+	padToRollover(env, 4)
+	env.ExecuteWorkflow(DeviceWorkflow, newDeviceState("dev-1", testSettings()))
+
+	want := State{
+		DeviceID:        "dev-1",
+		CurrentFw:       "fw-2",
+		PreviousFw:      "fw-1",
+		LastHeartbeatAt: time.Unix(1000, 0),
+		LastCommand:     &ConcludedCommand{Command: update, Outcome: OutcomeSucceeded},
+	}
+	if diff := cmp.Diff(want, queried); diff != "" {
+		t.Errorf("state query mismatch (-want +got):\n%s", diff)
+	}
+	if diff := cmp.Diff(want, finishRun(t, env).view()); diff != "" {
+		t.Errorf("carried state mismatch (-want +got):\n%s", diff)
+	}
+}
+
 func TestDeviceWorkflowSignalIdempotency(t *testing.T) {
 	t.Parallel()
 
@@ -362,6 +423,7 @@ func TestDeviceWorkflowCommandLifecycle(t *testing.T) {
 		want := State{
 			DeviceID:        "dev-1",
 			CurrentFw:       "fw-2",
+			PreviousFw:      "fw-1",
 			LastHeartbeatAt: time.Unix(1000, 0),
 			LastCommand:     &ConcludedCommand{Command: update, Outcome: OutcomeSucceeded},
 		}
@@ -591,6 +653,7 @@ func TestDrainAllAppliesBufferedSignals(t *testing.T) {
 	want := State{
 		DeviceID:        "dev-1",
 		CurrentFw:       "fw-2",
+		PreviousFw:      "fw-1",
 		LastHeartbeatAt: time.Unix(2000, 0),
 		Pending: &PendingCommand{Command: CommandIssuedSignal{
 			CommandID: "cmd-1", DeviceID: "dev-1", Kind: CommandKindUpdate,

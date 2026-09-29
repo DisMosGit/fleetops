@@ -139,7 +139,7 @@ func (u deviceUpdater) awaitResult(
 	// A deadline that has already passed leaves nothing to wait for, and the command's fate is
 	// still worth one read: the device may have concluded it before this attempt started.
 	for {
-		if concluded, ok := u.observe(ctx, req.DeviceID, commandID); ok {
+		if concluded, ok := observeCommand(ctx, u.states, req.DeviceID, commandID); ok {
 			return DeviceUpdate{
 				DeviceID: req.DeviceID,
 				Outcome:  updateOutcome(concluded.Outcome),
@@ -168,15 +168,17 @@ func (u deviceUpdater) awaitResult(
 	}
 }
 
-// observe reads one device's state and reports what the command this activity delivered
-// concluded. It reports ok=false when it cannot: the device has not concluded that command —
-// still pending, superseded by a newer one, or never heard from — or the read itself failed.
-// Neither is evidence about the device, so both leave the wait running to its deadline.
-func (u deviceUpdater) observe(
+// observeCommand reads one device's state and reports what the command with commandID concluded. It
+// reports ok=false when it cannot: the command has not concluded — still pending, superseded by a
+// newer one, or never heard from — or the read itself failed. Neither is evidence about the device,
+// so both leave a wait running to its deadline. It is shared by every activity that waits for a
+// device to conclude a command it delivered, so the rule has one implementation.
+func observeCommand(
 	ctx context.Context,
+	states DeviceStateReader,
 	deviceID, commandID string,
 ) (ConcludedCommand, bool) {
-	state, err := u.states.State(ctx, deviceID)
+	state, err := states.State(ctx, deviceID)
 	if err != nil {
 		if !errors.Is(err, ErrDeviceNotFound) && activity.IsActivity(ctx) {
 			activity.GetLogger(ctx).Warn("observe device state",

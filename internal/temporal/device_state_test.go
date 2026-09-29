@@ -108,6 +108,16 @@ func TestDeviceStateApply(t *testing.T) {
 		FirmwareID: "fw-2", Version: "fw-2",
 	}
 	result := CommandResultSignal{DeviceID: "dev-1", CommandID: "cmd-1", Outcome: OutcomeSucceeded}
+	// A restore commands the version the device ran before; a redeploy commands the one it
+	// already runs. Both are ordinary update commands for the entity.
+	restore := CommandIssuedSignal{
+		CommandID: "cmd-restore", DeviceID: "dev-1", Kind: CommandKindUpdate,
+		FirmwareID: "fw-1", Version: "fw-1",
+	}
+	redeploy := CommandIssuedSignal{
+		CommandID: "cmd-redeploy", DeviceID: "dev-1", Kind: CommandKindUpdate,
+		FirmwareID: "fw-2", Version: "fw-2",
+	}
 	config := ConfigChangedSignal{DeviceID: "dev-1", Version: 2, Snapshot: json.RawMessage(`{"a":1}`)}
 
 	cases := []struct {
@@ -136,7 +146,24 @@ func TestDeviceStateApply(t *testing.T) {
 					EventID: "evt-2", DeviceID: "dev-1", CurrentFw: "fw-2", Timestamp: newer,
 				})
 			},
-			want:    State{DeviceID: "dev-1", CurrentFw: "fw-2", LastHeartbeatAt: newer},
+			want: State{DeviceID: "dev-1", CurrentFw: "fw-2", PreviousFw: "fw-1", LastHeartbeatAt: newer},
+			// A device that never reported a version carries none either: the version being
+			// left was the empty one.
+			applied: 1,
+		},
+		{
+			name: "a report naming the current version moves neither version",
+			setup: func(s *deviceState) {
+				*s = newDeviceState("dev-1", testSettings())
+				s.CurrentFw, s.PreviousFw = "fw-2", "fw-1"
+				s.LastHeartbeatAt = base
+			},
+			apply: func(s *deviceState) {
+				s.applyHeartbeat(HeartbeatSignal{
+					EventID: "evt-2", DeviceID: "dev-1", CurrentFw: "fw-2", Timestamp: newer,
+				})
+			},
+			want:    State{DeviceID: "dev-1", CurrentFw: "fw-2", PreviousFw: "fw-1", LastHeartbeatAt: newer},
 			applied: 1,
 		},
 		{
@@ -221,7 +248,7 @@ func TestDeviceStateApply(t *testing.T) {
 			name:  "success adopts the commanded firmware and records the conclusion",
 			setup: heardWithPending,
 			apply: func(s *deviceState) { s.applyCommandResult(result) },
-			want: State{DeviceID: "dev-1", CurrentFw: "fw-2", LastHeartbeatAt: base,
+			want: State{DeviceID: "dev-1", CurrentFw: "fw-2", PreviousFw: "fw-1", LastHeartbeatAt: base,
 				LastCommand: &ConcludedCommand{Command: issued, Outcome: OutcomeSucceeded}},
 			applied: 2,
 		},
@@ -232,9 +259,43 @@ func TestDeviceStateApply(t *testing.T) {
 				s.applyCommandResult(result)
 				s.applyCommandResult(result)
 			},
-			want: State{DeviceID: "dev-1", CurrentFw: "fw-2", LastHeartbeatAt: base,
+			want: State{DeviceID: "dev-1", CurrentFw: "fw-2", PreviousFw: "fw-1", LastHeartbeatAt: base,
 				LastCommand: &ConcludedCommand{Command: issued, Outcome: OutcomeSucceeded}},
 			applied: 3,
+		},
+		{
+			name: "a restore moves the previous version too",
+			setup: func(s *deviceState) {
+				*s = newDeviceState("dev-1", testSettings())
+				s.CurrentFw, s.PreviousFw = "fw-2", "fw-1"
+				s.LastHeartbeatAt = base
+				s.applyCommandIssued(restore)
+			},
+			apply: func(s *deviceState) {
+				s.applyCommandResult(CommandResultSignal{
+					DeviceID: "dev-1", CommandID: restore.CommandID, Outcome: OutcomeSucceeded,
+				})
+			},
+			want: State{DeviceID: "dev-1", CurrentFw: "fw-1", PreviousFw: "fw-2", LastHeartbeatAt: base,
+				LastCommand: &ConcludedCommand{Command: restore, Outcome: OutcomeSucceeded}},
+			applied: 2,
+		},
+		{
+			name: "a command for the version already running moves neither",
+			setup: func(s *deviceState) {
+				*s = newDeviceState("dev-1", testSettings())
+				s.CurrentFw, s.PreviousFw = "fw-2", "fw-1"
+				s.LastHeartbeatAt = base
+				s.applyCommandIssued(redeploy)
+			},
+			apply: func(s *deviceState) {
+				s.applyCommandResult(CommandResultSignal{
+					DeviceID: "dev-1", CommandID: redeploy.CommandID, Outcome: OutcomeSucceeded,
+				})
+			},
+			want: State{DeviceID: "dev-1", CurrentFw: "fw-2", PreviousFw: "fw-1", LastHeartbeatAt: base,
+				LastCommand: &ConcludedCommand{Command: redeploy, Outcome: OutcomeSucceeded}},
+			applied: 2,
 		},
 		{
 			name:    "result for a non-pending command changes nothing",
@@ -392,6 +453,25 @@ func TestDeviceStateValidate(t *testing.T) {
 		}
 		if err := s.validate(); !errors.Is(err, ErrUnsupportedCarryVersion) {
 			t.Errorf("validate() on a v3 payload = %v, want ErrUnsupportedCarryVersion", err)
+		}
+	})
+
+	t.Run("carry version 4 payload is refused", func(t *testing.T) {
+		t.Parallel()
+		// The schema before this change: complete in every field it knew, but with no record
+		// of the firmware a device ran before its current one. Accepting it would leave a
+		// rollback with nothing to restore its in-flight devices to, so it is refused loudly.
+		const v4 = `{"carry_version":4,"device_id":"dev-1","current_fw":"fw-2",` +
+			`"settings":{"snapshot_interval":60000000000,"offline_threshold":30000000000}}`
+		var s deviceState
+		if err := json.Unmarshal([]byte(v4), &s); err != nil {
+			t.Fatalf("decode v4 payload: %v", err)
+		}
+		if s.PreviousFw != "" {
+			t.Errorf("a v4 payload decoded a previous firmware version: %q", s.PreviousFw)
+		}
+		if err := s.validate(); !errors.Is(err, ErrUnsupportedCarryVersion) {
+			t.Errorf("validate() on a v4 payload = %v, want ErrUnsupportedCarryVersion", err)
 		}
 	})
 }
@@ -691,6 +771,7 @@ func TestCarryRoundTrip(t *testing.T) {
 	s := newDeviceState("dev-1", testSettings())
 	s.Region, s.Model = "eu-west", "oak-s3"
 	s.CurrentFw = "fw-2"
+	s.PreviousFw = "fw-1"
 	s.Online = true
 	s.LastHeartbeatAt = time.Unix(123456, 789).UTC()
 	s.Pending = &PendingCommand{
