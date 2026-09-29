@@ -26,6 +26,6 @@ speculatively before it (stages match the delivery-status table in
 | `docs/architecture.md` | Full system architecture: components, data flow, deployment topology beyond the README summary | Contributors, evaluators | Stage 3 (streaming + telemetry paths in place) |
 | `docs/api.md` | API contracts: gRPC services and HTTP gateway endpoints, idempotency semantics | Contributors, UI authors | Stage 1 (v1 proto frozen) |
 | `docs/workflows.md` | Temporal deep-dive: `DeviceWorkflow` entity, `RolloutWorkflow` saga, signals, versioning, ContinueAsNew strategy | Contributors working on orchestration | Stage 2 |
-| `docs/telemetry.md` | Telemetry pipeline: RabbitMQ topology, consumer semantics, DLQ, Mongo time-series + change streams | Contributors working on ingestion | Stage 3 |
+| `docs/telemetry.md` | Telemetry pipeline: RabbitMQ topology and event envelope, consumer dedup/retry/dead-letter semantics, pipeline metrics, Mongo telemetry retention | Contributors working on ingestion | Stage 3 — written ([telemetry.md](telemetry.md)) |
 | `docs/observability.md` | OTel trace paths, Prometheus metrics catalogue, Grafana dashboards | Operators, contributors | Stage 4 |
 | `docs/demo.md` | Portfolio walkthrough: running a canary rollout, reading the rollback in Temporal UI, the demo GIF script | Evaluators, demo audience | Stage 5 |
