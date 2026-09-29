@@ -23,7 +23,8 @@ construct dependencies, and start the run loop.
   stage 3), and command dispatch through the `agentserver.Hub` seam. On `-http-addr` it serves
   the operator's HTTP gateway: the firmware upload API and the rollout API, each under its own
   path prefix (see [The operator HTTP API](#the-operator-http-api)). The gateway's SSE routes
-  join the same listener at stage 5.
+  join the same listener at stage 5. It polls `temporal.dispatch_task_queue` and registers
+  `dispatch-command` there — see [Task queues](#task-queues).
 - `worker` hosts the device entity and the canary rollout on `temporal.task_queue`. For the
   entity it registers `DeviceWorkflow` and the `snapshot-device-state` activity (the projection of
   device state into `device_state_snapshots`); for a rollout it registers `rollout-workflow` and
@@ -40,8 +41,10 @@ construct dependencies, and start the run loop.
   the worker needs no agent connection. `reconcile-device-inventory` reconciles one device's
   recorded `current_fw` against the version that device's workflow holds. The `dispatch-command`
   activity is not registered here: it runs in `controlplane`, beside the agent hub it dispatches
-  through. On one machine, give each replica its own `observability.health_addr` and
-  `observability.metrics_addr`; in the cluster each pod has its own.
+  through, and no worker is ever registered on `temporal.dispatch_task_queue` (see
+  [Task queues](#task-queues)). On one machine, give each replica its own
+  `observability.health_addr` and `observability.metrics_addr`; in the cluster each pod has its
+  own.
 - `worker` also hosts the broker publisher a rollback's announcements are published through:
   `announce-rollback` runs here, so the publisher is started with the worker (before it polls) and
   keeps a RabbitMQ session for the worker's lifetime, reconnecting after an outage without a
@@ -49,6 +52,47 @@ construct dependencies, and start the run loop.
   announcement fails after its short retry budget and the rollback continues. The worker declares
   the same broker layout `controlplane` does, including the `fleetops.rollout.notifications`
   queue a rollback's events are enqueued on (see [docs/telemetry.md](../docs/telemetry.md)).
+
+## Task queues
+
+The two binaries poll two different Temporal task queues, and neither polls the other's:
+
+| Queue | Configured by | Polled by | Task types that run on it |
+|---|---|---|---|
+| `temporal.task_queue` (`fleetops`) | `-config` | `worker` replicas only | `device-workflow`, `snapshot-device-state`, `rollout-workflow`, and the nine rollout activities |
+| `temporal.dispatch_task_queue` (`fleetops-controlplane`) | `-config` | `controlplane` only | `dispatch-command` |
+
+The split is not cosmetic. Temporal delivers a task to **any** poller of its queue, not to a poller
+that registered that task type — a process handed a type it does not host fails it as unknown and
+the task is redelivered with retry backoff until a process that hosts it picks it up. So the rule
+each binary follows is: poll a queue only if you register every task type that queue can deliver.
+`worker` registers the whole work queue and polls only it; `controlplane` registers
+`dispatch-command` and polls only the queue that carries it. A workflow or activity added to the
+work queue later is therefore delivered to the workers by construction, with nothing to remember in
+the control plane.
+
+Where a task runs is decided by where its **side effect** lives, not by tidiness:
+
+- `dispatch-command` sends a command down a device's live agent stream, and those streams are the
+  `agentserver.Hub` inside the control-plane process — so the activity is scheduled on the
+  control-plane queue and executed there. A device workflow schedules it explicitly, on the queue
+  carried in its entity settings, rather than on the queue the workflow itself runs on.
+- Every rollout activity, including `announce-rollback`, runs in `worker`, because the publisher a
+  rollback's announcement goes through is hosted by the process that runs the rollback.
+
+Both binaries read the same configuration file and **must be deployed together**. A control plane on
+the new build polls only the control-plane queue, so a worker still on the old build would schedule
+`dispatch-command` onto the work queue, where nothing serves it. Rollback is the same pairing in
+reverse: revert both binaries together.
+
+Device commands and the device entity meet across the two queues: the workflow runs on the work
+queue, its `dispatch-command` task goes to the control-plane queue, and the device's report comes
+back to the workflow as a signal. The device's run chain is started with the dispatch queue name in
+its settings, so a chain schedules its commands consistently for its whole life. A run chain created
+before this split carries a settings payload without the queue and is refused loudly rather than
+running half-understood; on the local dev stack the migration is to reset those chains —
+`temporal workflow terminate --workflow-id device-<device_id>`, after which the device's next
+signal recreates its chain at the current carry version with the dispatch queue in its settings.
 
 ## Rolling back
 

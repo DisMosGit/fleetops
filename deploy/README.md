@@ -25,6 +25,26 @@ file — unknown keys and invalid values stop startup with the offending field n
 plane and the worker serve `GET /healthz` (liveness) and `GET /readyz` (readiness: connectivity
 to MongoDB, RabbitMQ, and Temporal) on `observability.health_addr`.
 
+The `temporal` section carries **two** task queues, and the two binaries poll one each:
+
+| Field | Default | Polled by | Carries |
+|---|---|---|---|
+| `temporal.task_queue` | `"fleetops"` | `worker` replicas only | `device-workflow`, `snapshot-device-state`, `rollout-workflow`, and the nine rollout activities |
+| `temporal.dispatch_task_queue` | `"fleetops-controlplane"` | `controlplane` only | `dispatch-command` |
+
+They are separate because Temporal delivers a task to any poller of its queue rather than to one
+that registered its task type: two processes sharing one queue would each be handed task types they
+do not host, and those tasks would fail as unknown and be redelivered with retry backoff. The
+dispatch activity has its own queue because its side effect — the agent connection a command is
+written to — lives in the control-plane process, while every rollout activity's side effect lives in
+the worker. Both binaries read this one file and ship as a pair; see
+[Task queues](../cmd/README.md#task-queues).
+
+An empty value for either queue stops startup with the field named. That the two names **differ** is
+a requirement on the deployment, not a checked one: validation cannot know the topology an operator
+intends, and two names that happen to collide are only a defect when both binaries are pointed at
+them. Setting both to the work queue restores exactly the bouncing this separation removes.
+
 ## MongoDB data model contract
 
 Source of truth for requirements: `openspec/specs/mongo-data-model/spec.md`. Database `fleetops`.
