@@ -171,6 +171,23 @@ func TestValidate(t *testing.T) {
 		{name: "decision timeout at the health window is valid", mutate: func(c *Config) {
 			c.Rollout.DecisionTimeout = c.Rollout.HealthWindow
 		}},
+		{name: "unparseable result timeout", mutate: func(c *Config) {
+			c.Rollout.ResultTimeout = Duration{invalid: true}
+		}, wantErrs: []string{"rollout.result_timeout"}},
+		{name: "zero result timeout", mutate: func(c *Config) {
+			c.Rollout.ResultTimeout = Duration{}
+		}, wantErrs: []string{"rollout.result_timeout"}},
+		{name: "negative result timeout", mutate: func(c *Config) {
+			c.Rollout.ResultTimeout = Duration{Duration: -time.Minute}
+		}, wantErrs: []string{"rollout.result_timeout"}},
+		{name: "result timeout above the decision timeout", mutate: func(c *Config) {
+			c.Rollout.DecisionTimeout = Duration{Duration: 10 * time.Minute}
+			c.Rollout.ResultTimeout = Duration{Duration: 11 * time.Minute}
+		}, wantErrs: []string{"rollout.result_timeout"}},
+		{name: "result timeout at the decision timeout is valid", mutate: func(c *Config) {
+			c.Rollout.DecisionTimeout = Duration{Duration: 10 * time.Minute}
+			c.Rollout.ResultTimeout = Duration{Duration: 10 * time.Minute}
+		}},
 		{name: "temporal addr without port", mutate: func(c *Config) {
 			c.Temporal.Address = "temporal"
 		}, wantErrs: []string{"temporal.address"}},

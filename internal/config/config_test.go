@@ -86,6 +86,7 @@ func TestRolloutDefaults(t *testing.T) {
 		{"rollout.min_success_ratio", got.Rollout.MinSuccessRatio, 0.95},
 		{"rollout.min_samples", got.Rollout.MinSamples, 10},
 		{"rollout.decision_timeout", got.Rollout.DecisionTimeout.Duration, 30 * time.Minute},
+		{"rollout.result_timeout", got.Rollout.ResultTimeout.Duration, 5 * time.Minute},
 		{"rollout.waves", got.Rollout.Waves, []Wave{
 			{Percent: 1},
 			{Percent: 5},
@@ -213,6 +214,30 @@ func TestLoad(t *testing.T) {
 			mutate: func(c *Config) {
 				c.Rollout.DecisionTimeout = Duration{Duration: 10 * time.Minute}
 			},
+		},
+		{
+			name: "rollout result timeout overrides the default",
+			file: "rollout:\n  result_timeout: 2m\n",
+			mutate: func(c *Config) {
+				c.Rollout.ResultTimeout = Duration{Duration: 2 * time.Minute}
+			},
+		},
+		{
+			name:    "zero rollout result timeout is rejected by field name",
+			file:    "rollout:\n  result_timeout: 0s\n",
+			wantErr: "rollout.result_timeout",
+		},
+		{
+			name:    "unparseable rollout result timeout is rejected by field name",
+			file:    "rollout:\n  result_timeout: soon\n",
+			wantErr: "rollout.result_timeout",
+		},
+		{
+			name: "rollout result timeout above the decision timeout is rejected",
+			file: "rollout:\n  decision_timeout: 10m\n  result_timeout: 11m\n",
+			// A result wait longer than the wave's own decision timeout would let the
+			// deadline pass while the wave still waits on devices.
+			wantErr: "rollout.result_timeout",
 		},
 		{
 			name:    "malformed duration is rejected by field name",

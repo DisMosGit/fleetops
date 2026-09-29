@@ -92,6 +92,10 @@ rollout:
   # wave's start (Go duration string). Must not be shorter than health_window, which would decide
   # a wave before its first measurement could be taken.
   decision_timeout: "30m"
+  # Longest a wave waits for one device's reported update result before that device counts as
+  # unreported and the wave stops waiting on it (Go duration string). Must not exceed
+  # decision_timeout, which is the deadline at which the wave's verdict is already due.
+  result_timeout: "5m"
 
 temporal:
   # Temporal frontend address.

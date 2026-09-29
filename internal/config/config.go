@@ -135,6 +135,9 @@ type Rollout struct {
 	// DecisionTimeout is the longest a wave may stay undecided before its gate treats it as
 	// unhealthy.
 	DecisionTimeout Duration `yaml:"decision_timeout"`
+	// ResultTimeout is the longest a wave waits for a device's reported update result before
+	// that device counts as unreported and the wave stops waiting on it.
+	ResultTimeout Duration `yaml:"result_timeout"`
 }
 
 // Wave is one entry of the canary sequence: the share of the rollout's eligible pool the wave
@@ -211,6 +214,10 @@ func Defaults() Config {
 				{Percent: 100, RequireApproval: true},
 			},
 			DecisionTimeout: Duration{Duration: 30 * time.Minute},
+			// The same width as the health window: a wave that is judged on the samples its
+			// window gathered has, by then, given its devices as long to report as it
+			// measured them.
+			ResultTimeout: Duration{Duration: 5 * time.Minute},
 		},
 		Temporal: Temporal{Address: "localhost:7233", Namespace: "default", TaskQueue: "fleetops"},
 		Observability: Observability{

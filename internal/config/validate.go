@@ -74,12 +74,19 @@ func (c Config) Validate() error {
 	}
 	validateWaveSequence(add, "rollout.waves", c.Rollout.Waves)
 	validateDuration(add, "rollout.decision_timeout", c.Rollout.DecisionTimeout)
+	validateDuration(add, "rollout.result_timeout", c.Rollout.ResultTimeout)
 	// A decision timeout below the window would decide a wave before its first measurement could
 	// be taken. Comparing only parsed values keeps a malformed duration from reporting two
 	// violations for one field.
 	if !c.Rollout.HealthWindow.invalid && !c.Rollout.DecisionTimeout.invalid &&
 		c.Rollout.DecisionTimeout.Duration < c.Rollout.HealthWindow.Duration {
 		add("rollout.decision_timeout", "must not be below rollout.health_window")
+	}
+	// Waiting longer for device results than a wave may stay undecided would let the wave's
+	// decision timeout pass while it still waits on devices that can no longer change it.
+	if !c.Rollout.ResultTimeout.invalid && !c.Rollout.DecisionTimeout.invalid &&
+		c.Rollout.ResultTimeout.Duration > c.Rollout.DecisionTimeout.Duration {
+		add("rollout.result_timeout", "must not exceed rollout.decision_timeout")
 	}
 	validateHostPort(add, "temporal.address", c.Temporal.Address)
 	validateNonEmpty(add, "temporal.namespace", c.Temporal.Namespace)
