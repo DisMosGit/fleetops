@@ -16,8 +16,10 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/google/go-cmp/cmp"
+	"go.temporal.io/sdk/activity"
 	temporalclient "go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/converter"
+	"go.temporal.io/sdk/worker"
 
 	agentv1 "github.com/DisMosGit/fleetops/api/proto/agent/v1"
 	"github.com/DisMosGit/fleetops/internal/config"
@@ -316,6 +318,131 @@ func TestRolloutSettings(t *testing.T) {
 			t.Errorf("start input settings mismatch (-want +got):\n%s", diff)
 		}
 	})
+}
+
+// fakeWorker records the activities registered on it. The embedded worker.Worker supplies the
+// rest of the interface — it is nil, and no test calls through it.
+type fakeWorker struct {
+	worker.Worker
+	activities map[string]any
+}
+
+func (w *fakeWorker) RegisterActivityWithOptions(a any, options activity.RegisterOptions) {
+	w.activities[options.Name] = a
+}
+
+// fakeDispatcher is a hand-written temporal.CommandDispatcher double recording the commands the
+// registered dispatch activity delivered.
+type fakeDispatcher struct {
+	mu       sync.Mutex
+	commands []*agentv1.Command
+}
+
+// Send records one dispatched command.
+func (d *fakeDispatcher) Send(_ context.Context, cmd *agentv1.Command) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.commands = append(d.commands, cmd)
+	return nil
+}
+
+// sent returns the recorded commands.
+func (d *fakeDispatcher) sent() []*agentv1.Command {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return append([]*agentv1.Command(nil), d.commands...)
+}
+
+// workQueueTaskTypes are the workflow and activity names the workers register on the work queue.
+// The control plane must never register one of them: it does not poll the queue they are
+// delivered to, and a process that registered them without polling for them would be pretending
+// to a role it does not have.
+func workQueueTaskTypes() []string {
+	return []string{
+		temporal.DeviceWorkflowName,
+		temporal.SnapshotActivityName,
+		temporal.RolloutWorkflowName,
+		temporal.LoadFirmwareActivityName,
+		temporal.ResolveWaveTargetsActivityName,
+		temporal.RecordRolloutStateActivityName,
+		temporal.RecordWaveStateActivityName,
+		temporal.UpdateDeviceActivityName,
+		temporal.DowngradeDeviceActivityName,
+		temporal.ReconcileInventoryActivityName,
+		temporal.AnnounceRollbackActivityName,
+		temporal.EvaluateWaveHealthActivityName,
+	}
+}
+
+// TestStartWorker pins the control plane's Temporal topology: the queue it polls and what it
+// registers there. The polled queue is captured from the worker factory, so what is asserted is
+// the queue string this process hands to worker.New, and the registration set is read back off the
+// registry seam. Together they are the invariant the queue separation exists for: no poller of a
+// queue may lack a task type that queue can deliver.
+func TestStartWorker(t *testing.T) {
+	t.Parallel()
+
+	// Two distinct names, so the assertion says which configuration field the process reads
+	// rather than agreeing with whichever one it happens to pick.
+	cfg := config.Defaults()
+	cfg.Temporal.TaskQueue = "work"
+	cfg.Temporal.DispatchTaskQueue = "dispatch"
+
+	hub := &fakeDispatcher{}
+	built := &fakeWorker{activities: map[string]any{}}
+	var polled string
+	build := func(_ temporalclient.Client, queue string, options worker.Options) worker.Worker {
+		polled = queue
+		if options.WorkerStopTimeout <= 0 {
+			t.Errorf("WorkerStopTimeout = %v, want a bounded stop so shutdown drains",
+				options.WorkerStopTimeout)
+		}
+		return built
+	}
+
+	startWorker(build, nil, cfg, hub)
+
+	if polled != cfg.Temporal.DispatchTaskQueue {
+		t.Errorf("polled queue = %q, want the configured control-plane queue %q",
+			polled, cfg.Temporal.DispatchTaskQueue)
+	}
+	if polled == cfg.Temporal.TaskQueue {
+		t.Errorf("polled queue = work queue %q, want the control plane off it", polled)
+	}
+
+	// The registration set is exactly one activity: dispatch-command, under its explicit name
+	// rather than a function-reflection name.
+	if _, ok := built.activities[temporal.DispatchActivityName]; !ok {
+		t.Errorf("activity %q is not registered", temporal.DispatchActivityName)
+	}
+	if len(built.activities) != 1 {
+		t.Errorf("registered activities = %d, want only %q",
+			len(built.activities), temporal.DispatchActivityName)
+	}
+	for _, name := range workQueueTaskTypes() {
+		if _, ok := built.activities[name]; ok {
+			t.Errorf("work-queue type %q is registered in the control plane, want it left to the workers",
+				name)
+		}
+	}
+
+	// The registered activity is bound to the hub it was registered with: a device command
+	// reaches the agent connection this process holds.
+	dispatch, ok := built.activities[temporal.DispatchActivityName].(func(context.Context, temporal.CommandIssuedSignal) error)
+	if !ok {
+		t.Fatalf("registered activity has type %T, want the dispatch activity",
+			built.activities[temporal.DispatchActivityName])
+	}
+	if err := dispatch(context.Background(), temporal.CommandIssuedSignal{
+		CommandID: "cmd-1", DeviceID: "dev-1", Kind: temporal.CommandKindUpdate,
+		FirmwareID: "fw-2", Version: "2.0.0", Checksum: "sha256:0f1e2d",
+	}); err != nil {
+		t.Fatalf("run registered dispatch activity: %v", err)
+	}
+	sent := hub.sent()
+	if len(sent) != 1 || sent[0].GetCommandId() != "cmd-1" || sent[0].GetDeviceId() != "dev-1" {
+		t.Errorf("dispatched commands = %+v, want cmd-1 delivered to dev-1", sent)
+	}
 }
 
 // recordingStartClient is a hand-written startClient double recording the inputs it was handed.

@@ -492,6 +492,58 @@ func TestRegisterRollout(t *testing.T) {
 	}
 }
 
+// TestWorkerRegistersTheWholeWorkQueue pins the worker half of the queue topology. This binary
+// polls the work queue, and Temporal delivers a task to any poller of its queue rather than to one
+// that registered its type — so the worker must host every type that queue can deliver: the device
+// entity and its snapshot, the rollout workflow and its nine activities. It must host no
+// control-plane type either: the dispatch activity's side effect is the agent hub in the control
+// plane, and registering it here would put a task on a process that cannot serve it.
+func TestWorkerRegistersTheWholeWorkQueue(t *testing.T) {
+	t.Parallel()
+
+	registry := newFakeRegistry()
+	deps := &fakeRolloutDeps{}
+	registerDevice(registry, &fakeSnapshotStore{})
+	registerRollout(registry, rolloutDeps{
+		firmware: deps, versions: deps, targets: deps, rollouts: deps, waves: deps,
+		inventory: deps, commands: deps, devices: deps, health: deps, notifier: deps,
+	})
+
+	wantWorkflows := []string{temporal.DeviceWorkflowName, temporal.RolloutWorkflowName}
+	if len(registry.workflows) != len(wantWorkflows) {
+		t.Errorf("registered workflows = %d, want %d", len(registry.workflows), len(wantWorkflows))
+	}
+	for _, name := range wantWorkflows {
+		if _, ok := registry.workflows[name]; !ok {
+			t.Errorf("workflow %q is not registered", name)
+		}
+	}
+	wantActivities := []string{
+		temporal.SnapshotActivityName,
+		temporal.LoadFirmwareActivityName,
+		temporal.ResolveWaveTargetsActivityName,
+		temporal.RecordRolloutStateActivityName,
+		temporal.RecordWaveStateActivityName,
+		temporal.UpdateDeviceActivityName,
+		temporal.DowngradeDeviceActivityName,
+		temporal.ReconcileInventoryActivityName,
+		temporal.AnnounceRollbackActivityName,
+		temporal.EvaluateWaveHealthActivityName,
+	}
+	if len(registry.activities) != len(wantActivities) {
+		t.Errorf("registered activities = %d, want %d", len(registry.activities), len(wantActivities))
+	}
+	for _, name := range wantActivities {
+		if _, ok := registry.activities[name]; !ok {
+			t.Errorf("work-queue activity %q is not registered", name)
+		}
+	}
+	if _, ok := registry.activities[temporal.DispatchActivityName]; ok {
+		t.Errorf("activity %q is registered in the worker, want it left to the control plane",
+			temporal.DispatchActivityName)
+	}
+}
+
 // rollbackCommandIDForTest is the restore command id one rollback derives for dev-2: the workflow
 // derives it the same way, from the rollout and the device.
 func rollbackCommandIDForTest() string {

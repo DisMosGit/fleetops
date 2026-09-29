@@ -259,11 +259,14 @@ func run(ctx context.Context, cfg config.Config) error {
 	}()
 	db := mongoClient.Database(cfg.MongoDB.Database)
 
-	// New device run chains decide under the configured snapshot cadence and offline
-	// threshold, and the rollout activities decide under the configured rollout policy.
+	// New device run chains decide under the configured snapshot cadence, offline threshold,
+	// and dispatch queue, and the rollout activities decide under the configured rollout
+	// policy. This process runs the device workflow but not its dispatch activity, so the
+	// queue it seeds is the one the control plane polls.
 	signaler := temporal.NewSignaler(tc, cfg.Temporal.TaskQueue, temporal.DeviceSettings{
-		SnapshotInterval: cfg.Snapshots.Interval.Duration,
-		OfflineThreshold: cfg.Liveness.OfflineThreshold.Duration,
+		SnapshotInterval:  cfg.Snapshots.Interval.Duration,
+		OfflineThreshold:  cfg.Liveness.OfflineThreshold.Duration,
+		DispatchTaskQueue: cfg.Temporal.DispatchTaskQueue,
 	})
 
 	// The announcing step runs in this process, so the publisher it publishes through is

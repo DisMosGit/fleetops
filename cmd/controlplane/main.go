@@ -273,6 +273,46 @@ func newWaveHealthService(cfg config.Config, db *mongo.Database, log *slog.Logge
 	return wavehealth.NewService(wavehealth.New(store, store, settings), log)
 }
 
+// registry is the slice of the Temporal worker registry the wire-up needs — worker.Worker
+// satisfies it, and tests hand-write a fake. It is deliberately activity-only: the control plane
+// hosts no workflow, and a seam that could not register one says so.
+type registry interface {
+	// RegisterActivityWithOptions registers an activity function under an explicit name.
+	RegisterActivityWithOptions(a any, options activity.RegisterOptions)
+}
+
+// registerDispatch registers the command-dispatch activity under its explicit name. It is this
+// process's only registration, and that is the point: Temporal delivers a task to whichever poller
+// of its queue is available rather than to one that registered its type, so the control plane
+// polls a queue of its own and hosts exactly what that queue carries. Every task type belonging
+// to the work queue stays with the workers, which register all of them.
+func registerDispatch(w registry, dispatcher temporal.CommandDispatcher) {
+	w.RegisterActivityWithOptions(temporal.NewDispatchActivity(dispatcher), activity.RegisterOptions{
+		Name: temporal.DispatchActivityName,
+	})
+}
+
+// workerFactory builds the poller a binary runs. worker.New satisfies it, and a test substitutes
+// one that records the queue it was handed, so which queue this process polls is asserted without
+// standing up a Temporal server.
+type workerFactory func(temporalclient.Client, string, worker.Options) worker.Worker
+
+// startWorker builds the control plane's Temporal worker from cfg and registers the
+// command-dispatch activity on it — and nothing else, because nothing else runs in this process.
+// It polls the configured control-plane queue and not the work queue: Temporal delivers a task to
+// any poller of its queue rather than to one that registered its type, so a control plane on the
+// work queue would be handed the workers' device, snapshot, and rollout tasks and would fail every
+// one of them as an unknown type.
+func startWorker(
+	build workerFactory, tc temporalclient.Client, cfg config.Config,
+	dispatcher temporal.CommandDispatcher,
+) worker.Worker {
+	w := build(tc, cfg.Temporal.DispatchTaskQueue,
+		worker.Options{WorkerStopTimeout: shutdownTimeout})
+	registerDispatch(w, dispatcher)
+	return w
+}
+
 // run serves the liveness/readiness probes on the configured health address and AgentService
 // on the configured gRPC address until ctx is cancelled. Accepted streams persist device
 // records and heartbeats through the batched ingest pipeline and signal the device workflow,
@@ -336,11 +376,14 @@ func run(ctx context.Context, cfg config.Config, httpAddr string) error {
 	}
 	defer tc.Close()
 
-	// New device run chains decide under the configured snapshot cadence and offline
-	// threshold; both are captured at chain start and carried with the entity state.
+	// New device run chains decide under the configured snapshot cadence, offline threshold,
+	// and dispatch queue; all three are captured at chain start and carried with the entity
+	// state. The signaler starts workflows on the work queue — the dispatch queue is only
+	// where this process later receives their commands.
 	signaler := temporal.NewSignaler(tc, cfg.Temporal.TaskQueue, temporal.DeviceSettings{
-		SnapshotInterval: cfg.Snapshots.Interval.Duration,
-		OfflineThreshold: cfg.Liveness.OfflineThreshold.Duration,
+		SnapshotInterval:  cfg.Snapshots.Interval.Duration,
+		OfflineThreshold:  cfg.Liveness.OfflineThreshold.Duration,
+		DispatchTaskQueue: cfg.Temporal.DispatchTaskQueue,
 	})
 	hub := agentserver.NewHub(events.sink, log)
 	grpcServer := grpc.NewServer(agentserver.ServerOptions(log)...)
@@ -363,12 +406,12 @@ func run(ctx context.Context, cfg config.Config, httpAddr string) error {
 		),
 	}
 
-	// Activities live beside their side effects: dispatch-command needs the in-process hub,
-	// so it joins this process on the same task queue the workflow worker uses.
-	w := worker.New(tc, cfg.Temporal.TaskQueue, worker.Options{})
-	w.RegisterActivityWithOptions(temporal.NewDispatchActivity(hub), activity.RegisterOptions{
-		Name: temporal.DispatchActivityName,
-	})
+	// Activities live beside their side effects: dispatch-command needs the in-process hub, so
+	// it joins this process on the control plane's own task queue. Polling a queue of its own
+	// is what keeps this process from being handed the work queue's device, snapshot, and
+	// rollout tasks, which it does not host; the workflows still start on the work queue,
+	// because that is where the processes running them live.
+	w := startWorker(worker.New, tc, cfg, hub)
 
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() error {
@@ -422,7 +465,7 @@ func run(ctx context.Context, cfg config.Config, httpAddr string) error {
 		return sweeper.Run(gctx)
 	})
 	g.Go(func() error {
-		slog.Info("temporal worker started", "task_queue", cfg.Temporal.TaskQueue)
+		slog.Info("temporal worker started", "task_queue", cfg.Temporal.DispatchTaskQueue)
 		stop := make(chan any)
 		go func() {
 			<-gctx.Done()
