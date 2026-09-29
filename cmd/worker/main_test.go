@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -19,6 +20,7 @@ import (
 	"github.com/DisMosGit/fleetops/internal/devices"
 	"github.com/DisMosGit/fleetops/internal/firmware"
 	"github.com/DisMosGit/fleetops/internal/rollout"
+	"github.com/DisMosGit/fleetops/internal/telemetry"
 	"github.com/DisMosGit/fleetops/internal/temporal"
 	"github.com/DisMosGit/fleetops/internal/wavehealth"
 )
@@ -196,12 +198,35 @@ type fakeRolloutDeps struct {
 	rollouts []rollout.RolloutRecord
 	waves    []rollout.WaveStateUpdate
 	commands []temporal.CommandIssuedSignal
-	// deviceStates answers the device-state reads the update activity performs.
+	// deviceStates answers the device-state reads the update and downgrade activities perform.
 	deviceStates map[string]temporal.State
+	// reconciliations are the devices the inventory activity was asked to reconcile.
+	reconciliations []string
+	// announcements are the rollback events the notifier was asked to publish.
+	announcements []telemetry.RollbackEvent
 }
 
 func (d *fakeRolloutDeps) Metadata(_ context.Context, id string) (firmware.Record, error) {
 	return firmware.Record{ID: id, Version: "2.0.0", Models: []string{"oak-s3"}}, nil
+}
+
+// MetadataByVersion answers the registry lookup a downgrade resolves a previous version through.
+func (d *fakeRolloutDeps) MetadataByVersion(_ context.Context, version string) (firmware.Record, error) {
+	return firmware.Record{ID: "fw-0", Version: version, Models: []string{"oak-s3"}}, nil
+}
+
+// ReconcileFirmware answers the fleet's record of one device's firmware version.
+func (d *fakeRolloutDeps) ReconcileFirmware(
+	_ context.Context, deviceID, _ string,
+) (devices.FirmwareState, error) {
+	d.reconciliations = append(d.reconciliations, deviceID)
+	return devices.FirmwareAgreed, nil
+}
+
+// Announce records one rollback announcement the notifier was asked to publish.
+func (d *fakeRolloutDeps) Announce(_ context.Context, event telemetry.RollbackEvent) error {
+	d.announcements = append(d.announcements, event)
+	return nil
 }
 
 func (d *fakeRolloutDeps) ResolveWave(_ context.Context, req rollout.ResolveRequest) (rollout.WaveRecord, error) {
@@ -226,12 +251,23 @@ func (d *fakeRolloutDeps) SignalCommandIssued(_ context.Context, cmd temporal.Co
 	return nil
 }
 
-// State answers one device's authoritative state, reporting that the command it was signalled
-// concluded successfully — which is what the update activity waits for.
+// State answers one device's authoritative state: the state the test scripted, moved on by the
+// commands this process delivered to that device — which is what makes an update's and a restore's
+// wait end the way a real device's would.
 func (d *fakeRolloutDeps) State(_ context.Context, deviceID string) (temporal.State, error) {
 	state, ok := d.deviceStates[deviceID]
 	if !ok {
 		return temporal.State{}, fmt.Errorf("device %s: %w", deviceID, temporal.ErrDeviceNotFound)
+	}
+	for _, cmd := range d.commands {
+		if cmd.DeviceID != deviceID || cmd.Version == "" {
+			continue
+		}
+		if cmd.Version != state.CurrentFw {
+			state.PreviousFw, state.CurrentFw = state.CurrentFw, cmd.Version
+		}
+		concluded := temporal.ConcludedCommand{Command: cmd, Outcome: temporal.OutcomeSucceeded}
+		state.LastCommand, state.Pending = &concluded, nil
 	}
 	return state, nil
 }
@@ -294,8 +330,8 @@ func TestRegisterRollout(t *testing.T) {
 	registry := newFakeRegistry()
 	deps := &fakeRolloutDeps{}
 	registerRollout(registry, rolloutDeps{
-		firmware: deps, targets: deps, rollouts: deps,
-		waves: deps, commands: deps, devices: deps, health: deps,
+		firmware: deps, versions: deps, targets: deps, rollouts: deps, waves: deps,
+		inventory: deps, commands: deps, devices: deps, health: deps, notifier: deps,
 	})
 
 	if _, ok := registry.workflows[temporal.RolloutWorkflowName]; !ok {
@@ -307,6 +343,9 @@ func TestRegisterRollout(t *testing.T) {
 		temporal.RecordRolloutStateActivityName,
 		temporal.RecordWaveStateActivityName,
 		temporal.UpdateDeviceActivityName,
+		temporal.DowngradeDeviceActivityName,
+		temporal.ReconcileInventoryActivityName,
+		temporal.AnnounceRollbackActivityName,
 		temporal.EvaluateWaveHealthActivityName,
 	}
 	for _, name := range wantActivities {
@@ -379,6 +418,121 @@ func TestRegisterRollout(t *testing.T) {
 	}}
 	if diff := cmp.Diff(wantCommands, deps.commands); diff != "" {
 		t.Errorf("delivered commands mismatch (-want +got):\n%s", diff)
+	}
+
+	// The rollback's per-device downgrade is bound to the same device world and registry: it
+	// restores the version the device records as the one it ran before.
+	restore, ok := registry.activities[temporal.DowngradeDeviceActivityName].(func(context.Context, temporal.DowngradeDeviceRequest) (temporal.DeviceRestore, error))
+	if !ok {
+		t.Fatalf("registered activity has type %T, want the downgrade-device activity",
+			registry.activities[temporal.DowngradeDeviceActivityName])
+	}
+	deps.deviceStates["dev-2"] = temporal.State{
+		DeviceID: "dev-2", Model: "oak-s3", CurrentFw: "2.0.0", PreviousFw: "1.0.0",
+		LastCommand: &temporal.ConcludedCommand{
+			Command: temporal.CommandIssuedSignal{
+				CommandID: temporal.CommandID(waveID, "dev-2"), DeviceID: "dev-2",
+				Kind: temporal.CommandKindUpdate, FirmwareID: "fw-1", Version: "2.0.0",
+			},
+			Outcome: temporal.OutcomeSucceeded,
+		},
+	}
+	restored, err := restore(context.Background(), temporal.DowngradeDeviceRequest{
+		RolloutID: "ro-1", WaveID: waveID, DeviceID: "dev-2",
+		DeployedFw: "2.0.0", Deadline: time.Now().Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("run registered downgrade activity: %v", err)
+	}
+	if restored.Outcome != temporal.RestoreRestored {
+		t.Errorf("restore outcome = %q, want %q", restored.Outcome, temporal.RestoreRestored)
+	}
+	wantRestore := []temporal.CommandIssuedSignal{{
+		CommandID: rollbackCommandIDForTest(),
+		DeviceID:  "dev-2", Kind: temporal.CommandKindUpdate,
+		FirmwareID: "fw-0", Version: "1.0.0", Checksum: "",
+	}}
+	if diff := cmp.Diff(wantRestore, deps.commands[len(deps.commands)-1:]); diff != "" {
+		t.Errorf("delivered restore mismatch (-want +got):\n%s", diff)
+	}
+
+	// The reconciliation and the announcement are bound to the fleet inventory and the broker
+	// publisher this process wired.
+	reconcile, ok := registry.activities[temporal.ReconcileInventoryActivityName].(func(context.Context, temporal.ReconcileInventoryRequest) (temporal.DeviceInventory, error))
+	if !ok {
+		t.Fatalf("registered activity has type %T, want the reconcile-device-inventory activity",
+			registry.activities[temporal.ReconcileInventoryActivityName])
+	}
+	reconciled, err := reconcile(context.Background(), temporal.ReconcileInventoryRequest{
+		RolloutID: "ro-1", WaveID: waveID, DeviceID: "dev-2",
+	})
+	if err != nil {
+		t.Fatalf("run registered reconciliation activity: %v", err)
+	}
+	if reconciled.Outcome != temporal.InventoryAgreed || len(deps.reconciliations) != 1 {
+		t.Errorf("reconciliation = %+v against %v, want it agreed over dev-2",
+			reconciled, deps.reconciliations)
+	}
+
+	announce, ok := registry.activities[temporal.AnnounceRollbackActivityName].(func(context.Context, temporal.AnnounceRollbackRequest) error)
+	if !ok {
+		t.Fatalf("registered activity has type %T, want the announce-rollback activity",
+			registry.activities[temporal.AnnounceRollbackActivityName])
+	}
+	if err := announce(context.Background(), temporal.AnnounceRollbackRequest{
+		Phase: telemetry.RollbackStarted, RolloutID: "ro-1", FirmwareID: "fw-1",
+		FirmwareVersion: "2.0.0", Region: "eu-west", Model: "oak-s3", Outcome: temporal.OutcomeUnhealthyWave,
+		PlanSteps: 4, PlanDevices: 1, OccurredAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("run registered announcement activity: %v", err)
+	}
+	if len(deps.announcements) != 1 ||
+		deps.announcements[0].EventID != telemetry.RollbackEventID("ro-1", telemetry.RollbackStarted) {
+		t.Errorf("announcements = %+v, want the started phase published", deps.announcements)
+	}
+}
+
+// rollbackCommandIDForTest is the restore command id one rollback derives for dev-2: the workflow
+// derives it the same way, from the rollout and the device.
+func rollbackCommandIDForTest() string {
+	return "rollback-ro-1-dev-2"
+}
+
+// TestStartNotifier pins how the announcement publisher is hosted: its loop is running before the
+// worker begins polling, and a broker that is unreachable at startup is a reconnect loop inside the
+// notifier — the announcements fail, the worker runs.
+func TestStartNotifier(t *testing.T) {
+	t.Parallel()
+
+	// A port nothing listens on: every dial fails, which is the broker that is down when the
+	// worker starts.
+	notifier := telemetry.NewNotifier(
+		"amqp://guest:guest@127.0.0.1:9/",
+		telemetry.NewTopology(3, time.Second, time.Minute),
+		slog.New(slog.DiscardHandler),
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	run, ready := startNotifier(notifier, ctx)
+	done := make(chan error, 1)
+	go func() { done <- run() }()
+
+	select {
+	case <-ready:
+		// The publisher's loop is running: the worker may begin polling.
+	case <-time.After(5 * time.Second):
+		t.Fatal("the notifier never reported that its loop was running")
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("the notifier run = %v, want nil so an unreachable broker never stops the worker", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the notifier did not stop with the worker's context")
 	}
 }
 
