@@ -60,6 +60,21 @@ alerting:
   # Health score below which a degraded heartbeat is recorded as an alert, in [0, 1].
   health_threshold: 0.6
 
+rollout:
+  # Width of the sliding window a wave's health is evaluated over (Go duration string). The
+  # effective window never reaches back before the wave's start time.
+  health_window: "5m"
+  # Health score at or above which a heartbeat counts as a success. Deliberately separate from
+  # alerting.health_threshold: alert sensitivity and the promote/rollback boundary are
+  # different decisions, in [0, 1].
+  sample_health_threshold: 0.6
+  # Success ratio at or above which a decided window is healthy, in [0, 1]. A window at exactly
+  # this ratio is healthy.
+  min_success_ratio: 0.95
+  # Samples a window must hold before its verdict is decided; below it the wave is undecided
+  # rather than healthy, so thin evidence can never promote a wave.
+  min_samples: 10
+
 temporal:
   # Temporal frontend address.
   address: "localhost:7233"

@@ -61,6 +61,17 @@ func (c Config) Validate() error {
 		// The closed-range check rejects NaN along with every out-of-range threshold.
 		add("alerting.health_threshold", "must be in [0, 1]")
 	}
+	validateDuration(add, "rollout.health_window", c.Rollout.HealthWindow)
+	if c.Rollout.MinSamples <= 0 {
+		add("rollout.min_samples", fmt.Sprintf("must be positive, got %d", c.Rollout.MinSamples))
+	}
+	if !(c.Rollout.SampleHealthThreshold >= 0 && c.Rollout.SampleHealthThreshold <= 1) {
+		// The closed-range check rejects NaN along with every out-of-range threshold.
+		add("rollout.sample_health_threshold", "must be in [0, 1]")
+	}
+	if !(c.Rollout.MinSuccessRatio >= 0 && c.Rollout.MinSuccessRatio <= 1) {
+		add("rollout.min_success_ratio", "must be in [0, 1]")
+	}
 	validateHostPort(add, "temporal.address", c.Temporal.Address)
 	validateNonEmpty(add, "temporal.namespace", c.Temporal.Namespace)
 	validateNonEmpty(add, "temporal.task_queue", c.Temporal.TaskQueue)

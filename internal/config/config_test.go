@@ -61,6 +61,42 @@ func TestBrokerAndAlertingDefaults(t *testing.T) {
 	}
 }
 
+// TestRolloutDefaults pins the canary gating defaults an absent rollout section yields: each
+// field is asserted on its own, so a drifted default fails with the field's name.
+func TestRolloutDefaults(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	file := "simulation:\n  fleet_size: 250\n"
+	if err := os.WriteFile(path, []byte(file), 0o600); err != nil {
+		t.Fatalf("write test config: %v", err)
+	}
+	got, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	defaults := []struct {
+		field string
+		got   any
+		want  any
+	}{
+		{"rollout.health_window", got.Rollout.HealthWindow.Duration, 5 * time.Minute},
+		{"rollout.sample_health_threshold", got.Rollout.SampleHealthThreshold, 0.6},
+		{"rollout.min_success_ratio", got.Rollout.MinSuccessRatio, 0.95},
+		{"rollout.min_samples", got.Rollout.MinSamples, 10},
+	}
+	for _, tc := range defaults {
+		t.Run(tc.field, func(t *testing.T) {
+			t.Parallel()
+
+			if diff := cmp.Diff(tc.want, tc.got); diff != "" {
+				t.Errorf("%s default mismatch (-want +got):\n%s", tc.field, diff)
+			}
+		})
+	}
+}
+
 func TestLoad(t *testing.T) {
 	t.Parallel()
 
@@ -136,6 +172,20 @@ func TestLoad(t *testing.T) {
 			file: "snapshots:\n  interval: 30s\n",
 			mutate: func(c *Config) {
 				c.Snapshots.Interval = Duration{Duration: 30 * time.Second}
+			},
+		},
+		{
+			name: "rollout gating section overrides defaults",
+			file: "rollout:\n" +
+				"  health_window: 2m\n" +
+				"  sample_health_threshold: 0.5\n" +
+				"  min_success_ratio: 0.9\n" +
+				"  min_samples: 25\n",
+			mutate: func(c *Config) {
+				c.Rollout.HealthWindow = Duration{Duration: 2 * time.Minute}
+				c.Rollout.SampleHealthThreshold = 0.5
+				c.Rollout.MinSuccessRatio = 0.9
+				c.Rollout.MinSamples = 25
 			},
 		},
 		{

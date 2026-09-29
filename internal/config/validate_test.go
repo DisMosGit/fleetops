@@ -108,6 +108,33 @@ func TestValidate(t *testing.T) {
 		{name: "negative health threshold", mutate: func(c *Config) {
 			c.Alerting.HealthThreshold = -0.1
 		}, wantErrs: []string{"alerting.health_threshold"}},
+		{name: "unparseable rollout health window", mutate: func(c *Config) {
+			c.Rollout.HealthWindow = Duration{invalid: true}
+		}, wantErrs: []string{"rollout.health_window"}},
+		{name: "zero rollout health window", mutate: func(c *Config) {
+			c.Rollout.HealthWindow = Duration{}
+		}, wantErrs: []string{"rollout.health_window"}},
+		{name: "negative rollout health window", mutate: func(c *Config) {
+			c.Rollout.HealthWindow = Duration{Duration: -time.Minute}
+		}, wantErrs: []string{"rollout.health_window"}},
+		{name: "zero min samples", mutate: func(c *Config) {
+			c.Rollout.MinSamples = 0
+		}, wantErrs: []string{"rollout.min_samples"}},
+		{name: "negative min samples", mutate: func(c *Config) {
+			c.Rollout.MinSamples = -1
+		}, wantErrs: []string{"rollout.min_samples"}},
+		{name: "sample health threshold above one", mutate: func(c *Config) {
+			c.Rollout.SampleHealthThreshold = 1.5
+		}, wantErrs: []string{"rollout.sample_health_threshold"}},
+		{name: "negative sample health threshold", mutate: func(c *Config) {
+			c.Rollout.SampleHealthThreshold = -0.1
+		}, wantErrs: []string{"rollout.sample_health_threshold"}},
+		{name: "min success ratio above one", mutate: func(c *Config) {
+			c.Rollout.MinSuccessRatio = 1.5
+		}, wantErrs: []string{"rollout.min_success_ratio"}},
+		{name: "negative min success ratio", mutate: func(c *Config) {
+			c.Rollout.MinSuccessRatio = -0.1
+		}, wantErrs: []string{"rollout.min_success_ratio"}},
 		{name: "temporal addr without port", mutate: func(c *Config) {
 			c.Temporal.Address = "temporal"
 		}, wantErrs: []string{"temporal.address"}},

@@ -35,6 +35,8 @@ type Config struct {
 	RabbitMQ RabbitMQ `yaml:"rabbitmq"`
 	// Alerting configures the heartbeat alerting consumer.
 	Alerting Alerting `yaml:"alerting"`
+	// Rollout configures canary wave health gating.
+	Rollout Rollout `yaml:"rollout"`
 	// Temporal configures the orchestration backend.
 	Temporal Temporal `yaml:"temporal"`
 	// Observability configures metrics, tracing, and probe endpoints.
@@ -113,6 +115,23 @@ type Alerting struct {
 	HealthThreshold float64 `yaml:"health_threshold"`
 }
 
+// Rollout configures canary wave health gating: how wide a window a wave's health is measured
+// over, what counts as a successful sample, and when the measurement is evidence enough to
+// decide with. The per-sample threshold is deliberately separate from
+// alerting.health_threshold even though their defaults agree — alert sensitivity and the
+// promote/rollback boundary are different decisions, and one shared value would let a change to
+// alerting silently move the gate.
+type Rollout struct {
+	// HealthWindow is the width of the sliding window a wave's health is evaluated over.
+	HealthWindow Duration `yaml:"health_window"`
+	// SampleHealthThreshold is the health score at or above which a heartbeat counts as a success.
+	SampleHealthThreshold float64 `yaml:"sample_health_threshold"`
+	// MinSuccessRatio is the success ratio at or above which a decided window is healthy.
+	MinSuccessRatio float64 `yaml:"min_success_ratio"`
+	// MinSamples is the number of samples a window must hold before its verdict is decided.
+	MinSamples int `yaml:"min_samples"`
+}
+
 // Temporal configures the orchestration backend.
 type Temporal struct {
 	// Address is the Temporal frontend address, in host:port form.
@@ -163,6 +182,12 @@ func Defaults() Config {
 			QueueDepthInterval: Duration{Duration: 15 * time.Second},
 		},
 		Alerting: Alerting{HealthThreshold: 0.6},
+		Rollout: Rollout{
+			HealthWindow:          Duration{Duration: 5 * time.Minute},
+			SampleHealthThreshold: 0.6,
+			MinSuccessRatio:       0.95,
+			MinSamples:            10,
+		},
 		Temporal: Temporal{Address: "localhost:7233", Namespace: "default", TaskQueue: "fleetops"},
 		Observability: Observability{
 			OTelEndpoint: "localhost:4317",
