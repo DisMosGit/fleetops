@@ -29,6 +29,11 @@ const (
 	// RolloutQueue is the work queue rollout work will be consumed from; the rollout workflow
 	// is its producer and consumer, so nothing binds to it yet.
 	RolloutQueue = "fleetops.rollout.tasks"
+	// RolloutNotificationQueue is the work queue rollout notifications are consumed from —
+	// rollback announcements today. It is declared and bound with the rest of the layout, before
+	// any consumer exists: publishes are mandatory, so a notification published under a key no
+	// queue is bound to would come back unroutable and be lost.
+	RolloutNotificationQueue = "fleetops.rollout.notifications"
 )
 
 // Routing-key grammar. An event family is addressed by its prefix, and a consumer narrows its
@@ -36,18 +41,25 @@ const (
 const (
 	heartbeatKeyPrefix = "heartbeat."
 	rolloutKeyPrefix   = "rollout.task."
+	// notificationKeyPrefix is the key space of rollout notifications: one kind of notification,
+	// one phase of it.
+	notificationKeyPrefix = "rollout.notification."
+	// rollbackNotificationKind is the notification kind of rollback announcements.
+	rollbackNotificationKind = "rollback"
 	// heartbeatFamilyKey and rolloutFamilyKey subscribe a work queue to a whole family.
 	heartbeatFamilyKey = "heartbeat.#"
 	rolloutFamilyKey   = "rollout.task.#"
-	// retryKeyPrefix names the path an expired retry takes back to its work queue.
-	retryKeyPrefix = "retry."
-	// retryQueueInfix and deadLetterQueueSuffix build a work queue's retry and dead-letter
-	// queue names from the work queue name.
-	retryQueueInfix         = ".retry."
-	deadLetterQueueSuffix   = ".dlq"
-	argMessageTTL           = "x-message-ttl"
-	argDeadLetterExchange   = "x-dead-letter-exchange"
-	argDeadLetterRoutingKey = "x-dead-letter-routing-key"
+	// notificationFamilyKey subscribes a work queue to every rollout notification, and
+	// rollbackNotificationsKey to rollback announcements alone. Both are bindings a consumer
+	// attaches with; neither needs a publisher change.
+	notificationFamilyKey    = "rollout.notification.#"
+	rollbackNotificationsKey = "rollout.notification.rollback.#"
+	retryKeyPrefix           = "retry."
+	retryQueueInfix          = ".retry."
+	deadLetterQueueSuffix    = ".dlq"
+	argMessageTTL            = "x-message-ttl"
+	argDeadLetterExchange    = "x-dead-letter-exchange"
+	argDeadLetterRoutingKey  = "x-dead-letter-routing-key"
 )
 
 // QueueKind labels a queue in the depth metric with what the queue is for.
@@ -116,6 +128,11 @@ func (t Topology) WorkQueues() []WorkQueue {
 			Name:      RolloutQueue,
 			EventType: RolloutEventType,
 			Keys:      []string{rolloutFamilyKey, t.RetryKey(RolloutQueue)},
+		},
+		{
+			Name:      RolloutNotificationQueue,
+			EventType: RollbackEventType,
+			Keys:      []string{notificationFamilyKey, t.RetryKey(RolloutNotificationQueue)},
 		},
 	}
 }
@@ -194,6 +211,13 @@ func HeartbeatRoutingKey(region, model string) string {
 // RolloutRoutingKey returns the routing key of rollout work of one kind.
 func RolloutRoutingKey(kind string) string {
 	return rolloutKeyPrefix + kind
+}
+
+// RollbackRoutingKey returns the routing key of one phase of a rollback announcement. A consumer
+// subscribes to a single phase by binding that key, to every rollback announcement with
+// rollbackNotificationsKey, or to every rollout notification with notificationFamilyKey.
+func RollbackRoutingKey(phase RollbackPhase) string {
+	return notificationKeyPrefix + rollbackNotificationKind + "." + string(phase)
 }
 
 // declarer is the AMQP surface a topology declaration needs. *amqp.Channel and every Session

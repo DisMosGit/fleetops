@@ -116,6 +116,22 @@ func TestDeclareLayout(t *testing.T) {
 		"bind fleetops.rollout.tasks.retry.2 <- fleetops.retry key=fleetops.rollout.tasks.retry.2 noWait=false args=map[]",
 		"queue fleetops.rollout.tasks.dlq durable=true autoDelete=false exclusive=false noWait=false args=map[]",
 		"bind fleetops.rollout.tasks.dlq <- fleetops.dead-letter key=fleetops.rollout.tasks.dlq noWait=false args=map[]",
+
+		// The notification queue is declared and bound with the rest of the layout, before any
+		// consumer exists: a published notification has to be routable from the moment the
+		// topology is declared.
+		"queue fleetops.rollout.notifications durable=true autoDelete=false exclusive=false noWait=false " +
+			"args=map[x-dead-letter-exchange:fleetops.dead-letter x-dead-letter-routing-key:fleetops.rollout.notifications.dlq]",
+		"bind fleetops.rollout.notifications <- fleetops.events key=rollout.notification.# noWait=false args=map[]",
+		"bind fleetops.rollout.notifications <- fleetops.events key=retry.fleetops.rollout.notifications noWait=false args=map[]",
+		"queue fleetops.rollout.notifications.retry.1 durable=true autoDelete=false exclusive=false noWait=false " +
+			"args=map[x-dead-letter-exchange:fleetops.events x-dead-letter-routing-key:retry.fleetops.rollout.notifications x-message-ttl:5000]",
+		"bind fleetops.rollout.notifications.retry.1 <- fleetops.retry key=fleetops.rollout.notifications.retry.1 noWait=false args=map[]",
+		"queue fleetops.rollout.notifications.retry.2 durable=true autoDelete=false exclusive=false noWait=false " +
+			"args=map[x-dead-letter-exchange:fleetops.events x-dead-letter-routing-key:retry.fleetops.rollout.notifications x-message-ttl:10000]",
+		"bind fleetops.rollout.notifications.retry.2 <- fleetops.retry key=fleetops.rollout.notifications.retry.2 noWait=false args=map[]",
+		"queue fleetops.rollout.notifications.dlq durable=true autoDelete=false exclusive=false noWait=false args=map[]",
+		"bind fleetops.rollout.notifications.dlq <- fleetops.dead-letter key=fleetops.rollout.notifications.dlq noWait=false args=map[]",
 	}
 	if diff := cmp.Diff(want, recorder.steps); diff != "" {
 		t.Errorf("declared layout mismatch (-want +got):\n%s", diff)
@@ -141,24 +157,30 @@ func TestDeclareRetryLadder(t *testing.T) {
 			name:        "three attempts double from the base",
 			maxAttempts: 3,
 			wantTTLs: map[string]string{
-				HeartbeatQueue + ".retry.1": "5000",
-				HeartbeatQueue + ".retry.2": "10000",
-				RolloutQueue + ".retry.1":   "5000",
-				RolloutQueue + ".retry.2":   "10000",
+				HeartbeatQueue + ".retry.1":           "5000",
+				HeartbeatQueue + ".retry.2":           "10000",
+				RolloutQueue + ".retry.1":             "5000",
+				RolloutQueue + ".retry.2":             "10000",
+				RolloutNotificationQueue + ".retry.1": "5000",
+				RolloutNotificationQueue + ".retry.2": "10000",
 			},
 		},
 		{
 			name:        "five attempts keep doubling",
 			maxAttempts: 5,
 			wantTTLs: map[string]string{
-				HeartbeatQueue + ".retry.1": "5000",
-				HeartbeatQueue + ".retry.2": "10000",
-				HeartbeatQueue + ".retry.3": "20000",
-				HeartbeatQueue + ".retry.4": "40000",
-				RolloutQueue + ".retry.1":   "5000",
-				RolloutQueue + ".retry.2":   "10000",
-				RolloutQueue + ".retry.3":   "20000",
-				RolloutQueue + ".retry.4":   "40000",
+				HeartbeatQueue + ".retry.1":           "5000",
+				HeartbeatQueue + ".retry.2":           "10000",
+				HeartbeatQueue + ".retry.3":           "20000",
+				HeartbeatQueue + ".retry.4":           "40000",
+				RolloutQueue + ".retry.1":             "5000",
+				RolloutQueue + ".retry.2":             "10000",
+				RolloutQueue + ".retry.3":             "20000",
+				RolloutQueue + ".retry.4":             "40000",
+				RolloutNotificationQueue + ".retry.1": "5000",
+				RolloutNotificationQueue + ".retry.2": "10000",
+				RolloutNotificationQueue + ".retry.3": "20000",
+				RolloutNotificationQueue + ".retry.4": "40000",
 			},
 		},
 	}
@@ -237,6 +259,10 @@ func TestTopologyNames(t *testing.T) {
 		{Name: "fleetops.rollout.tasks.retry.1", Kind: QueueKindRetry},
 		{Name: "fleetops.rollout.tasks.retry.2", Kind: QueueKindRetry},
 		{Name: "fleetops.rollout.tasks.dlq", Kind: QueueKindDeadLetter},
+		{Name: "fleetops.rollout.notifications", Kind: QueueKindWork},
+		{Name: "fleetops.rollout.notifications.retry.1", Kind: QueueKindRetry},
+		{Name: "fleetops.rollout.notifications.retry.2", Kind: QueueKindRetry},
+		{Name: "fleetops.rollout.notifications.dlq", Kind: QueueKindDeadLetter},
 	}
 	if diff := cmp.Diff(wantQueues, topology.Queues()); diff != "" {
 		t.Errorf("Queues() mismatch (-want +got):\n%s", diff)
@@ -261,6 +287,40 @@ func TestTopologyNames(t *testing.T) {
 	}
 	if got := RolloutRoutingKey("start"); got != "rollout.task.start" {
 		t.Errorf("RolloutRoutingKey() = %q, want rollout.task.start", got)
+	}
+
+	notifications, err := topology.WorkQueue(RolloutNotificationQueue)
+	if err != nil {
+		t.Fatalf("WorkQueue(%s) error = %v", RolloutNotificationQueue, err)
+	}
+	if notifications.EventType != RollbackEventType {
+		t.Errorf("notification queue event type = %q, want %q",
+			notifications.EventType, RollbackEventType)
+	}
+	wantBindings := []string{
+		"rollout.notification.#",
+		"retry." + RolloutNotificationQueue,
+	}
+	if diff := cmp.Diff(wantBindings, notifications.Keys); diff != "" {
+		t.Errorf("notification queue bindings mismatch (-want +got):\n%s", diff)
+	}
+	// Two phases, two keys, both inside the notification family and inside the rollback kind, so
+	// a consumer narrows to one phase, to every rollback announcement, or to every rollout
+	// notification with a binding alone.
+	wantKeys := map[RollbackPhase]string{
+		RollbackStarted:   "rollout.notification.rollback.started",
+		RollbackCompleted: "rollout.notification.rollback.completed",
+	}
+	for phase, want := range wantKeys {
+		if got := RollbackRoutingKey(phase); got != want {
+			t.Errorf("RollbackRoutingKey(%s) = %q, want %q", phase, got, want)
+		}
+		if !strings.HasPrefix(want, strings.TrimSuffix(notificationFamilyKey, "#")) {
+			t.Errorf("rollback key %q is outside the notification family %q", want, notificationFamilyKey)
+		}
+		if !strings.HasPrefix(want, strings.TrimSuffix(rollbackNotificationsKey, "#")) {
+			t.Errorf("rollback key %q is outside the rollback kind %q", want, rollbackNotificationsKey)
+		}
 	}
 	if got := topology.RetryKey(HeartbeatQueue); got != "retry."+HeartbeatQueue {
 		t.Errorf("RetryKey() = %q, want retry.%s", got, HeartbeatQueue)
