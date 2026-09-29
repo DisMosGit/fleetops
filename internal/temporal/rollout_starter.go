@@ -2,9 +2,11 @@ package temporal
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	enumspb "go.temporal.io/api/enums/v1"
+	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/sdk/client"
 )
 
@@ -36,7 +38,7 @@ func NewRolloutStarter(c startClient, taskQueue string, settings RolloutSettings
 // Start begins one rollout. It refuses a request that names no rollout, firmware, region, or
 // model, and it starts the workflow under the rollout's derived id with the configured policy, so
 // a rollout is always driven by exactly one execution: a second start for the same rollout id is
-// refused rather than creating a run chain beside the first one's records.
+// refused with ErrRolloutExists rather than creating a run chain beside the first one's records.
 func (s *RolloutStarter) Start(ctx context.Context, req RolloutRequest) error {
 	for _, required := range []struct {
 		field string
@@ -63,6 +65,9 @@ func (s *RolloutStarter) Start(ctx context.Context, req RolloutRequest) error {
 		WorkflowIDReusePolicy: enumspb.WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE,
 	}, RolloutWorkflowName, RolloutInput{RolloutRequest: req, Settings: s.settings})
 	if err != nil {
+		if _, duplicate := errors.AsType[*serviceerror.WorkflowExecutionAlreadyStarted](err); duplicate {
+			return fmt.Errorf("start rollout %s: %w", req.RolloutID, ErrRolloutExists)
+		}
 		return fmt.Errorf("start rollout %s: %w", req.RolloutID, err)
 	}
 	return nil

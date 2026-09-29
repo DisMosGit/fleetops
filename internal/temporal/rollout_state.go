@@ -26,6 +26,10 @@ type rolloutState struct {
 	RolloutID string `json:"rollout_id"`
 	// FirmwareID is the firmware the rollout deploys.
 	FirmwareID string `json:"firmware_id"`
+	// FirmwareVersion is the version of the firmware the rollout deploys, empty until its
+	// metadata has been loaded. It mirrors the deployed firmware for the rollout's search
+	// attributes, and is not part of the rollout's identity: the id is.
+	FirmwareVersion string `json:"firmware_version,omitempty"`
 	// Region is the target selector's region.
 	Region string `json:"region"`
 	// Model is the target selector's device model.
@@ -34,8 +38,16 @@ type rolloutState struct {
 	WorkflowID string `json:"workflow_id"`
 	// Settings are the configured canary policy the rollout drives under.
 	Settings RolloutSettings `json:"settings"`
-	// Status is the rollout's lifecycle status.
+	// Status is the status the rollout's own control flow reached: running, or awaiting an
+	// approval, or one of the terminal statuses. It is not what the rollout reports — see
+	// reported, which folds the operator's pause over it — and every recorded status goes
+	// through that projection, so the document, the search attribute, and the state query
+	// cannot disagree.
 	Status rollout.RolloutStatus `json:"status"`
+	// Paused reports whether an operator has held the rollout. A pause takes effect immediately
+	// for advancement (no wave is resolved or dispatched) and is visible immediately even while
+	// a wave is in flight, because the operator's intent is what the status reports.
+	Paused bool `json:"paused,omitempty"`
 	// Waves is one entry per configured wave, in sequence order.
 	Waves []rolloutWaveProgress `json:"waves"`
 	// Current is the position in Waves of the wave in flight, or noWave.
@@ -49,10 +61,15 @@ type rolloutState struct {
 	EndedBy string `json:"ended_by,omitempty"`
 	// Decision is the failing wave's measured health; nil unless a gate ended the rollout.
 	Decision *WaveHealth `json:"decision,omitempty"`
+	// LastAttrs is the search-attribute map the workflow last upserted; nil before the first
+	// upsert. Keeping it in state is what makes the change detection survive a replay: a state
+	// change that mirrors nothing does not upsert.
+	LastAttrs map[string]any `json:"last_attrs,omitempty"`
 }
 
 // rolloutWaveProgress is one wave's progress within a rollout: the identity its resolution
-// derived, the status and success rate its gate recorded, and how many devices it targets.
+// derived, the status and success rate its gate recorded, how many devices it targets, and which
+// of those devices did not take the update.
 type rolloutWaveProgress struct {
 	// ID is the wave's derived identity; empty before the wave is resolved.
 	ID string `json:"id,omitempty"`
@@ -62,6 +79,10 @@ type rolloutWaveProgress struct {
 	SuccessRate float64 `json:"success_rate"`
 	// TargetCount is the size of the membership the wave was resolved to.
 	TargetCount int `json:"target_count"`
+	// FailedDeviceIDs are the wave's devices that reported a failed update.
+	FailedDeviceIDs []string `json:"failed_device_ids,omitempty"`
+	// UnreportedDeviceIDs are the wave's devices that never reported a result.
+	UnreportedDeviceIDs []string `json:"unreported_device_ids,omitempty"`
 }
 
 // newRolloutState returns the state of a rollout that has not started: running, with no wave in
@@ -118,14 +139,23 @@ func (s rolloutState) validate() error {
 }
 
 // validate checks that a policy can sequence a canary: a positive health window, a decision
-// timeout no shorter than it, and an ordered sequence whose shares are inside (0, 100], strictly
-// increasing, and end at 100% so a completed rollout means the whole target group was reached.
+// timeout no shorter than it, a result timeout inside that decision timeout, and an ordered
+// sequence whose shares are inside (0, 100], strictly increasing, and end at 100% so a completed
+// rollout means the whole target group was reached.
 func (s RolloutSettings) validate() error {
 	if s.HealthWindow <= 0 {
 		return errors.New("rollout settings without a positive health window")
 	}
 	if s.DecisionTimeout < s.HealthWindow {
 		return errors.New("rollout settings with a decision timeout below the health window")
+	}
+	if s.ResultTimeout <= 0 {
+		return errors.New("rollout settings without a positive result timeout")
+	}
+	// Waiting longer for device results than a wave may stay undecided would let the wave's
+	// decision timeout pass while it still waits on devices that can no longer change it.
+	if s.ResultTimeout > s.DecisionTimeout {
+		return errors.New("rollout settings with a result timeout above the decision timeout")
 	}
 	if len(s.Waves) == 0 {
 		return errors.New("rollout settings without a wave sequence")
@@ -151,6 +181,44 @@ func (s rolloutState) terminal() bool {
 	return s.Status.Terminal()
 }
 
+// reported derives the status the rollout reports, which is what its document, its search
+// attribute, and its state query all carry: a terminal status, else `paused` while an operator
+// holds it, else `awaiting_approval` while it holds at a gated wave, else `running`. One function
+// produces it, so the three records cannot disagree.
+//
+// The pause outranks `awaiting_approval` because it is the operator's most recent intent and the
+// more informative answer: a paused rollout waiting at a gate reports the hold, and its
+// outstanding approval stays recordable through the query's own field.
+func (s rolloutState) reported() rollout.RolloutStatus {
+	switch {
+	case s.terminal():
+		return s.Status
+	case s.Paused:
+		return rollout.RolloutPaused
+	default:
+		return s.Status
+	}
+}
+
+// pause holds the rollout: an operator stopped it from starting further waves. A pause is
+// idempotent, and a concluded rollout ignores it — a terminal status is never left.
+func (s *rolloutState) pause() {
+	if s.terminal() {
+		return
+	}
+	s.Paused = true
+}
+
+// resume lets a held rollout continue from exactly where it stopped: every recorded wave outcome
+// and any banked approval are untouched. A resume of a rollout that is not paused changes
+// nothing, and a concluded rollout ignores it.
+func (s *rolloutState) resume() {
+	if s.terminal() {
+		return
+	}
+	s.Paused = false
+}
+
 // holdForApproval records that the rollout is holding at a wave that requires an approval, with
 // that wave as the one it waits for.
 func (s *rolloutState) holdForApproval(position int) {
@@ -158,8 +226,9 @@ func (s *rolloutState) holdForApproval(position int) {
 	s.Current = position
 }
 
-// resume returns a rollout that was holding for approval to running.
-func (s *rolloutState) resume() {
+// releaseApprovalHold returns a rollout that was holding for approval to running. The operator's
+// pause, if any, is untouched: a resumed hold still reports the pause.
+func (s *rolloutState) releaseApprovalHold() {
 	s.Status = rollout.RolloutRunning
 }
 
@@ -187,10 +256,28 @@ func (s *rolloutState) startWave(position int, resolved ResolvedWave) {
 	s.Current = position
 }
 
-// recordWave records a wave's decided status and the success rate its gate measured.
-func (s *rolloutState) recordWave(position int, status rollout.WaveStatus, successRate float64) {
+// recordWave records a wave's decided status and the success rate its gate measured, along with
+// the device outcomes its dispatch collected: which of its devices failed their update and which
+// never reported. The sets are replaced whole, so a retried record converges on the same outcome.
+func (s *rolloutState) recordWave(
+	position int,
+	status rollout.WaveStatus,
+	successRate float64,
+	outcomes waveOutcomes,
+) {
 	s.Waves[position].Status = status
 	s.Waves[position].SuccessRate = successRate
+	s.Waves[position].FailedDeviceIDs = outcomes.Failed
+	s.Waves[position].UnreportedDeviceIDs = outcomes.Unreported
+}
+
+// waveOutcomes are the device outcomes one wave's dispatch collected: the devices that reported a
+// failed update and the devices that never reported before the wave stopped waiting on them.
+type waveOutcomes struct {
+	// Failed are the devices that reported a failed update.
+	Failed []string
+	// Unreported are the devices that never reported a result.
+	Unreported []string
 }
 
 // complete concludes a rollout whose whole sequence was promoted.
@@ -227,13 +314,16 @@ func (s rolloutState) view() RolloutView {
 			view.Status = s.Waves[i].Status
 			view.SuccessRate = s.Waves[i].SuccessRate
 			view.TargetCount = s.Waves[i].TargetCount
+			view.FailedCount = len(s.Waves[i].FailedDeviceIDs)
+			view.UnreportedCount = len(s.Waves[i].UnreportedDeviceIDs)
 		}
 		waves = append(waves, view)
 	}
 	return RolloutView{
 		RolloutID:           s.RolloutID,
-		Status:              s.Status,
+		Status:              s.reported(),
 		FirmwareID:          s.FirmwareID,
+		FirmwareVersion:     s.FirmwareVersion,
 		Region:              s.Region,
 		Model:               s.Model,
 		Waves:               waves,

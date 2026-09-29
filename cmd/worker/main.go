@@ -23,10 +23,12 @@ import (
 
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.temporal.io/api/operatorservice/v1"
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/worker"
 	"go.temporal.io/sdk/workflow"
+	"google.golang.org/grpc"
 
 	"github.com/DisMosGit/fleetops/internal/config"
 	"github.com/DisMosGit/fleetops/internal/devices"
@@ -62,6 +64,32 @@ func main() {
 	}
 }
 
+// searchAttributeRegistry is the slice of the Temporal operator service the startup bootstrap
+// needs — operatorservice.OperatorServiceClient satisfies it, and tests hand-write a fake.
+type searchAttributeRegistry interface {
+	// ListSearchAttributes reports the namespace's registered search attributes.
+	ListSearchAttributes(
+		ctx context.Context, in *operatorservice.ListSearchAttributesRequest,
+		opts ...grpc.CallOption,
+	) (*operatorservice.ListSearchAttributesResponse, error)
+	// AddSearchAttributes registers custom search attributes on a namespace.
+	AddSearchAttributes(
+		ctx context.Context, in *operatorservice.AddSearchAttributesRequest,
+		opts ...grpc.CallOption,
+	) (*operatorservice.AddSearchAttributesResponse, error)
+}
+
+// bootstrapNamespace prepares the namespace this worker's workflows run in: the custom search
+// attributes both workflow families upsert are registered before the first task is polled, so no
+// run can mirror a value the Temporal UI cannot filter on. It is idempotent and safe when several
+// replicas do it at once, which is what makes startup a plain call rather than a coordination.
+func bootstrapNamespace(ctx context.Context, reg searchAttributeRegistry, namespace string) error {
+	if err := temporal.EnsureSearchAttributes(ctx, reg, namespace); err != nil {
+		return fmt.Errorf("ensure search attributes: %w", err)
+	}
+	return nil
+}
+
 // registry is the slice of the Temporal worker registry the wire-up needs — worker.Worker
 // satisfies it, and tests hand-write a fake.
 type registry interface {
@@ -86,15 +114,20 @@ func registerDevice(w registry, snapshots temporal.StateSnapshotter) {
 
 // rolloutDeps are the side effects the rollout workflow's activities own, wired to this process:
 // the firmware registry its commands name, the fleet database its membership and records live in,
-// the device command seam its waves are dispatched through, and the wave-health evaluation its
-// gates decide on.
+// the device command seam its per-device updates are delivered through, the device state that seam
+// is observed through, and the wave-health evaluation its gates decide on.
 type rolloutDeps struct {
 	firmware temporal.FirmwareSource
 	targets  temporal.TargetResolver
 	rollouts temporal.RolloutRecorder
 	waves    temporal.WaveRecorder
 	commands temporal.DeviceCommander
+	devices  temporal.DeviceStateReader
 	health   temporal.HealthEvaluator
+	// updateOptions adjust the per-device update activity. Production leaves them empty — the
+	// activity's defaults are what a rollout drives under — and the integration smoke shrinks
+	// the observation interval so a device that never reports is provable in seconds.
+	updateOptions []temporal.UpdateDeviceOption
 }
 
 // newRolloutDeps wires the rollout's side effects to the fleet database, the configured health
@@ -102,6 +135,7 @@ type rolloutDeps struct {
 func newRolloutDeps(
 	db *mongo.Database,
 	commands temporal.DeviceCommander,
+	devices temporal.DeviceStateReader,
 	health wavehealth.Settings,
 ) rolloutDeps {
 	store := rollout.NewStore(db)
@@ -114,14 +148,16 @@ func newRolloutDeps(
 		rollouts: store,
 		waves:    store,
 		commands: commands,
+		devices:  devices,
 		health:   wavehealth.New(samples, samples, health),
 	}
 }
 
 // registerRollout registers the rollout workflow and its worker-hosted activities under their
 // explicit names. The one activity whose side effect is a live agent stream (dispatch-command)
-// stays in the control plane: dispatch-wave-update only signals device workflows, whose command-id
-// dedup makes a redelivery a no-op, so it belongs beside the workflow that owns it.
+// stays in the control plane: update-device signals a device workflow and reads its state query,
+// whose command-id dedup makes a redelivery a no-op, so it belongs beside the workflow that owns
+// it.
 func registerRollout(w registry, deps rolloutDeps) {
 	w.RegisterWorkflowWithOptions(temporal.RolloutWorkflow, workflow.RegisterOptions{
 		Name: temporal.RolloutWorkflowName,
@@ -134,29 +170,13 @@ func registerRollout(w registry, deps rolloutDeps) {
 		{temporal.ResolveWaveTargetsActivityName, temporal.NewResolveWaveActivity(deps.targets)},
 		{temporal.RecordRolloutStateActivityName, temporal.NewRecordRolloutActivity(deps.rollouts)},
 		{temporal.RecordWaveStateActivityName, temporal.NewRecordWaveActivity(deps.waves)},
-		{temporal.DispatchWaveUpdateActivityName, temporal.NewDispatchWaveActivity(deps.commands)},
+		{temporal.UpdateDeviceActivityName, temporal.NewUpdateDeviceActivity(
+			deps.commands, deps.devices, deps.updateOptions...,
+		)},
 		{temporal.EvaluateWaveHealthActivityName, temporal.NewEvaluateWaveActivity(deps.health)},
 	}
 	for _, a := range activities {
 		w.RegisterActivityWithOptions(a.fn, activity.RegisterOptions{Name: a.name})
-	}
-}
-
-// rolloutSettings maps the configured canary sequence and gate timing onto the policy a rollout
-// drives under: the settings a start path hands to the workflow, so the sequence an operator
-// configures is the sequence the rollout drives, with the approval flags they set.
-func rolloutSettings(cfg config.Rollout) temporal.RolloutSettings {
-	waves := make([]temporal.RolloutWave, 0, len(cfg.Waves))
-	for _, wave := range cfg.Waves {
-		waves = append(waves, temporal.RolloutWave{
-			Percent:         wave.Percent,
-			RequireApproval: wave.RequireApproval,
-		})
-	}
-	return temporal.RolloutSettings{
-		HealthWindow:    cfg.HealthWindow.Duration,
-		DecisionTimeout: cfg.DecisionTimeout.Duration,
-		Waves:           waves,
 	}
 }
 
@@ -186,8 +206,8 @@ func run(ctx context.Context, cfg config.Config) error {
 	}
 	defer tc.Close()
 
-	if err := temporal.EnsureSearchAttributes(ctx, tc.OperatorService(), cfg.Temporal.Namespace); err != nil {
-		return fmt.Errorf("ensure search attributes: %w", err)
+	if err := bootstrapNamespace(ctx, tc.OperatorService(), cfg.Temporal.Namespace); err != nil {
+		return err
 	}
 
 	mongoClient, err := mongo.Connect(options.Client().ApplyURI(cfg.MongoDB.URI))
@@ -212,7 +232,9 @@ func run(ctx context.Context, cfg config.Config) error {
 	// activity task and replicas can come and go without coordinating.
 	w := worker.New(tc, cfg.Temporal.TaskQueue, worker.Options{WorkerStopTimeout: shutdownTimeout})
 	registerDevice(w, devices.NewSnapshotStore(db))
-	registerRollout(w, newRolloutDeps(db, signaler, rolloutHealthSettings(cfg.Rollout)))
+	registerRollout(w, newRolloutDeps(
+		db, signaler, temporal.NewDeviceStates(tc), rolloutHealthSettings(cfg.Rollout),
+	))
 
 	checks, err := health.NewDependencyChecks(cfg.MongoDB.URI, cfg.RabbitMQ.URL, cfg.Temporal.Address)
 	if err != nil {

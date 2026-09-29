@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	enumspb "go.temporal.io/api/enums/v1"
+	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/sdk/client"
 )
 
@@ -147,6 +148,24 @@ func TestRolloutStarterStart(t *testing.T) {
 		err := NewRolloutStarter(fc, "fleetops", settings).Start(context.Background(), req)
 		if err == nil || !strings.Contains(err.Error(), "ro-1") {
 			t.Errorf("Start() error = %v, want it to name the rollout that could not start", err)
+		}
+	})
+
+	t.Run("a rollout id already in use is refused as a duplicate", func(t *testing.T) {
+		t.Parallel()
+
+		// What a second start for a live rollout id looks like from the client: the reuse
+		// policy refused it. The caller gets a sentinel it can map onto its own surface
+		// instead of having to read the backend's error.
+		fc := &fakeStartClient{
+			err: serviceerror.NewWorkflowExecutionAlreadyStarted("workflow already exists", "", ""),
+		}
+		err := NewRolloutStarter(fc, "fleetops", settings).Start(context.Background(), req)
+		if !errors.Is(err, ErrRolloutExists) {
+			t.Errorf("Start() error = %v, want ErrRolloutExists", err)
+		}
+		if !strings.Contains(err.Error(), "ro-1") {
+			t.Errorf("Start() error = %v, want it to name the rollout", err)
 		}
 	})
 }

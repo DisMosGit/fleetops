@@ -86,11 +86,76 @@ func TestEnsureSearchAttributes(t *testing.T) {
 			t.Fatalf("EnsureSearchAttributes: %v", err)
 		}
 		want := map[string]enumspb.IndexedValueType{
-			SearchAttrDeviceFirmware: enumspb.INDEXED_VALUE_TYPE_KEYWORD,
-			SearchAttrDeviceOnline:   enumspb.INDEXED_VALUE_TYPE_BOOL,
+			SearchAttrDeviceFirmware:  enumspb.INDEXED_VALUE_TYPE_KEYWORD,
+			SearchAttrDeviceOnline:    enumspb.INDEXED_VALUE_TYPE_BOOL,
+			SearchAttrRolloutFirmware: enumspb.INDEXED_VALUE_TYPE_KEYWORD,
+			SearchAttrRolloutRegion:   enumspb.INDEXED_VALUE_TYPE_KEYWORD,
+			SearchAttrRolloutStatus:   enumspb.INDEXED_VALUE_TYPE_KEYWORD,
 		}
 		if diff := cmp.Diff(want, reg.added[0]); diff != "" {
 			t.Errorf("registered attributes mismatch (-want +got):\n%s", diff)
+		}
+	})
+
+	t.Run("a namespace with the device attributes gets the rollout ones", func(t *testing.T) {
+		t.Parallel()
+		// The upgrade path this change introduces: a namespace already carrying the four device
+		// attributes is extended with the three rollout attributes, and the existing ones are
+		// left alone.
+		deviceAttrs := map[string]enumspb.IndexedValueType{
+			SearchAttrDeviceRegion:   enumspb.INDEXED_VALUE_TYPE_KEYWORD,
+			SearchAttrDeviceModel:    enumspb.INDEXED_VALUE_TYPE_KEYWORD,
+			SearchAttrDeviceFirmware: enumspb.INDEXED_VALUE_TYPE_KEYWORD,
+			SearchAttrDeviceOnline:   enumspb.INDEXED_VALUE_TYPE_BOOL,
+		}
+		reg := &fakeSearchAttributeRegistry{registered: deviceAttrs}
+		if err := EnsureSearchAttributes(context.Background(), reg, "default"); err != nil {
+			t.Fatalf("EnsureSearchAttributes: %v", err)
+		}
+		want := map[string]enumspb.IndexedValueType{
+			SearchAttrRolloutFirmware: enumspb.INDEXED_VALUE_TYPE_KEYWORD,
+			SearchAttrRolloutRegion:   enumspb.INDEXED_VALUE_TYPE_KEYWORD,
+			SearchAttrRolloutStatus:   enumspb.INDEXED_VALUE_TYPE_KEYWORD,
+		}
+		if len(reg.added) != 1 {
+			t.Fatalf("registration calls = %d, want 1", len(reg.added))
+		}
+		if diff := cmp.Diff(want, reg.added[0]); diff != "" {
+			t.Errorf("registered attributes mismatch (-want +got):\n%s", diff)
+		}
+		for name, typ := range deviceAttrs {
+			if reg.registered[name] != typ {
+				t.Errorf("device attribute %s = %s, want it left at %s", name, reg.registered[name], typ)
+			}
+		}
+	})
+
+	t.Run("the registered set is the seven attributes both families upsert", func(t *testing.T) {
+		t.Parallel()
+		want := map[string]enumspb.IndexedValueType{
+			"DeviceRegion":    enumspb.INDEXED_VALUE_TYPE_KEYWORD,
+			"DeviceModel":     enumspb.INDEXED_VALUE_TYPE_KEYWORD,
+			"DeviceFirmware":  enumspb.INDEXED_VALUE_TYPE_KEYWORD,
+			"DeviceOnline":    enumspb.INDEXED_VALUE_TYPE_BOOL,
+			"RolloutFirmware": enumspb.INDEXED_VALUE_TYPE_KEYWORD,
+			"RolloutRegion":   enumspb.INDEXED_VALUE_TYPE_KEYWORD,
+			"RolloutStatus":   enumspb.INDEXED_VALUE_TYPE_KEYWORD,
+		}
+		if diff := cmp.Diff(want, searchAttributeTypes()); diff != "" {
+			t.Errorf("registered attribute set mismatch (-want +got):\n%s", diff)
+		}
+		// Every attribute a workflow can derive has a registered type: attrUpdates silently
+		// drops a name the registry does not know, so this is what keeps a derived value from
+		// being dropped on the floor.
+		for name := range searchAttributes(deviceState{}) {
+			if _, ok := want[name]; !ok {
+				t.Errorf("device attribute %s has no registered type", name)
+			}
+		}
+		for name := range rolloutSearchAttributes(rolloutState{}) {
+			if _, ok := want[name]; !ok {
+				t.Errorf("rollout attribute %s has no registered type", name)
+			}
 		}
 	})
 

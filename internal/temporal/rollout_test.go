@@ -22,6 +22,7 @@ func rolloutTestInput() RolloutInput {
 		Settings: RolloutSettings{
 			HealthWindow:    5 * time.Minute,
 			DecisionTimeout: 30 * time.Minute,
+			ResultTimeout:   5 * time.Minute,
 			Waves: []RolloutWave{
 				{Percent: 10},
 				{Percent: 100, RequireApproval: true},
@@ -115,6 +116,12 @@ func TestRolloutStateValidate(t *testing.T) {
 		{name: "decision timeout below the window", mutate: func(in *RolloutInput) {
 			in.Settings.DecisionTimeout = time.Minute
 		}, wantErr: "decision timeout"},
+		{name: "zero result timeout", mutate: func(in *RolloutInput) {
+			in.Settings.ResultTimeout = 0
+		}, wantErr: "result timeout"},
+		{name: "result timeout above the decision timeout", mutate: func(in *RolloutInput) {
+			in.Settings.ResultTimeout = in.Settings.DecisionTimeout + time.Minute
+		}, wantErr: "result timeout"},
 		{name: "empty sequence", mutate: func(in *RolloutInput) {
 			in.Settings.Waves = nil
 		}, wantErr: "wave sequence"},
@@ -196,9 +203,9 @@ func TestRolloutView(t *testing.T) {
 			name: "a running rollout reports its position",
 			apply: func(s *rolloutState) {
 				s.startWave(0, ResolvedWave{WaveID: "ro-1-w0-10", DeviceIDs: []string{"dev-1", "dev-2"}})
-				s.recordWave(0, rollout.WaveHealthy, 0.99)
+				s.recordWave(0, rollout.WaveHealthy, 0.99, waveOutcomes{})
 				s.startWave(1, ResolvedWave{WaveID: "ro-1-w1-100", DeviceIDs: []string{"dev-3"}})
-				s.recordWave(1, rollout.WaveEvaluating, 0)
+				s.recordWave(1, rollout.WaveEvaluating, 0, waveOutcomes{})
 			},
 			want: RolloutView{
 				RolloutID: "ro-1", Status: rollout.RolloutRunning,
@@ -208,6 +215,30 @@ func TestRolloutView(t *testing.T) {
 					{Percent: 100, Status: rollout.WaveEvaluating, TargetCount: 1},
 				},
 				Current: 1,
+			},
+		},
+		{
+			name: "a wave reports how many of its devices did not take the update",
+			apply: func(s *rolloutState) {
+				s.startWave(0, ResolvedWave{
+					WaveID: "ro-1-w0-10", DeviceIDs: []string{"dev-1", "dev-2", "dev-3", "dev-4"},
+				})
+				s.recordWave(0, rollout.WaveHealthy, 0.8, waveOutcomes{
+					Failed:     []string{"dev-2"},
+					Unreported: []string{"dev-3", "dev-4"},
+				})
+			},
+			want: RolloutView{
+				RolloutID: "ro-1", Status: rollout.RolloutRunning,
+				FirmwareID: "fw-1", Region: "eu-west", Model: "oak-s3",
+				Waves: []WaveView{
+					{
+						Percent: 10, Status: rollout.WaveHealthy, SuccessRate: 0.8,
+						TargetCount: 4, FailedCount: 1, UnreportedCount: 2,
+					},
+					{Percent: 100, Status: rollout.WavePending},
+				},
+				Current: 0,
 			},
 		},
 		{
@@ -241,8 +272,8 @@ func TestRolloutView(t *testing.T) {
 			name: "a completed rollout reports why it concluded",
 			apply: func(s *rolloutState) {
 				s.startWave(0, ResolvedWave{WaveID: "ro-1-w0-10", DeviceIDs: []string{"dev-1"}})
-				s.recordWave(0, rollout.WaveHealthy, 0.97)
-				s.recordWave(1, rollout.WaveSkipped, 0)
+				s.recordWave(0, rollout.WaveHealthy, 0.97, waveOutcomes{})
+				s.recordWave(1, rollout.WaveSkipped, 0, waveOutcomes{})
 				s.complete()
 			},
 			want: RolloutView{
@@ -260,9 +291,9 @@ func TestRolloutView(t *testing.T) {
 			name: "a rolled-back rollout reports the wave that ended it",
 			apply: func(s *rolloutState) {
 				s.startWave(0, ResolvedWave{WaveID: "ro-1-w0-10", DeviceIDs: []string{"dev-1"}})
-				s.recordWave(0, rollout.WaveHealthy, 0.99)
+				s.recordWave(0, rollout.WaveHealthy, 0.99, waveOutcomes{})
 				s.startWave(1, ResolvedWave{WaveID: "ro-1-w1-100", DeviceIDs: []string{"dev-3"}})
-				s.recordWave(1, rollout.WaveUnhealthy, 0.4)
+				s.recordWave(1, rollout.WaveUnhealthy, 0.4, waveOutcomes{})
 				health := WaveHealth{
 					Verdict: wavehealth.VerdictUnhealthy, SuccessRatio: 0.4,
 					SampleSize: 120, WindowStart: time.Unix(1000, 0), WindowEnd: time.Unix(1300, 0),

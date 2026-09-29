@@ -25,6 +25,21 @@ const (
 	SearchAttrDeviceOnline = "DeviceOnline"
 )
 
+// The custom Temporal search attributes every rollout workflow run carries. Their values mirror
+// rollout state (see rolloutSearchAttributes), which is what makes releases filterable in the
+// Temporal UI by the firmware version being deployed, the target region, and the rollout's current
+// status — alone or combined.
+const (
+	// SearchAttrRolloutFirmware is the Keyword attribute holding the deployed firmware's
+	// version. It is empty until the rollout's firmware metadata has loaded: the version is not
+	// knowable from the start input.
+	SearchAttrRolloutFirmware = "RolloutFirmware"
+	// SearchAttrRolloutRegion is the Keyword attribute holding the target selector's region.
+	SearchAttrRolloutRegion = "RolloutRegion"
+	// SearchAttrRolloutStatus is the Keyword attribute holding the rollout's lifecycle status.
+	SearchAttrRolloutStatus = "RolloutStatus"
+)
+
 // searchAttributes derives the complete search-attribute map of one device state — one pure
 // function of state, so the attributes cannot drift from what they mirror. The workflow
 // upserts the whole map: four values, all of them derived here.
@@ -34,6 +49,19 @@ func searchAttributes(s deviceState) map[string]any {
 		SearchAttrDeviceModel:    s.Model,
 		SearchAttrDeviceFirmware: s.CurrentFw,
 		SearchAttrDeviceOnline:   s.Online,
+	}
+}
+
+// rolloutSearchAttributes derives the complete search-attribute map of one rollout state — one
+// pure function of state, so the attributes cannot drift from the rollout they mirror, and the
+// firmware version and the status cannot disagree with the rollout document or the state query.
+// The status is the projected one (see rolloutState.reported), so a paused rollout is filterable
+// as paused while a wave is still in flight.
+func rolloutSearchAttributes(s rolloutState) map[string]any {
+	return map[string]any{
+		SearchAttrRolloutFirmware: s.FirmwareVersion,
+		SearchAttrRolloutRegion:   s.Region,
+		SearchAttrRolloutStatus:   string(s.reported()),
 	}
 }
 
@@ -52,19 +80,24 @@ func attrsEqual(a, b map[string]any) bool {
 	return true
 }
 
-// attrUpdates encodes a derived attribute map as the typed updates the workflow upserts. The
-// map stays the one derivation of attribute values; this is only its transport form.
+// attrUpdates encodes a derived attribute map as the typed updates the workflow upserts. The map
+// stays the one derivation of attribute values; this is only its transport form, and the type of
+// each attribute comes from the same registry the namespace bootstrap uses, so a value can never
+// be upserted at a type the namespace does not have.
 func attrUpdates(attrs map[string]any) []temporal.SearchAttributeUpdate {
-	region, _ := attrs[SearchAttrDeviceRegion].(string)
-	model, _ := attrs[SearchAttrDeviceModel].(string)
-	firmware, _ := attrs[SearchAttrDeviceFirmware].(string)
-	online, _ := attrs[SearchAttrDeviceOnline].(bool)
-	return []temporal.SearchAttributeUpdate{
-		temporal.NewSearchAttributeKeyKeyword(SearchAttrDeviceRegion).ValueSet(region),
-		temporal.NewSearchAttributeKeyKeyword(SearchAttrDeviceModel).ValueSet(model),
-		temporal.NewSearchAttributeKeyKeyword(SearchAttrDeviceFirmware).ValueSet(firmware),
-		temporal.NewSearchAttributeKeyBool(SearchAttrDeviceOnline).ValueSet(online),
+	types := searchAttributeTypes()
+	updates := make([]temporal.SearchAttributeUpdate, 0, len(attrs))
+	for name, value := range attrs {
+		switch types[name] {
+		case enumspb.INDEXED_VALUE_TYPE_KEYWORD:
+			text, _ := value.(string)
+			updates = append(updates, temporal.NewSearchAttributeKeyKeyword(name).ValueSet(text))
+		case enumspb.INDEXED_VALUE_TYPE_BOOL:
+			flag, _ := value.(bool)
+			updates = append(updates, temporal.NewSearchAttributeKeyBool(name).ValueSet(flag))
+		}
 	}
+	return updates
 }
 
 // searchAttributeRegistry is the slice of the Temporal operator service the attribute
@@ -84,14 +117,17 @@ type searchAttributeRegistry interface {
 }
 
 // searchAttributeTypes returns the registered type of every custom search attribute — the
-// typing the UI's filters depend on. A fresh map every call keeps this free of shared mutable
-// state.
+// typing the UI's filters depend on, and the typing attrUpdates encodes values at. A fresh map
+// every call keeps this free of shared mutable state.
 func searchAttributeTypes() map[string]enumspb.IndexedValueType {
 	return map[string]enumspb.IndexedValueType{
-		SearchAttrDeviceRegion:   enumspb.INDEXED_VALUE_TYPE_KEYWORD,
-		SearchAttrDeviceModel:    enumspb.INDEXED_VALUE_TYPE_KEYWORD,
-		SearchAttrDeviceFirmware: enumspb.INDEXED_VALUE_TYPE_KEYWORD,
-		SearchAttrDeviceOnline:   enumspb.INDEXED_VALUE_TYPE_BOOL,
+		SearchAttrDeviceRegion:    enumspb.INDEXED_VALUE_TYPE_KEYWORD,
+		SearchAttrDeviceModel:     enumspb.INDEXED_VALUE_TYPE_KEYWORD,
+		SearchAttrDeviceFirmware:  enumspb.INDEXED_VALUE_TYPE_KEYWORD,
+		SearchAttrDeviceOnline:    enumspb.INDEXED_VALUE_TYPE_BOOL,
+		SearchAttrRolloutFirmware: enumspb.INDEXED_VALUE_TYPE_KEYWORD,
+		SearchAttrRolloutRegion:   enumspb.INDEXED_VALUE_TYPE_KEYWORD,
+		SearchAttrRolloutStatus:   enumspb.INDEXED_VALUE_TYPE_KEYWORD,
 	}
 }
 

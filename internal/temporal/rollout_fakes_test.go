@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -37,6 +39,9 @@ type rolloutFakes struct {
 	// rollouts and waves are the recorded documents, keyed by id.
 	rollouts map[string]rollout.RolloutRecord
 	waves    map[string]rollout.WaveRecord
+	// device is the scriptable device world the update activities command devices through and
+	// read their results from.
+	device *deviceWorld
 	// commands are the update commands the seam accepted, in delivery order.
 	commands []CommandIssuedSignal
 	// evaluations are the health evaluations the gate asked for, in order.
@@ -48,6 +53,14 @@ type rolloutFakes struct {
 	health []WaveHealth
 	// events is the ordered log of what the workflow did, for progression assertions.
 	events []string
+	// onWaveState, when set, runs after one wave write with the update it recorded. It is how a
+	// test observes the rollout at a moment it chose: the state query evaluated inside the hook
+	// sees exactly the state the rollout had reached then.
+	onWaveState func(rollout.WaveStateUpdate)
+	// onControlRecord, when set, runs synchronously after the rollout record of a control-signal
+	// transition with the status it wrote. It is how a test observes the rollout at the exact
+	// moment a signal was folded, rather than at a wall-clock instant the test guessed at.
+	onControlRecord func(status rollout.RolloutStatus)
 
 	// Failures the test scripts.
 	firmwareErr   error
@@ -66,16 +79,26 @@ type rolloutFakes struct {
 }
 
 // newRolloutFakes returns the fake world a rollout test runs under: one firmware in the registry,
-// the given eligible pool, and the policy the evaluator clips its windows against.
+// the given eligible pool, and the policy the evaluator clips its windows against. The devices in
+// the pool start out concluding their updates successfully, which is the shape of a healthy wave;
+// a test that needs another behaviour scripts it on the device world.
 func newRolloutFakes(settings RolloutSettings, rec firmware.Record, pool ...string) *rolloutFakes {
-	return &rolloutFakes{
+	fakes := &rolloutFakes{
 		settings:      settings,
 		firmware:      map[string]firmware.Record{rec.ID: rec},
 		pool:          pool,
 		rollouts:      map[string]rollout.RolloutRecord{},
 		waves:         map[string]rollout.WaveRecord{},
+		device:        newDeviceWorld(),
 		dispatchFails: map[string]int{},
 	}
+	fakes.device.succeed(pool...)
+	return fakes
+}
+
+// devices returns the scriptable device world the update activities run against.
+func (f *rolloutFakes) devices() *deviceWorld {
+	return f.device
 }
 
 // scriptHealth queues the verdicts the evaluator returns, one per evaluation.
@@ -92,6 +115,7 @@ func rolloutTestSettings() RolloutSettings {
 	return RolloutSettings{
 		HealthWindow:    5 * time.Minute,
 		DecisionTimeout: 30 * time.Minute,
+		ResultTimeout:   30 * time.Second,
 		Waves: []RolloutWave{
 			{Percent: 1},
 			{Percent: 5},
@@ -101,10 +125,20 @@ func rolloutTestSettings() RolloutSettings {
 	}
 }
 
+// rolloutResultTimeout is the result timeout the workflow tests drive. It is short so a device
+// that never reports is provable without the suite waiting out the production default, and longer
+// than a few poll intervals so a device that reports late is still found.
+const rolloutResultTimeout = 30 * time.Second
+
 // rolloutSettingsWith returns the test policy with its sequence, window, and decision timeout
 // replaced, for the gate tests that script their own timing.
 func rolloutSettingsWith(window, timeout time.Duration, waves ...RolloutWave) RolloutSettings {
-	return RolloutSettings{HealthWindow: window, DecisionTimeout: timeout, Waves: waves}
+	return RolloutSettings{
+		HealthWindow:    window,
+		DecisionTimeout: timeout,
+		ResultTimeout:   rolloutResultTimeout,
+		Waves:           waves,
+	}
 }
 
 // rolloutTestFirmware is the firmware the fake registry holds: version 2.0.0, targeting the
@@ -188,6 +222,10 @@ func (f *rolloutFakes) ResolveWave(_ context.Context, req rollout.ResolveRequest
 		Status:    rollout.WaveDispatching,
 		DeviceIDs: rollout.WaveTargets(f.pool, targeted, req.Percent),
 		StartedAt: req.StartedAt.Add(-f.resolveLag),
+		// The store writes both sets empty on insert, so a wave that has just been resolved
+		// reports "no failures" rather than "not collected yet".
+		FailedDeviceIDs:     []string{},
+		UnreportedDeviceIDs: []string{},
 	}
 	f.waves[req.WaveID] = rec
 	return rec, nil
@@ -196,17 +234,33 @@ func (f *rolloutFakes) ResolveWave(_ context.Context, req rollout.ResolveRequest
 // RecordRollout implements RolloutRecorder.
 func (f *rolloutFakes) RecordRollout(_ context.Context, rec rollout.RolloutRecord) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.events = append(f.events, "rollout "+string(rec.Status))
 	if err := f.recordFailure(); err != nil {
+		f.mu.Unlock()
 		return err
 	}
 	if existing, ok := f.rollouts[rec.ID]; ok && existing.Status.Terminal() {
 		// A terminal status is never left.
+		f.mu.Unlock()
 		return nil
 	}
 	f.rollouts[rec.ID] = rec
+	hook := f.onControlRecord
+	// The hook runs without the lock: it evaluates the workflow's state query, which reaches
+	// back into this fake world.
+	f.mu.Unlock()
+	if hook != nil && rec.Status != rollout.RolloutRunning {
+		hook(rec.Status)
+	}
 	return nil
+}
+
+// observeControlRecord registers a hook that runs after every non-running rollout write, which is
+// what a control signal's transition writes.
+func (f *rolloutFakes) observeControlRecord(hook func(rollout.RolloutStatus)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.onControlRecord = hook
 }
 
 // RecordWaveState implements WaveRecorder.
@@ -228,25 +282,48 @@ func (f *rolloutFakes) RecordWaveState(_ context.Context, update rollout.WaveSta
 	}
 	rec.Status = update.Status
 	rec.SuccessRate = update.SuccessRate
+	// Every wave write carries the outcome sets, exactly as the store writes them: a wave whose
+	// devices all succeeded stores empty arrays rather than leaving the fields behind.
+	rec.FailedDeviceIDs = update.FailedDeviceIDs
+	rec.UnreportedDeviceIDs = update.UnreportedDeviceIDs
 	f.waves[update.WaveID] = rec
+	hook := f.onWaveState
+	// The hook runs without the lock: it evaluates the workflow's state query, which reaches
+	// back into this fake world.
+	f.mu.Unlock()
+	if hook != nil {
+		hook(update)
+	}
+	f.mu.Lock()
 	return nil
 }
 
-// SignalCommandIssued implements DeviceCommander. A device with scripted failures left rejects
-// its command that many times, which is how a partly delivered wave is simulated.
-func (f *rolloutFakes) SignalCommandIssued(_ context.Context, cmd CommandIssuedSignal) error {
+// observeWaveState registers a hook that runs after every wave write.
+func (f *rolloutFakes) observeWaveState(hook func(rollout.WaveStateUpdate)) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.onWaveState = hook
+}
+
+// SignalCommandIssued implements DeviceCommander. A device with scripted failures left rejects
+// its command that many times, which is how a partly delivered wave is simulated; otherwise the
+// command reaches the scriptable device world, where the device's scripted conclusion lives.
+func (f *rolloutFakes) SignalCommandIssued(ctx context.Context, cmd CommandIssuedSignal) error {
+	f.mu.Lock()
 	f.commands = append(f.commands, cmd)
 	f.events = append(f.events, "command "+cmd.DeviceID)
-	if f.dispatchFails[cmd.DeviceID] > 0 {
+	switch {
+	case f.dispatchFails[cmd.DeviceID] > 0:
 		f.dispatchFails[cmd.DeviceID]--
+		f.mu.Unlock()
 		return errors.New("device workflow is unreachable")
+	case f.dispatchErr != nil:
+		err := f.dispatchErr
+		f.mu.Unlock()
+		return err
 	}
-	if f.dispatchErr != nil {
-		return f.dispatchErr
-	}
-	return nil
+	f.mu.Unlock()
+	return f.device.SignalCommandIssued(ctx, cmd)
 }
 
 // Evaluate implements HealthEvaluator: it answers with the next scripted verdict, clipped to the
@@ -313,6 +390,34 @@ func (f *rolloutFakes) recordedRollout(id string) (rollout.RolloutRecord, bool) 
 	return rec, ok
 }
 
+// recordedWaveEvents returns the wave-write events the workflow logged, in order, which is how a
+// test counts the wave progress that mirrors no rollout attribute.
+func (f *rolloutFakes) recordedWaveEvents() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var events []string
+	for _, event := range f.events {
+		if strings.HasPrefix(event, "wave ") {
+			events = append(events, event)
+		}
+	}
+	return events
+}
+
+// rolloutStatuses returns every status the workflow recorded for the rollout, in order, which is
+// how a test asserts that a control signal did or did not move the recorded picture.
+func (f *rolloutFakes) rolloutStatuses() []rollout.RolloutStatus {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var statuses []rollout.RolloutStatus
+	for _, event := range f.events {
+		if after, ok := strings.CutPrefix(event, "rollout "); ok {
+			statuses = append(statuses, rollout.RolloutStatus(after))
+		}
+	}
+	return statuses
+}
+
 // recordedWave returns a wave document the workflow wrote, if it wrote one.
 func (f *rolloutFakes) recordedWave(id string) (rollout.WaveRecord, bool) {
 	f.mu.Lock()
@@ -321,11 +426,18 @@ func (f *rolloutFakes) recordedWave(id string) (rollout.WaveRecord, bool) {
 	return rec, ok
 }
 
-// recordedCommands returns the commands the seam accepted, in delivery order.
+// recordedCommands returns the commands the seam accepted, ordered by command id. A wave's
+// per-device updates run concurrently, so the order they arrive in is not deterministic; command
+// ids are derived from the wave and the device, so ordering by them groups one wave's commands
+// together in target order and makes an assertion about what was delivered comparable.
 func (f *rolloutFakes) recordedCommands() []CommandIssuedSignal {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return append([]CommandIssuedSignal(nil), f.commands...)
+	commands := append([]CommandIssuedSignal(nil), f.commands...)
+	slices.SortFunc(commands, func(a, b CommandIssuedSignal) int {
+		return strings.Compare(a.CommandID, b.CommandID)
+	})
+	return commands
 }
 
 // recordedEvaluations returns the health evaluations the gate asked for, in order.
@@ -349,12 +461,22 @@ func (f *rolloutFakes) recordedEvents() []string {
 	return append([]string(nil), f.events...)
 }
 
+// rolloutTestTimeout bounds one workflow test run. It is generous on purpose: the update activity
+// waits in wall-clock time even under the test environment, so a test that proves a device never
+// reports spends real time in that wait, and the bound exists only to fail a hung test rather than
+// to time one out mid-run.
+const rolloutTestTimeout = 2 * time.Minute
+
 // newRolloutEnv returns a test environment hosting RolloutWorkflow under its registered name with
-// its six activities implemented by the real constructors over fakes.
+// its six activities implemented by the real constructors over fakes, the per-device update among
+// them driving the scriptable device world. The update activity's poll interval is shrunk so a
+// device that reports late is found without the suite spending the production interval between
+// observations.
 func newRolloutEnv(fakes *rolloutFakes) *testsuite.TestWorkflowEnvironment {
 	var suite testsuite.WorkflowTestSuite
 	suite.SetLogger(discardLogger{})
 	env := suite.NewTestWorkflowEnvironment()
+	env.SetTestTimeout(rolloutTestTimeout)
 	env.RegisterWorkflowWithOptions(RolloutWorkflow, workflow.RegisterOptions{Name: RolloutWorkflowName})
 	env.RegisterActivityWithOptions(NewLoadFirmwareActivity(fakes),
 		activity.RegisterOptions{Name: LoadFirmwareActivityName})
@@ -364,8 +486,9 @@ func newRolloutEnv(fakes *rolloutFakes) *testsuite.TestWorkflowEnvironment {
 		activity.RegisterOptions{Name: RecordRolloutStateActivityName})
 	env.RegisterActivityWithOptions(NewRecordWaveActivity(fakes),
 		activity.RegisterOptions{Name: RecordWaveStateActivityName})
-	env.RegisterActivityWithOptions(NewDispatchWaveActivity(fakes),
-		activity.RegisterOptions{Name: DispatchWaveUpdateActivityName})
+	env.RegisterActivityWithOptions(
+		NewUpdateDeviceActivity(fakes, fakes.devices(), WithUpdatePollInterval(10*time.Millisecond)),
+		activity.RegisterOptions{Name: UpdateDeviceActivityName})
 	env.RegisterActivityWithOptions(NewEvaluateWaveActivity(fakes),
 		activity.RegisterOptions{Name: EvaluateWaveHealthActivityName})
 	return env

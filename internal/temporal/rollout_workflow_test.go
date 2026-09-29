@@ -89,6 +89,7 @@ func TestRolloutWorkflowSkipsAWaveThatTargetsNobody(t *testing.T) {
 	settings := RolloutSettings{
 		HealthWindow:    5 * time.Minute,
 		DecisionTimeout: 30 * time.Minute,
+		ResultTimeout:   rolloutResultTimeout,
 		Waves:           []RolloutWave{{Percent: 1}, {Percent: 100}},
 	}
 	fakes := newRolloutFakes(settings, rolloutTestFirmware(), deviceIDs(10)...)
@@ -195,6 +196,7 @@ func TestRolloutWorkflowRollsBackOnDispatchFailure(t *testing.T) {
 	settings := RolloutSettings{
 		HealthWindow:    5 * time.Minute,
 		DecisionTimeout: 30 * time.Minute,
+		ResultTimeout:   rolloutResultTimeout,
 		Waves:           []RolloutWave{{Percent: 10}, {Percent: 100}},
 	}
 	fakes := newRolloutFakes(settings, rolloutTestFirmware(), deviceIDs(10)...)
@@ -279,6 +281,7 @@ func TestRolloutWorkflowAnswersTheStateQuery(t *testing.T) {
 	settings := RolloutSettings{
 		HealthWindow:    5 * time.Minute,
 		DecisionTimeout: 30 * time.Minute,
+		ResultTimeout:   rolloutResultTimeout,
 		Waves:           []RolloutWave{{Percent: 10}, {Percent: 100}},
 	}
 	fakes := newRolloutFakes(settings, rolloutTestFirmware(), deviceIDs(10)...)
@@ -381,6 +384,41 @@ func TestRolloutWorkflowRejectsAnInputItCannotDrive(t *testing.T) {
 	if len(fakes.recordedEvents()) != 0 {
 		t.Errorf("events = %v, want nothing recorded for an input that cannot be driven",
 			fakes.recordedEvents())
+	}
+}
+
+// TestHeartbeatTimeoutOutlivesTheObservationInterval pins the relationship the wait depends on: an
+// attempt can only heartbeat between two observations, so a heartbeat timeout below the observation
+// interval would kill attempts that are waiting exactly as designed and retry every one of them.
+func TestHeartbeatTimeoutOutlivesTheObservationInterval(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name          string
+		resultTimeout time.Duration
+		want          time.Duration
+	}{
+		{name: "a long wait is bounded by half of it", resultTimeout: 5 * time.Minute, want: 150 * time.Second},
+		{name: "a result timeout far above the floor", resultTimeout: time.Minute, want: 30 * time.Second},
+		{name: "a result timeout at the floor", resultTimeout: 4 * time.Second, want: 3 * time.Second},
+		{name: "a result timeout below the floor", resultTimeout: 3 * time.Second, want: 3 * time.Second},
+		{name: "an unreasonably short result timeout still outlives an observation",
+			resultTimeout: 200 * time.Millisecond, want: 3 * time.Second},
+		{name: "no result timeout still outlives an observation", resultTimeout: 0, want: 3 * time.Second},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := heartbeatTimeout(tc.resultTimeout)
+			if got != tc.want {
+				t.Errorf("heartbeatTimeout(%s) = %s, want %s", tc.resultTimeout, got, tc.want)
+			}
+			if got <= updatePollInterval {
+				t.Errorf("heartbeatTimeout(%s) = %s, want it above the observation interval %s",
+					tc.resultTimeout, got, updatePollInterval)
+			}
+		})
 	}
 }
 

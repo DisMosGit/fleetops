@@ -192,7 +192,7 @@ func NewRecordRolloutActivity(recorder RolloutRecorder) func(ctx context.Context
 }
 
 // RecordWaveRequest is the record-wave-state activity's request: the wave to move and the state it
-// reached.
+// reached, including the device outcomes its dispatch collected.
 type RecordWaveRequest struct {
 	// RolloutID is the rollout the wave belongs to.
 	RolloutID string `json:"rollout_id"`
@@ -202,57 +202,27 @@ type RecordWaveRequest struct {
 	Status rollout.WaveStatus `json:"status"`
 	// SuccessRate is the evaluated success ratio; zero until the wave has been evaluated.
 	SuccessRate float64 `json:"success_rate"`
+	// FailedDeviceIDs are the devices that reported a failed update.
+	FailedDeviceIDs []string `json:"failed_device_ids"`
+	// UnreportedDeviceIDs are the devices that never reported before the wave stopped waiting.
+	UnreportedDeviceIDs []string `json:"unreported_device_ids"`
 }
 
 // NewRecordWaveActivity returns the record-wave-state activity bound to recorder: it moves a
-// recorded wave's status and success rate, leaving its membership and start time alone.
+// recorded wave's status and success rate and stores the device outcomes it collected, leaving its
+// membership and start time alone.
 func NewRecordWaveActivity(recorder WaveRecorder) func(ctx context.Context, req RecordWaveRequest) error {
 	return func(ctx context.Context, req RecordWaveRequest) error {
 		err := recorder.RecordWaveState(ctx, rollout.WaveStateUpdate{
-			RolloutID:   req.RolloutID,
-			WaveID:      req.WaveID,
-			Status:      req.Status,
-			SuccessRate: req.SuccessRate,
+			RolloutID:           req.RolloutID,
+			WaveID:              req.WaveID,
+			Status:              req.Status,
+			SuccessRate:         req.SuccessRate,
+			FailedDeviceIDs:     req.FailedDeviceIDs,
+			UnreportedDeviceIDs: req.UnreportedDeviceIDs,
 		})
 		if err != nil {
 			return fmt.Errorf("record wave %s as %s: %w", req.WaveID, req.Status, err)
-		}
-		return nil
-	}
-}
-
-// DispatchWaveRequest is the dispatch-wave-update activity's request: the wave, the devices it
-// targets, and the firmware they are commanded to run.
-type DispatchWaveRequest struct {
-	// RolloutID is the rollout the wave belongs to.
-	RolloutID string `json:"rollout_id"`
-	// WaveID is the wave being dispatched; command ids are derived from it.
-	WaveID string `json:"wave_id"`
-	// DeviceIDs are the devices to command; an empty set delivers nothing.
-	DeviceIDs []string `json:"device_ids"`
-	// Firmware is the firmware every command names.
-	Firmware Firmware `json:"firmware"`
-}
-
-// NewDispatchWaveActivity returns the dispatch-wave-update activity bound to commander: it
-// delivers one update command per target device through the device command seam, under a command
-// id derived from the wave and the device. Delivery is at-least-once — a retry of a partly
-// delivered wave re-signals devices that already accepted, whose command-id dedup makes the
-// repeat a no-op — and the wave is complete once every device has accepted its command.
-func NewDispatchWaveActivity(commander DeviceCommander) func(ctx context.Context, req DispatchWaveRequest) error {
-	return func(ctx context.Context, req DispatchWaveRequest) error {
-		for _, deviceID := range req.DeviceIDs {
-			cmd := CommandIssuedSignal{
-				CommandID:  CommandID(req.WaveID, deviceID),
-				DeviceID:   deviceID,
-				Kind:       CommandKindUpdate,
-				FirmwareID: req.Firmware.ID,
-				Version:    req.Firmware.Version,
-				Checksum:   req.Firmware.Checksum,
-			}
-			if err := commander.SignalCommandIssued(ctx, cmd); err != nil {
-				return fmt.Errorf("dispatch wave %s to device %s: %w", req.WaveID, deviceID, err)
-			}
 		}
 		return nil
 	}

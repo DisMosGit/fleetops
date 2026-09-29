@@ -2,12 +2,18 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
+	enumspb "go.temporal.io/api/enums/v1"
+	"go.temporal.io/api/operatorservice/v1"
 	"go.temporal.io/sdk/activity"
-	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/workflow"
+	"google.golang.org/grpc"
 
 	"github.com/DisMosGit/fleetops/internal/config"
 	"github.com/DisMosGit/fleetops/internal/devices"
@@ -50,11 +56,148 @@ func (s *fakeSnapshotStore) SaveSnapshot(_ context.Context, snap devices.Snapsho
 	return nil
 }
 
+// fakeSearchAttributes is a hand-written searchAttributeRegistry double recording what the
+// startup bootstrap registers.
+type fakeSearchAttributes struct {
+	registered map[string]enumspb.IndexedValueType
+	namespaces []string
+}
+
+func newFakeSearchAttributes() *fakeSearchAttributes {
+	return &fakeSearchAttributes{registered: map[string]enumspb.IndexedValueType{}}
+}
+
+func (f *fakeSearchAttributes) ListSearchAttributes(
+	_ context.Context, in *operatorservice.ListSearchAttributesRequest, _ ...grpc.CallOption,
+) (*operatorservice.ListSearchAttributesResponse, error) {
+	f.namespaces = append(f.namespaces, in.GetNamespace())
+	attrs := make(map[string]enumspb.IndexedValueType, len(f.registered))
+	for name, typ := range f.registered {
+		attrs[name] = typ
+	}
+	return &operatorservice.ListSearchAttributesResponse{CustomAttributes: attrs}, nil
+}
+
+func (f *fakeSearchAttributes) AddSearchAttributes(
+	_ context.Context, in *operatorservice.AddSearchAttributesRequest, _ ...grpc.CallOption,
+) (*operatorservice.AddSearchAttributesResponse, error) {
+	for name, typ := range in.GetSearchAttributes() {
+		f.registered[name] = typ
+	}
+	return &operatorservice.AddSearchAttributesResponse{}, nil
+}
+
+// TestBootstrapNamespace pins what the worker registers before it polls: every custom search
+// attribute its workflows upsert — the device family's and the rollout family's — so no run can
+// mirror a value the Temporal UI cannot filter on. An attribute a namespace already carries is
+// left alone, which is what makes the bootstrap safe to run on every replica start.
+func TestBootstrapNamespace(t *testing.T) {
+	t.Parallel()
+
+	t.Run("a fresh namespace gets all seven attributes", func(t *testing.T) {
+		t.Parallel()
+
+		reg := newFakeSearchAttributes()
+		if err := bootstrapNamespace(context.Background(), reg, "fleetops-dev"); err != nil {
+			t.Fatalf("bootstrapNamespace: %v", err)
+		}
+
+		want := map[string]enumspb.IndexedValueType{
+			"DeviceRegion":    enumspb.INDEXED_VALUE_TYPE_KEYWORD,
+			"DeviceModel":     enumspb.INDEXED_VALUE_TYPE_KEYWORD,
+			"DeviceFirmware":  enumspb.INDEXED_VALUE_TYPE_KEYWORD,
+			"DeviceOnline":    enumspb.INDEXED_VALUE_TYPE_BOOL,
+			"RolloutFirmware": enumspb.INDEXED_VALUE_TYPE_KEYWORD,
+			"RolloutRegion":   enumspb.INDEXED_VALUE_TYPE_KEYWORD,
+			"RolloutStatus":   enumspb.INDEXED_VALUE_TYPE_KEYWORD,
+		}
+		if diff := cmp.Diff(want, reg.registered); diff != "" {
+			t.Errorf("registered attributes mismatch (-want +got):\n%s", diff)
+		}
+		if len(reg.namespaces) == 0 || reg.namespaces[0] != "fleetops-dev" {
+			t.Errorf("namespaces inspected = %v, want the configured one", reg.namespaces)
+		}
+	})
+
+	t.Run("a namespace with the device attributes gets the rollout ones", func(t *testing.T) {
+		t.Parallel()
+
+		// The upgrade path: a namespace seeded by the previous build already carries the four
+		// device attributes.
+		reg := newFakeSearchAttributes()
+		reg.registered = map[string]enumspb.IndexedValueType{
+			"DeviceRegion":   enumspb.INDEXED_VALUE_TYPE_KEYWORD,
+			"DeviceModel":    enumspb.INDEXED_VALUE_TYPE_KEYWORD,
+			"DeviceFirmware": enumspb.INDEXED_VALUE_TYPE_KEYWORD,
+			"DeviceOnline":   enumspb.INDEXED_VALUE_TYPE_BOOL,
+		}
+		if err := bootstrapNamespace(context.Background(), reg, "default"); err != nil {
+			t.Fatalf("bootstrapNamespace: %v", err)
+		}
+
+		want := map[string]enumspb.IndexedValueType{
+			"DeviceRegion":    enumspb.INDEXED_VALUE_TYPE_KEYWORD,
+			"DeviceModel":     enumspb.INDEXED_VALUE_TYPE_KEYWORD,
+			"DeviceFirmware":  enumspb.INDEXED_VALUE_TYPE_KEYWORD,
+			"DeviceOnline":    enumspb.INDEXED_VALUE_TYPE_BOOL,
+			"RolloutFirmware": enumspb.INDEXED_VALUE_TYPE_KEYWORD,
+			"RolloutRegion":   enumspb.INDEXED_VALUE_TYPE_KEYWORD,
+			"RolloutStatus":   enumspb.INDEXED_VALUE_TYPE_KEYWORD,
+		}
+		if diff := cmp.Diff(want, reg.registered); diff != "" {
+			t.Errorf("registered attributes mismatch (-want +got):\n%s", diff)
+		}
+	})
+
+	t.Run("a second bootstrap changes nothing", func(t *testing.T) {
+		t.Parallel()
+
+		reg := newFakeSearchAttributes()
+		if err := bootstrapNamespace(context.Background(), reg, "default"); err != nil {
+			t.Fatalf("bootstrapNamespace: %v", err)
+		}
+		first := len(reg.registered)
+		if err := bootstrapNamespace(context.Background(), reg, "default"); err != nil {
+			t.Fatalf("bootstrapNamespace rerun: %v", err)
+		}
+		if len(reg.registered) != first {
+			t.Errorf("registered attributes = %d after a rerun, want %d", len(reg.registered), first)
+		}
+	})
+
+	t.Run("a failure is reported with its cause", func(t *testing.T) {
+		t.Parallel()
+
+		err := bootstrapNamespace(context.Background(), &failingSearchAttributes{}, "default")
+		if err == nil || !strings.Contains(err.Error(), "search attributes") {
+			t.Errorf("bootstrapNamespace = %v, want a search-attribute error", err)
+		}
+	})
+}
+
+// failingSearchAttributes reports every registry call as a failure.
+type failingSearchAttributes struct{}
+
+func (f *failingSearchAttributes) ListSearchAttributes(
+	context.Context, *operatorservice.ListSearchAttributesRequest, ...grpc.CallOption,
+) (*operatorservice.ListSearchAttributesResponse, error) {
+	return nil, errors.New("temporal is unavailable")
+}
+
+func (f *failingSearchAttributes) AddSearchAttributes(
+	context.Context, *operatorservice.AddSearchAttributesRequest, ...grpc.CallOption,
+) (*operatorservice.AddSearchAttributesResponse, error) {
+	return nil, errors.New("temporal is unavailable")
+}
+
 // fakeRolloutDeps is a hand-written double for every side effect the rollout activities own,
 // recording the writes so a test can prove the registered activities are bound to it.
 type fakeRolloutDeps struct {
 	rollouts []rollout.RolloutRecord
 	waves    []rollout.WaveStateUpdate
+	commands []temporal.CommandIssuedSignal
+	// deviceStates answers the device-state reads the update activity performs.
+	deviceStates map[string]temporal.State
 }
 
 func (d *fakeRolloutDeps) Metadata(_ context.Context, id string) (firmware.Record, error) {
@@ -78,8 +221,19 @@ func (d *fakeRolloutDeps) RecordWaveState(_ context.Context, update rollout.Wave
 	return nil
 }
 
-func (d *fakeRolloutDeps) SignalCommandIssued(context.Context, temporal.CommandIssuedSignal) error {
+func (d *fakeRolloutDeps) SignalCommandIssued(_ context.Context, cmd temporal.CommandIssuedSignal) error {
+	d.commands = append(d.commands, cmd)
 	return nil
+}
+
+// State answers one device's authoritative state, reporting that the command it was signalled
+// concluded successfully — which is what the update activity waits for.
+func (d *fakeRolloutDeps) State(_ context.Context, deviceID string) (temporal.State, error) {
+	state, ok := d.deviceStates[deviceID]
+	if !ok {
+		return temporal.State{}, fmt.Errorf("device %s: %w", deviceID, temporal.ErrDeviceNotFound)
+	}
+	return state, nil
 }
 
 func (d *fakeRolloutDeps) Evaluate(
@@ -141,7 +295,7 @@ func TestRegisterRollout(t *testing.T) {
 	deps := &fakeRolloutDeps{}
 	registerRollout(registry, rolloutDeps{
 		firmware: deps, targets: deps, rollouts: deps,
-		waves: deps, commands: deps, health: deps,
+		waves: deps, commands: deps, devices: deps, health: deps,
 	})
 
 	if _, ok := registry.workflows[temporal.RolloutWorkflowName]; !ok {
@@ -152,7 +306,7 @@ func TestRegisterRollout(t *testing.T) {
 		temporal.ResolveWaveTargetsActivityName,
 		temporal.RecordRolloutStateActivityName,
 		temporal.RecordWaveStateActivityName,
-		temporal.DispatchWaveUpdateActivityName,
+		temporal.UpdateDeviceActivityName,
 		temporal.EvaluateWaveHealthActivityName,
 	}
 	for _, name := range wantActivities {
@@ -187,69 +341,44 @@ func TestRegisterRollout(t *testing.T) {
 	if len(deps.rollouts) != 1 || deps.rollouts[0].ID != "ro-1" {
 		t.Errorf("store received %+v, want the recorded rollout", deps.rollouts)
 	}
-}
 
-// fakeStartClient is a hand-written double for the Temporal client's start call, recording the
-// workflow options and the start input a rollout is begun with.
-type fakeStartClient struct {
-	inputs []temporal.RolloutInput
-}
-
-func (c *fakeStartClient) ExecuteWorkflow(
-	_ context.Context, _ client.StartWorkflowOptions, _ any, args ...any,
-) (client.WorkflowRun, error) {
-	var input temporal.RolloutInput
-	if len(args) > 0 {
-		input, _ = args[0].(temporal.RolloutInput)
+	// The per-device update activity is bound to the device world this process wired: its
+	// command reaches the command seam, and its wait ends on the state that seam's device
+	// reports.
+	update, ok := registry.activities[temporal.UpdateDeviceActivityName].(func(context.Context, temporal.UpdateDeviceRequest) (temporal.DeviceUpdate, error))
+	if !ok {
+		t.Fatalf("registered activity has type %T, want the update-device activity",
+			registry.activities[temporal.UpdateDeviceActivityName])
 	}
-	c.inputs = append(c.inputs, input)
-	return nil, nil
-}
-
-func TestRolloutSettingsReachTheStartPath(t *testing.T) {
-	t.Parallel()
-
-	cfg := config.Defaults()
-	cfg.Rollout.HealthWindow = config.Duration{Duration: time.Minute}
-	cfg.Rollout.DecisionTimeout = config.Duration{Duration: 5 * time.Minute}
-	cfg.Rollout.Waves = []config.Wave{
-		{Percent: 10},
-		{Percent: 100, RequireApproval: true},
+	waveID := rollout.WaveID("ro-1", 0, 100)
+	firmwareRec := temporal.Firmware{ID: "fw-1", Version: "2.0.0", Checksum: "sha256:0f1e2d"}
+	deps.deviceStates = map[string]temporal.State{"dev-1": {
+		DeviceID: "dev-1",
+		LastCommand: &temporal.ConcludedCommand{
+			Command: temporal.CommandIssuedSignal{
+				CommandID: temporal.CommandID(waveID, "dev-1"), DeviceID: "dev-1",
+				Kind: temporal.CommandKindUpdate, FirmwareID: "fw-1", Version: "2.0.0",
+			},
+			Outcome: temporal.OutcomeSucceeded,
+		},
+	}}
+	got, err := update(context.Background(), temporal.UpdateDeviceRequest{
+		RolloutID: "ro-1", WaveID: waveID, DeviceID: "dev-1", Firmware: firmwareRec,
+		Deadline: time.Now().Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("run registered update activity: %v", err)
 	}
-
-	settings := rolloutSettings(cfg.Rollout)
-	// The configured sequence reaches the workflow's start path unchanged, approval flags and
-	// all: this is the policy a rollout started through this worker drives under.
-	fc := &fakeStartClient{}
-	starter := temporal.NewRolloutStarter(fc, cfg.Temporal.TaskQueue, settings)
-	req := temporal.RolloutRequest{
-		RolloutID: "ro-1", FirmwareID: "fw-1", Region: "eu-west", Model: "oak-s3",
+	if got.Outcome != temporal.UpdateSucceeded {
+		t.Errorf("update outcome = %q, want %q", got.Outcome, temporal.UpdateSucceeded)
 	}
-	if err := starter.Start(context.Background(), req); err != nil {
-		t.Fatalf("start rollout: %v", err)
-	}
-	if len(fc.inputs) != 1 {
-		t.Fatalf("started rollouts = %d, want 1", len(fc.inputs))
-	}
-	got := fc.inputs[0]
-	if got.RolloutRequest != req {
-		t.Errorf("start input request = %+v, want %+v", got.RolloutRequest, req)
-	}
-	if got.Settings.HealthWindow != time.Minute || got.Settings.DecisionTimeout != 5*time.Minute {
-		t.Errorf("start input windows = %v/%v, want the configured 1m/5m",
-			got.Settings.HealthWindow, got.Settings.DecisionTimeout)
-	}
-	wantWaves := []temporal.RolloutWave{
-		{Percent: 10},
-		{Percent: 100, RequireApproval: true},
-	}
-	if len(got.Settings.Waves) != len(wantWaves) {
-		t.Fatalf("start input waves = %+v, want %+v", got.Settings.Waves, wantWaves)
-	}
-	for i, wave := range wantWaves {
-		if got.Settings.Waves[i] != wave {
-			t.Errorf("start input wave %d = %+v, want %+v", i, got.Settings.Waves[i], wave)
-		}
+	wantCommands := []temporal.CommandIssuedSignal{{
+		CommandID: temporal.CommandID(waveID, "dev-1"), DeviceID: "dev-1",
+		Kind: temporal.CommandKindUpdate, FirmwareID: "fw-1", Version: "2.0.0",
+		Checksum: "sha256:0f1e2d",
+	}}
+	if diff := cmp.Diff(wantCommands, deps.commands); diff != "" {
+		t.Errorf("delivered commands mismatch (-want +got):\n%s", diff)
 	}
 }
 
