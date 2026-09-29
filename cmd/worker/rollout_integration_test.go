@@ -15,10 +15,13 @@ import (
 	"os"
 	"os/exec"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
+	amqp "github.com/rabbitmq/amqp091-go"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
@@ -28,8 +31,10 @@ import (
 
 	"github.com/DisMosGit/fleetops/internal/config"
 	"github.com/DisMosGit/fleetops/internal/mongotest"
+	"github.com/DisMosGit/fleetops/internal/rabbittest"
 	"github.com/DisMosGit/fleetops/internal/rollout"
 	"github.com/DisMosGit/fleetops/internal/rolloutapi"
+	"github.com/DisMosGit/fleetops/internal/telemetry"
 	"github.com/DisMosGit/fleetops/internal/temporal"
 )
 
@@ -71,12 +76,17 @@ type commandRecorder struct {
 }
 
 // deviceScripts scripts the devices the smoke drives: the ones that report a failed update with
-// the detail they report, and the ones that never report at all.
+// the detail they report, the ones that never report at all, and — for a rollback — the ones whose
+// restore concludes with a failure or never concludes.
 type deviceScripts struct {
-	// fail maps a device to the failure detail it reports.
+	// fail maps a device to the failure detail it reports for its update.
 	fail map[string]string
-	// never marks a device that accepts its command and never reports a result.
+	// never marks a device that accepts its update command and never reports a result.
 	never map[string]bool
+	// failRestore maps a device to the failure detail it reports for its restore.
+	failRestore map[string]string
+	// neverRestore marks a device that accepts its restore command and never reports a result.
+	neverRestore map[string]bool
 }
 
 // script returns the recorder's device world, creating it on first use.
@@ -89,6 +99,12 @@ func (r *commandRecorder) script() *deviceScripts {
 	}
 	if r.scripts.never == nil {
 		r.scripts.never = map[string]bool{}
+	}
+	if r.scripts.failRestore == nil {
+		r.scripts.failRestore = map[string]string{}
+	}
+	if r.scripts.neverRestore == nil {
+		r.scripts.neverRestore = map[string]bool{}
 	}
 	return r.scripts
 }
@@ -108,7 +124,9 @@ func (r *commandRecorder) deliveredCommands(deviceID string) []temporal.CommandI
 
 // SignalCommandIssued implements temporal.DeviceCommander. It records the command and decides the
 // outcome the device will report: a success unless the device is scripted to fail or to stay
-// silent.
+// silent. A restore — a command addressed by a rollback id, for the version the device ran before —
+// has its own scripts, because a device that took an update and one that reports a failed restore
+// are different facts about a rollback.
 func (r *commandRecorder) SignalCommandIssued(_ context.Context, cmd temporal.CommandIssuedSignal) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -116,15 +134,24 @@ func (r *commandRecorder) SignalCommandIssued(_ context.Context, cmd temporal.Co
 	if r.scripts == nil {
 		r.scripts = &deviceScripts{}
 	}
-	if r.scripts.never[cmd.DeviceID] {
+	restore := strings.HasPrefix(cmd.CommandID, rollbackCommandPrefix)
+	if restore && r.scripts.neverRestore[cmd.DeviceID] {
+		return nil
+	}
+	if !restore && r.scripts.never[cmd.DeviceID] {
 		return nil
 	}
 	if r.concluded == nil {
 		r.concluded = map[string]temporal.ConcludedCommand{}
 	}
 	outcome, detail := temporal.OutcomeSucceeded, ""
-	if failed, ok := r.scripts.fail[cmd.DeviceID]; ok {
-		outcome, detail = temporal.OutcomeFailed, failed
+	switch {
+	case restore:
+		if failed, ok := r.scripts.failRestore[cmd.DeviceID]; ok {
+			outcome, detail = temporal.OutcomeFailed, failed
+		}
+	case r.scripts.fail[cmd.DeviceID] != "":
+		outcome, detail = temporal.OutcomeFailed, r.scripts.fail[cmd.DeviceID]
 	}
 	r.concluded[cmd.CommandID] = temporal.ConcludedCommand{
 		Command: cmd, Outcome: outcome, Detail: detail,
@@ -132,26 +159,63 @@ func (r *commandRecorder) SignalCommandIssued(_ context.Context, cmd temporal.Co
 	return nil
 }
 
-// State implements temporal.DeviceStateReader: it reports the state of the device that accepted
-// the command, which is how the update activity's wait for a reported result ends.
+// rollbackCommandPrefix is the prefix every restore command id carries; the workflow derives it
+// from the rollout and the device.
+const rollbackCommandPrefix = "rollback-"
+
+// restoreCommands returns the restore commands the seam accepted, in delivery order.
+func (r *commandRecorder) restoreCommands() []temporal.CommandIssuedSignal {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var restores []temporal.CommandIssuedSignal
+	for _, cmd := range r.commands {
+		if strings.HasPrefix(cmd.CommandID, rollbackCommandPrefix) {
+			restores = append(restores, cmd)
+		}
+	}
+	return restores
+}
+
+// State implements temporal.DeviceStateReader: it reports the state of the device that accepted the
+// command — the newest conclusion it reported, the command it still holds pending, and the firmware
+// history those conclusions left behind — which is how the update activity's wait ends and what a
+// rollback restores from.
 func (r *commandRecorder) State(_ context.Context, deviceID string) (temporal.State, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	state := temporal.State{DeviceID: deviceID, CurrentFw: "1.0.0"}
-	// The newest command this device accepted is the one its state reports on.
-	for i := len(r.commands) - 1; i >= 0; i-- {
-		if r.commands[i].DeviceID != deviceID {
+	state := temporal.State{DeviceID: deviceID, Model: "oak-s3", CurrentFw: smokeInitialFirmware}
+	newest := ""
+	for _, cmd := range r.commands {
+		if cmd.DeviceID != deviceID {
 			continue
 		}
-		if concluded, ok := r.concluded[r.commands[i].CommandID]; ok {
-			state.LastCommand = &concluded
-			return state, nil
+		newest = cmd.CommandID
+		concluded, ok := r.concluded[cmd.CommandID]
+		if !ok {
+			continue
 		}
-		state.Pending = &temporal.PendingCommand{Command: r.commands[i], Dispatched: true}
-		return state, nil
+		if concluded.Outcome == temporal.OutcomeSucceeded && cmd.Version != "" &&
+			cmd.Version != state.CurrentFw {
+			state.PreviousFw, state.CurrentFw = state.CurrentFw, cmd.Version
+		}
+		state.LastCommand = &concluded
 	}
-	return temporal.State{}, fmt.Errorf("device %s: %w", deviceID, temporal.ErrDeviceNotFound)
+	if newest == "" {
+		return temporal.State{}, fmt.Errorf("device %s: %w", deviceID, temporal.ErrDeviceNotFound)
+	}
+	if concluded := state.LastCommand; concluded == nil || concluded.Command.CommandID != newest {
+		for i := len(r.commands) - 1; i >= 0; i-- {
+			if r.commands[i].DeviceID == deviceID {
+				state.Pending = &temporal.PendingCommand{Command: r.commands[i], Dispatched: true}
+				break
+			}
+		}
+	}
+	return state, nil
 }
+
+// smokeInitialFirmware is the version the seeded fleet runs before a rollout moves it.
+const smokeInitialFirmware = "1.0.0"
 
 // recorded returns the commands the seam accepted, in delivery order.
 func (r *commandRecorder) recorded() []temporal.CommandIssuedSignal {
@@ -174,9 +238,13 @@ func (r *commandRecorder) recorded() []temporal.CommandIssuedSignal {
 func TestRolloutSmoke(t *testing.T) {
 	db := mongotest.Start(t).DB
 	address := startTemporalDevServer(t)
+	// The rollback's announcements are published for real: the worker hosts the publisher the
+	// announcements go through, and the notification queue they land on is the broker's.
+	broker := rabbittest.Start(t)
 
 	cfg := config.Defaults()
 	cfg.Temporal.Address = address
+	cfg.RabbitMQ.URL = broker.URL
 	cfg.Rollout.HealthWindow = config.Duration{Duration: smokeHealthWindow}
 	cfg.Rollout.DecisionTimeout = config.Duration{Duration: 30 * time.Second}
 	// The result timeout is shrunk the same way the window is: the smoke drives the real
@@ -187,7 +255,20 @@ func TestRolloutSmoke(t *testing.T) {
 	cfg.Rollout.MinSuccessRatio = 0.95
 
 	dispatcher := &commandRecorder{}
-	tc := startSmokeWorker(t, cfg, db, dispatcher, dispatcher)
+	notifier := telemetry.NewNotifier(
+		cfg.RabbitMQ.URL,
+		telemetry.NewTopology(
+			cfg.RabbitMQ.MaxAttempts, cfg.RabbitMQ.RetryBase.Duration, cfg.RabbitMQ.RetryMax.Duration,
+		),
+		smokeLogger(),
+	)
+	notifierCtx, stopNotifier := context.WithCancel(context.Background())
+	notifierRun, notifierReady := startNotifier(notifier, notifierCtx)
+	go func() { _ = notifierRun() }()
+	<-notifierReady
+	t.Cleanup(stopNotifier)
+
+	tc := startSmokeWorker(t, cfg, db, dispatcher, dispatcher, notifier)
 	ctx := context.Background()
 
 	// The fleet: devices to canary in one region and two smaller fleets in others, all of the
@@ -401,6 +482,237 @@ func TestRolloutSmoke(t *testing.T) {
 	if wave := waitForWave(t, waves, rollout.WaveID(live.RolloutID, 1, 100)); wave.Status != rollout.WaveHealthy {
 		t.Errorf("gated wave after the resume = %q, want healthy", wave.Status)
 	}
+
+	// 6. A wave that regresses drives the whole rollback: the devices the rollout moved are
+	// restored in reverse wave order through the real downgrade activity, the fleet's records
+	// are reconciled against the devices, both announcements reach the notification queue, and
+	// the rollout records its terminal status only once the plan has run.
+	seedPreviousFirmware(t, db)
+	rollbackFleet := seedFleet(t, db, "eu-north", 3)
+	// The first wave is promoted on a healthy fleet; the second is judged on a fleet that has
+	// gone bad, which is what rolls the rollout back. The devices still take the update — their
+	// outcomes are scripted independently of the heartbeats the gate measures.
+	stopRollbackHealthy := startHeartbeats(t, db, map[string][]string{"eu-north": rollbackFleet}, 0.95)
+	scripts.failRestore[rollbackFleet[1]] = "flash write failed"
+	scripts.neverRestore[rollbackFleet[2]] = true
+
+	rolling := temporal.RolloutRequest{
+		RolloutID: "ro-smoke-rollback", FirmwareID: "fw-smoke", Region: "eu-north", Model: "oak-s3",
+	}
+	rollingSettings := smokeRolloutSettings(t, cfg)
+	rollingSettings.Waves = []temporal.RolloutWave{{Percent: 50}, {Percent: 100}}
+	if err := temporal.NewRolloutStarter(tc, cfg.Temporal.TaskQueue, rollingSettings).
+		Start(ctx, rolling); err != nil {
+		t.Fatalf("start rollback rollout: %v", err)
+	}
+	firstWaveID := rollout.WaveID(rolling.RolloutID, 0, 50)
+	if wave := waitForWave(t, waves, firstWaveID); wave.Status != rollout.WaveHealthy {
+		t.Fatalf("first wave status = %q, want the promoted wave", wave.Status)
+	}
+	// The fleet goes bad under the rollout's feet: the next wave's window measures a regressing
+	// fleet and the rollout rolls back.
+	stopRollbackHealthy()
+	stopRollbackBroken := startHeartbeats(t, db, map[string][]string{"eu-north": rollbackFleet}, 0.1)
+	t.Cleanup(stopRollbackBroken)
+
+	rollingRecord := waitForRolloutStatus(t, rollouts, rolling.RolloutID, rollout.RolloutRolledBack)
+	secondWave := waitForWave(t, waves, rollout.WaveID(rolling.RolloutID, 1, 100))
+	if secondWave.Status != rollout.WaveUnhealthy {
+		t.Errorf("regressing wave status = %q, want unhealthy", secondWave.Status)
+	}
+	if rollingRecord.Rollback == nil {
+		t.Fatal("the rollout document carries no rollback record")
+	}
+	// The plan compensates the wave that failed before the wave it promoted over, and every
+	// step's outcome is recorded.
+	wantPlan := []rollout.RollbackStepRecord{
+		{Kind: rollout.RollbackNotifyStarted, Status: rollout.RollbackStepCompleted},
+		{
+			Kind: rollout.RollbackDowngrade, WaveID: secondWave.ID,
+			Status: rollout.RollbackStepCompleted, Devices: 2, Failed: 1, Unreported: 1,
+		},
+		{
+			Kind: rollout.RollbackDowngrade, WaveID: firstWaveID,
+			Status: rollout.RollbackStepCompleted, Devices: 1, Restored: 1,
+		},
+		{
+			Kind: rollout.RollbackReconcileInventory, Status: rollout.RollbackStepCompleted,
+			Devices: 3, Agreed: 1, Corrected: 2,
+		},
+		{Kind: rollout.RollbackNotifyCompleted, Status: rollout.RollbackStepCompleted},
+	}
+	if diff := cmp.Diff(wantPlan, rollingRecord.Rollback.Steps); diff != "" {
+		t.Errorf("recorded rollback plan mismatch (-want +got):\n%s", diff)
+	}
+	// The terminal status carries the completed plan: "rolled back" means the compensations ran,
+	// not that someone intended them.
+	for _, step := range rollingRecord.Rollback.Steps {
+		if step.Status == rollout.RollbackStepPending || step.Status == rollout.RollbackStepRunning {
+			t.Errorf("step %s is recorded as %s on a concluded rollback", step.Kind, step.Status)
+		}
+	}
+	wantInventory := []rollout.FirmwareInventoryRecord{
+		{Version: smokeInitialFirmware, Devices: 1},
+		{Version: "2.0.0", Devices: 2},
+	}
+	if diff := cmp.Diff(wantInventory, rollingRecord.Rollback.Inventory); diff != "" {
+		t.Errorf("recorded inventory mismatch (-want +got):\n%s", diff)
+	}
+	if want := []string{rollbackFleet[1], rollbackFleet[2]}; !slices.Equal(rollingRecord.Rollback.UnrestoredDeviceIDs, want) {
+		t.Errorf("unrestored devices = %v, want %v",
+			rollingRecord.Rollback.UnrestoredDeviceIDs, want)
+	}
+
+	// The devices were restored in reverse wave order: the second wave's restores were all
+	// delivered before the first wave's, which is what makes the plan a saga.
+	restores := dispatcher.restoreCommands()
+	if len(restores) != 3 {
+		t.Fatalf("restore commands = %d, want one per compensated device", len(restores))
+	}
+	for i, cmd := range restores {
+		if !strings.HasPrefix(cmd.CommandID, rollbackCommandPrefix) ||
+			!strings.HasSuffix(cmd.CommandID, cmd.DeviceID) {
+			t.Errorf("restore %d command id = %q, want the rollback and device it derives from",
+				i, cmd.CommandID)
+		}
+		if cmd.Kind != temporal.CommandKindUpdate || cmd.Version != smokeInitialFirmware {
+			t.Errorf("restore %d command = %q/%q, want an ordinary update for the older version",
+				i, cmd.Kind, cmd.Version)
+		}
+	}
+	secondWaveFirst := commandPosition(t, restores, secondWave.DeviceIDs[0])
+	firstWaveOnly := commandPosition(t, restores, firstWaveID)
+	if secondWaveFirst < 0 || firstWaveOnly < 0 || secondWaveFirst > firstWaveOnly {
+		t.Errorf("restore order = %v, want the second wave's devices before the first wave's",
+			restores)
+	}
+
+	// The fleet's records now agree with the devices: the two devices the rollback could not
+	// restore are recorded on the deployed firmware, and the restored one on the previous.
+	for _, tc := range []struct {
+		deviceID string
+		wantFw   string
+	}{
+		{rollbackFleet[0], smokeInitialFirmware},
+		{rollbackFleet[1], "2.0.0"},
+		{rollbackFleet[2], "2.0.0"},
+	} {
+		var doc struct {
+			CurrentFw string `bson:"current_fw"`
+		}
+		if err := db.Collection("devices").FindOne(ctx,
+			bson.D{{Key: "_id", Value: tc.deviceID}}).Decode(&doc); err != nil {
+			t.Fatalf("read device %s: %v", tc.deviceID, err)
+		}
+		if doc.CurrentFw != tc.wantFw {
+			t.Errorf("device %s recorded on %q, want %q", tc.deviceID, doc.CurrentFw, tc.wantFw)
+		}
+	}
+
+	// Both announcements reached the notification queue, in plan order, and the completion
+	// carries what the compensations achieved.
+	announcements := awaitAnnouncements(t, broker, 2)
+	if announcements[0].Phase != telemetry.RollbackStarted ||
+		announcements[1].Phase != telemetry.RollbackCompleted {
+		t.Fatalf("announcement phases = %s, %s, want started then completed",
+			announcements[0].Phase, announcements[1].Phase)
+	}
+	if announcements[0].Rollout.RolloutID != rolling.RolloutID ||
+		announcements[0].Rollout.WaveID != secondWave.ID ||
+		announcements[0].Rollout.Outcome != string(temporal.OutcomeUnhealthyWave) {
+		t.Errorf("started announcement = %+v, want the rollout, the failing wave, and the outcome",
+			announcements[0].Rollout)
+	}
+	if announcements[0].Progress != nil {
+		t.Error("the started announcement reports achievements, want none before any compensation")
+	}
+	progress := announcements[1].Progress
+	if progress == nil {
+		t.Fatal("the completed announcement carries no progress")
+	}
+	if progress.Restored != 1 || progress.Failed != 1 || progress.Unreported != 1 ||
+		progress.Corrected != 2 || progress.Agreed != 1 {
+		t.Errorf("announced progress = %+v, want the plan's own counts", progress)
+	}
+	if want := []string{rollbackFleet[1], rollbackFleet[2]}; !slices.Equal(progress.UnrestoredDeviceIDs, want) {
+		t.Errorf("announced unrestored devices = %v, want %v", progress.UnrestoredDeviceIDs, want)
+	}
+}
+
+// commandPosition returns the delivery position of the first restore command for any of devices,
+// or -1 when none was delivered.
+func commandPosition(t *testing.T, restores []temporal.CommandIssuedSignal, devices ...string) int {
+	t.Helper()
+	for i, cmd := range restores {
+		if slices.Contains(devices, cmd.DeviceID) {
+			return i
+		}
+	}
+	return -1
+}
+
+// awaitAnnouncements consumes n rollback announcements from the notification queue, so the smoke
+// reads what a dashboard or an alerting consumer would.
+func awaitAnnouncements(
+	t *testing.T,
+	h *rabbittest.Harness,
+	n int,
+) []telemetry.RollbackEvent {
+	t.Helper()
+	ch := h.Channel(t)
+	h.AwaitDepth(t, ch, telemetry.RolloutNotificationQueue, true, n)
+	conn, err := amqp.Dial(h.URL)
+	if err != nil {
+		t.Fatalf("dial rabbitmq: %v", err)
+	}
+	defer func() {
+		if err := conn.Close(); err != nil {
+			t.Logf("close announcement connection: %v", err)
+		}
+	}()
+	consumer, err := conn.Channel()
+	if err != nil {
+		t.Fatalf("open announcement channel: %v", err)
+	}
+	if err := consumer.Qos(n, 0, false); err != nil {
+		t.Fatalf("set prefetch: %v", err)
+	}
+	deliveries, err := consumer.Consume(telemetry.RolloutNotificationQueue, "", true, false, false, false, nil)
+	if err != nil {
+		t.Fatalf("consume %s: %v", telemetry.RolloutNotificationQueue, err)
+	}
+	events := make([]telemetry.RollbackEvent, 0, n)
+	for len(events) < n {
+		select {
+		case delivery := <-deliveries:
+			event, err := telemetry.DecodeRollbackEvent(delivery.Body)
+			if err != nil {
+				t.Fatalf("decode announcement %d: %v", len(events)+1, err)
+			}
+			events = append(events, event)
+		case <-time.After(smokePollTimeout):
+			t.Fatalf("timed out after %d of %d announcements", len(events), n)
+		}
+	}
+	return events
+}
+
+// seedPreviousFirmware stores the firmware version a rollback restores devices to, so a downgrade
+// resolves the version the devices ran before the deployed one.
+func seedPreviousFirmware(t *testing.T, db *mongo.Database) {
+	t.Helper()
+	_, err := db.Collection("firmware").InsertOne(context.Background(), bson.D{
+		{Key: "_id", Value: "fw-smoke-previous"},
+		{Key: "version", Value: smokeInitialFirmware},
+		{Key: "models", Value: bson.A{"oak-s3"}},
+		{Key: "checksum", Value: "sha256:smoke-previous"},
+		{Key: "size", Value: 1024},
+		{Key: "created_at", Value: time.Now().UTC()},
+		{Key: "gridfs_id", Value: "fwbin-smoke-previous"},
+	})
+	if err != nil {
+		t.Fatalf("seed the previous firmware: %v", err)
+	}
 }
 
 // smokeLogger is the logger the operator surface is driven with: the smoke runs the surface as the
@@ -551,6 +863,7 @@ func startSmokeWorker(
 	db *mongo.Database,
 	commands temporal.DeviceCommander,
 	devices temporal.DeviceStateReader,
+	notifier *telemetry.Notifier,
 ) temporalclient.Client {
 	t.Helper()
 	ctx := context.Background()
@@ -582,7 +895,7 @@ func startSmokeWorker(
 		t.Fatalf("bootstrap namespace: %v", err)
 	}
 
-	deps := newRolloutDeps(db, commands, devices, rolloutHealthSettings(cfg.Rollout))
+	deps := newRolloutDeps(db, commands, devices, rolloutHealthSettings(cfg.Rollout), notifier)
 	deps.updateOptions = []temporal.UpdateDeviceOption{
 		temporal.WithUpdatePollInterval(smokeUpdatePollInterval),
 	}
