@@ -60,6 +60,51 @@ func TestSchema(t *testing.T) {
 		}
 	})
 
+	t.Run("waves validator requires membership and start time", func(t *testing.T) {
+		coll := db.Collection("waves")
+		complete := bson.D{
+			{Key: "_id", Value: "wave-complete"},
+			{Key: "rollout_id", Value: "roll-complete"},
+			{Key: "percent", Value: 5},
+			{Key: "status", Value: "running"},
+			{Key: "success_rate", Value: 0.0},
+			{Key: "device_ids", Value: bson.A{"dev-1", "dev-2"}},
+			{Key: "started_at", Value: time.Now()},
+		}
+		if _, err := coll.InsertOne(ctx, complete); err != nil {
+			t.Fatalf("InsertOne(complete wave) error = %v, want nil", err)
+		}
+
+		// A canary share smaller than one device targets nobody: that wave is recorded with an
+		// empty membership rather than refused, so the validator must allow the empty array.
+		empty := bson.D{
+			{Key: "_id", Value: "wave-empty"},
+			{Key: "rollout_id", Value: "roll-complete"},
+			{Key: "percent", Value: 1},
+			{Key: "status", Value: "running"},
+			{Key: "success_rate", Value: 0.0},
+			{Key: "device_ids", Value: bson.A{}},
+			{Key: "started_at", Value: time.Now()},
+		}
+		if _, err := coll.InsertOne(ctx, empty); err != nil {
+			t.Errorf("InsertOne(wave targeting no devices) error = %v, want nil", err)
+		}
+
+		// Each field is required on its own, so a partial wave that would make health
+		// evaluation guess its membership or its window cannot be stored.
+		for _, missing := range []string{"device_ids", "started_at"} {
+			doc := bson.D{{Key: "_id", Value: "wave-missing-" + missing}}
+			for _, el := range complete {
+				if el.Key != missing && el.Key != "_id" {
+					doc = append(doc, el)
+				}
+			}
+			if _, err := coll.InsertOne(ctx, doc); err == nil {
+				t.Errorf("InsertOne(wave without %s) = nil error, want a validation error", missing)
+			}
+		}
+	})
+
 	t.Run("index set is present", func(t *testing.T) {
 		want := map[string]bool{
 			"idx_region_model": false,

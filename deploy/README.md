@@ -109,6 +109,16 @@ Indexes: `_id_` (unique), `idx_status {status}` (rollout list filtering), `idx_f
 | `percent` | int | canary share of the target group: 1, 5, 25, or 100 (required) |
 | `status` | string | wave status (required) |
 | `success_rate` | number | health over the wave's health window (required) |
+| `device_ids` | array of string | the target devices the wave was dispatched to (required; may be empty) |
+| `started_at` | date | when the wave started, opening its health window (required) |
+
+`device_ids` is the wave's membership as resolved when it started, recorded rather than
+re-derived: a device that re-registers or changes model mid-rollout must not silently move the
+denominator a canary decision rests on. A wave whose canary share resolves to no device is still
+recorded, with an empty array. Health evaluation reads heartbeats of exactly these devices and
+**never heartbeats older than `started_at`** — pre-wave samples come from devices still running
+the previous firmware, so counting them would make a regressing wave look healthiest exactly when
+the gate must be strictest.
 
 Indexes: `_id_` (unique), `idx_rollout_percent {rollout_id, percent}` (waves of a rollout in wave
 order). No unique `(rollout_id, percent)` constraint — a rollback may re-run a wave size. No TTL.

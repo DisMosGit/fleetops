@@ -63,7 +63,7 @@ const expectedRequired = {
   device_state_snapshots: ["region", "model", "current_fw", "online", "last_heartbeat", "config", "snapshot_at"],
   firmware: ["version", "models", "checksum", "size", "created_at", "gridfs_id"],
   rollouts: ["firmware_id", "status", "temporal_wf_id", "region", "model"],
-  waves: ["rollout_id", "percent", "status", "success_rate"],
+  waves: ["rollout_id", "percent", "status", "success_rate", "device_ids", "started_at"],
   processed_events: ["consumer", "event_id", "device_id", "claimed_at"],
   device_alerts: ["device_id", "region", "model", "threshold", "min_health", "first_seen_at", "last_seen_at"],
 };

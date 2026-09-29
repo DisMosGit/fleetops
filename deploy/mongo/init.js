@@ -150,18 +150,25 @@ fleet.rollouts.createIndex({ status: 1 }, { name: "idx_status" });
 fleet.rollouts.createIndex({ firmware_id: 1 }, { name: "idx_firmware_id" });
 
 // waves: one document per canary wave, _id = wave id; waves list in (rollout_id, percent) order.
+// device_ids is the target set the wave was dispatched to and started_at opens its health
+// window: a wave's health is evaluated over exactly those devices and never over heartbeats
+// recorded before started_at, so re-resolving the target group cannot move the denominator.
+// device_ids has no minItems — a canary share smaller than one device legitimately targets
+// nobody, and that wave is recorded rather than skipped.
 ensureCollection("waves", {
   validationAction: "error",
   validationLevel: "strict",
   validator: {
     $jsonSchema: {
       bsonType: "object",
-      required: ["rollout_id", "percent", "status", "success_rate"],
+      required: ["rollout_id", "percent", "status", "success_rate", "device_ids", "started_at"],
       properties: {
         rollout_id: { bsonType: "string" },
         percent: { bsonType: ["int", "long"] },
         status: { bsonType: "string" },
         success_rate: { bsonType: ["double", "int", "long"] },
+        device_ids: { bsonType: "array", items: { bsonType: "string" } },
+        started_at: { bsonType: "date" },
       },
     },
   },
