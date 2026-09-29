@@ -72,6 +72,67 @@ for (const [coll, fields] of Object.entries(expectedRequired)) {
   check(fields.every((f) => req.includes(f)), coll + " validator requires " + fields.join(", "));
 }
 
+// --- the wave outcome sets: optional string arrays, written by every wave write ---
+function propertiesOf(name) {
+  const info = fleet.getCollectionInfos({ name: name })[0];
+  const schema = info && info.options && info.options.validator && info.options.validator.$jsonSchema;
+  return (schema && schema.properties) || {};
+}
+const waveProps = propertiesOf("waves");
+for (const field of ["failed_device_ids", "unreported_device_ids"]) {
+  const prop = waveProps[field];
+  check(prop !== undefined, "waves validator describes " + field);
+  check(
+    prop && prop.bsonType === "array" && prop.items && prop.items.bsonType === "string",
+    "waves." + field + " is an array of device ids",
+  );
+  // Optional on purpose: a document written before these fields existed must stay updatable,
+  // and a document written with them stays valid for the previous validator.
+  check(!expectedRequired.waves.includes(field), "waves." + field + " is not a required field");
+}
+
+// --- the wave outcome sets round-trip through the validator ---
+const waveID = "verify-wave-" + Date.now();
+fleet.waves.insertOne({
+  _id: waveID,
+  rollout_id: "verify-rollout",
+  percent: 25,
+  status: "evaluating",
+  success_rate: 0,
+  device_ids: ["verify-a", "verify-b", "verify-c"],
+  started_at: new Date(),
+  failed_device_ids: ["verify-b"],
+  unreported_device_ids: ["verify-c"],
+});
+const storedWave = fleet.waves.findOne({ _id: waveID });
+check(storedWave.failed_device_ids.length === 1 && storedWave.failed_device_ids[0] === "verify-b",
+  "waves stores the failed device set");
+check(
+  storedWave.unreported_device_ids.length === 1 && storedWave.unreported_device_ids[0] === "verify-c",
+  "waves stores the unreported device set",
+);
+// An empty set is stored as an empty array rather than null, so a reader never has to tell
+// "no failures" apart from "not collected yet".
+fleet.waves.updateOne({ _id: waveID },
+  { $set: { failed_device_ids: [], unreported_device_ids: [] } });
+const clearedWave = fleet.waves.findOne({ _id: waveID });
+check(
+  Array.isArray(clearedWave.failed_device_ids) && clearedWave.failed_device_ids.length === 0 &&
+    Array.isArray(clearedWave.unreported_device_ids) && clearedWave.unreported_device_ids.length === 0,
+  "waves stores empty outcome sets as empty arrays",
+);
+// A document written before the fields existed stays updatable by the new build.
+fleet.waves.updateOne({ _id: waveID },
+  { $unset: { failed_device_ids: "", unreported_device_ids: "" } });
+let legacyWaveUpdated = true;
+try {
+  fleet.waves.updateOne({ _id: waveID }, { $set: { status: "healthy", success_rate: 0.99 } });
+} catch (e) {
+  legacyWaveUpdated = false;
+}
+check(legacyWaveUpdated, "a wave document without the outcome sets stays updatable");
+fleet.waves.deleteMany({ _id: waveID });
+
 // --- index set ---
 function indexMap(name) {
   const map = {};

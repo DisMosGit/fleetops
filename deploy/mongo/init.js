@@ -155,6 +155,12 @@ fleet.rollouts.createIndex({ firmware_id: 1 }, { name: "idx_firmware_id" });
 // recorded before started_at, so re-resolving the target group cannot move the denominator.
 // device_ids has no minItems — a canary share smaller than one device legitimately targets
 // nobody, and that wave is recorded rather than skipped.
+// failed_device_ids and unreported_device_ids are the outcomes the wave's dispatch collected: the
+// devices that reported a failed update and the devices that never reported before the wave
+// stopped waiting on them. They are written by every wave write, always as arrays — a wave whose
+// devices all succeeded says so with two empty arrays — and they are deliberately not required, so
+// a document written before they existed stays updatable by the new build and a document written
+// by the new build stays valid for the previous validator.
 ensureCollection("waves", {
   validationAction: "error",
   validationLevel: "strict",
@@ -169,6 +175,8 @@ ensureCollection("waves", {
         success_rate: { bsonType: ["double", "int", "long"] },
         device_ids: { bsonType: "array", items: { bsonType: "string" } },
         started_at: { bsonType: "date" },
+        failed_device_ids: { bsonType: "array", items: { bsonType: "string" } },
+        unreported_device_ids: { bsonType: "array", items: { bsonType: "string" } },
       },
     },
   },

@@ -5,6 +5,7 @@ package rollout
 import (
 	"context"
 	"errors"
+	"slices"
 	"testing"
 	"time"
 
@@ -13,6 +14,32 @@ import (
 
 	"github.com/DisMosGit/fleetops/internal/mongotest"
 )
+
+// assertEmptyArrays fails the test unless the named wave document stores both outcome sets as
+// empty BSON arrays. Reading through the driver's decoder cannot tell an empty array from a
+// missing field — both decode to an empty slice — so the stored document is inspected directly.
+func assertEmptyArrays(t *testing.T, ctx context.Context, waves *mongo.Collection, waveID string) {
+	t.Helper()
+	var raw bson.M
+	if err := waves.FindOne(ctx, bson.D{{Key: "_id", Value: waveID}}).Decode(&raw); err != nil {
+		t.Fatalf("read raw wave %s: %v", waveID, err)
+	}
+	for _, field := range []string{"failed_device_ids", "unreported_device_ids"} {
+		value, ok := raw[field]
+		if !ok {
+			t.Errorf("stored wave %s has no %s field, want an empty array", waveID, field)
+			continue
+		}
+		ids, ok := value.(bson.A)
+		if !ok {
+			t.Errorf("stored wave %s field %s = %#v, want an array", waveID, field, value)
+			continue
+		}
+		if len(ids) != 0 {
+			t.Errorf("stored wave %s field %s = %v, want an empty array", waveID, field, ids)
+		}
+	}
+}
 
 // startedAt is the workflow-decided start time every resolution in these tests records. It is
 // fixed and millisecond-aligned so the stored value can be compared exactly — MongoDB keeps
@@ -262,6 +289,83 @@ func TestStore(t *testing.T) {
 		// The membership and the window a decision was measured over are never rewritten.
 		if !stored.StartedAt.Equal(startedAt) || len(stored.DeviceIDs) != 1 {
 			t.Errorf("stored wave = %+v, want its membership and start time unchanged", stored)
+		}
+	})
+
+	t.Run("a wave records the devices that did not take the update", func(t *testing.T) {
+		seed(t, "outcome-a", "eu-west", "oak-s3-outcome")
+		seed(t, "outcome-b", "eu-west", "oak-s3-outcome")
+		rec, err := store.ResolveWave(ctx, ResolveRequest{
+			RolloutID: "ro-outcome", WaveID: WaveID("ro-outcome", 0, 100),
+			Percent: 100, Region: "eu-west", Model: "oak-s3-outcome", StartedAt: startedAt,
+		})
+		if err != nil {
+			t.Fatalf("ResolveWave() error = %v", err)
+		}
+		// A wave that has just been resolved has no outcomes yet, and both sets are stored
+		// as empty arrays rather than null or absent.
+		assertEmptyArrays(t, ctx, waves, rec.ID)
+
+		update := WaveStateUpdate{
+			RolloutID: "ro-outcome", WaveID: rec.ID,
+			Status:              WaveEvaluating,
+			FailedDeviceIDs:     []string{"outcome-a"},
+			UnreportedDeviceIDs: []string{"outcome-b"},
+		}
+		if err := store.RecordWaveState(ctx, update); err != nil {
+			t.Fatalf("RecordWaveState() error = %v", err)
+		}
+		stored := readWave(t, rec.ID)
+		if want := []string{"outcome-a"}; !slices.Equal(stored.FailedDeviceIDs, want) {
+			t.Errorf("stored failed_device_ids = %v, want %v", stored.FailedDeviceIDs, want)
+		}
+		if want := []string{"outcome-b"}; !slices.Equal(stored.UnreportedDeviceIDs, want) {
+			t.Errorf("stored unreported_device_ids = %v, want %v", stored.UnreportedDeviceIDs, want)
+		}
+
+		// A wave whose devices all succeeded: the sets are written empty, not left behind.
+		update.FailedDeviceIDs, update.UnreportedDeviceIDs = nil, nil
+		if err := store.RecordWaveState(ctx, update); err != nil {
+			t.Fatalf("RecordWaveState() clearing outcomes error = %v", err)
+		}
+		stored = readWave(t, rec.ID)
+		if len(stored.FailedDeviceIDs) != 0 || len(stored.UnreportedDeviceIDs) != 0 {
+			t.Errorf("stored wave = %+v, want both outcome sets empty", stored)
+		}
+		assertEmptyArrays(t, ctx, waves, rec.ID)
+	})
+
+	t.Run("a document written before the outcome sets existed stays updatable", func(t *testing.T) {
+		// A wave document as the previous build wrote it: no outcome arrays at all. The new
+		// build must still be able to record its state, and must fill the arrays in.
+		waveID := WaveID("ro-legacy", 0, 100)
+		if _, err := waves.InsertOne(ctx, bson.D{
+			{Key: "_id", Value: waveID},
+			{Key: "rollout_id", Value: "ro-legacy"},
+			{Key: "percent", Value: 100},
+			{Key: "status", Value: "dispatching"},
+			{Key: "success_rate", Value: 0.0},
+			{Key: "device_ids", Value: []string{}},
+			{Key: "started_at", Value: startedAt},
+		}); err != nil {
+			t.Fatalf("insert legacy wave %s: %v", waveID, err)
+		}
+
+		if err := store.RecordWaveState(ctx, WaveStateUpdate{
+			RolloutID: "ro-legacy", WaveID: waveID, Status: WaveFailed,
+			FailedDeviceIDs: []string{"legacy-a"},
+		}); err != nil {
+			t.Fatalf("RecordWaveState() on a legacy document error = %v", err)
+		}
+		stored := readWave(t, waveID)
+		if stored.Status != WaveFailed {
+			t.Errorf("stored status = %q, want %q", stored.Status, WaveFailed)
+		}
+		if want := []string{"legacy-a"}; !slices.Equal(stored.FailedDeviceIDs, want) {
+			t.Errorf("stored failed_device_ids = %v, want %v", stored.FailedDeviceIDs, want)
+		}
+		if stored.UnreportedDeviceIDs == nil {
+			t.Error("stored unreported_device_ids is null, want an empty array")
 		}
 	})
 

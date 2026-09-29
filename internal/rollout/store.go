@@ -32,8 +32,9 @@ type ResolveRequest struct {
 	StartedAt time.Time
 }
 
-// WaveStateUpdate is a recorded wave's decided state: the status the wave reached and, once its
-// health has been evaluated, the success rate measured over its window.
+// WaveStateUpdate is a recorded wave's decided state: the status the wave reached, the success
+// rate measured over its window once its health has been evaluated, and the devices whose updates
+// failed or never reported once their outcomes have been collected.
 type WaveStateUpdate struct {
 	// RolloutID is the rollout the wave belongs to.
 	RolloutID string
@@ -43,6 +44,10 @@ type WaveStateUpdate struct {
 	Status WaveStatus
 	// SuccessRate is the evaluated success ratio; zero until the wave has been evaluated.
 	SuccessRate float64
+	// FailedDeviceIDs are the devices that reported a failed update.
+	FailedDeviceIDs []string
+	// UnreportedDeviceIDs are the devices that never reported before the wave stopped waiting.
+	UnreportedDeviceIDs []string
 }
 
 // Store is the fleet database as a rollout consumes it: the devices a selector's pool holds, the
@@ -137,6 +142,11 @@ func (s *Store) ResolveWave(ctx context.Context, req ResolveRequest) (WaveRecord
 		Status:    WaveDispatching,
 		DeviceIDs: WaveTargets(pool, targeted, req.Percent),
 		StartedAt: req.StartedAt,
+		// A wave that has just been resolved has no device outcomes yet, and the fields are
+		// written empty rather than left absent: a reader of the document does not have to
+		// tell "no failures" apart from "not collected yet".
+		FailedDeviceIDs:     []string{},
+		UnreportedDeviceIDs: []string{},
 	}
 	if _, err := s.waves.InsertOne(ctx, rec); err != nil {
 		if mongo.IsDuplicateKeyError(err) {
@@ -149,9 +159,10 @@ func (s *Store) ResolveWave(ctx context.Context, req ResolveRequest) (WaveRecord
 	return rec, nil
 }
 
-// RecordWaveState records a recorded wave's status and success rate. A wave is resolved before it
-// can move, so an unknown wave is an error rather than a write that would create a document
-// without membership. Writing the same transition twice leaves the document unchanged.
+// RecordWaveState records a recorded wave's status, success rate, and collected device outcomes.
+// A wave is resolved before it can move, so an unknown wave is an error rather than a write that
+// would create a document without membership. Writing the same transition twice leaves the
+// document unchanged.
 func (s *Store) RecordWaveState(ctx context.Context, update WaveStateUpdate) error {
 	if update.RolloutID == "" || update.WaveID == "" {
 		return errors.New("record wave state: rollout id and wave id required")
@@ -163,6 +174,10 @@ func (s *Store) RecordWaveState(ctx context.Context, update WaveStateUpdate) err
 	fields := bson.D{
 		{Key: "status", Value: update.Status},
 		{Key: "success_rate", Value: update.SuccessRate},
+		// Always an array, never null: the outcome sets are written by every wave write, so a
+		// wave that recorded no failures says so instead of leaving the field absent.
+		{Key: "failed_device_ids", Value: nonNilIDs(update.FailedDeviceIDs)},
+		{Key: "unreported_device_ids", Value: nonNilIDs(update.UnreportedDeviceIDs)},
 	}
 	res, err := s.waves.UpdateOne(ctx, filter, bson.D{{Key: "$set", Value: fields}})
 	if err != nil {
@@ -173,6 +188,15 @@ func (s *Store) RecordWaveState(ctx context.Context, update WaveStateUpdate) err
 			update.WaveID, update.RolloutID, ErrNotFound)
 	}
 	return nil
+}
+
+// nonNilIDs returns ids as an empty slice when it is nil, so a stored array field is written as
+// an empty array rather than null.
+func nonNilIDs(ids []string) []string {
+	if ids == nil {
+		return []string{}
+	}
+	return ids
 }
 
 // wave returns one recorded wave of one rollout. The rollout id is part of the lookup, so a wave

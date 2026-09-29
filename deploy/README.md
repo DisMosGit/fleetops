@@ -101,11 +101,12 @@ the rollout progresses.
 | `region` | string | target group region (required) |
 | `model` | string | target group model (required) |
 
-`status` is one of `running`, `awaiting_approval` (holding at a wave that requires an operator
-approval), `rolled_back`, `completed`, or `failed`. The last three are terminal: a later write
-never moves the document out of one, so a retried or late transition leaves a concluded rollout's
-record as it stands. Every write is idempotent — recording a status the document already holds
-changes nothing.
+`status` is one of `running`, `paused` (an operator held the rollout: it starts no further wave),
+`awaiting_approval` (holding at a wave that requires an operator approval), `rolled_back`,
+`completed`, or `failed`. The last three are terminal: a later write never moves the document out
+of one, so a retried or late transition leaves a concluded rollout's record as it stands. `paused`
+is never terminal — a resumed rollout reports `running` again. Every write is idempotent —
+recording a status the document already holds changes nothing.
 
 Indexes: `_id_` (unique), `idx_status {status}` (rollout list filtering), `idx_firmware_id
 {firmware_id}` (rollouts per firmware). No TTL.
@@ -125,15 +126,18 @@ gate decides.
 | `success_rate` | number | success ratio measured over the wave's health window (required) |
 | `device_ids` | array of string | the target devices the wave was dispatched to (required; may be empty) |
 | `started_at` | date | when the wave started, opening its health window (required) |
+| `failed_device_ids` | array of string | devices that reported a failed update (optional; written empty when none) |
+| `unreported_device_ids` | array of string | devices that never reported a result (optional; written empty when none) |
 
 `status` is one of `dispatching` (membership recorded, update commands being delivered),
-`evaluating` (dispatched, inside its health window or being re-measured), `skipped` (a share that
-added no device: recorded, not dispatched, and not gated on health), `healthy` or `unhealthy` (the
-gate's decision), or `failed` (its update commands could not be delivered). `success_rate` is `0`
-until the wave's health has been evaluated and then carries the evaluated success ratio; a skipped
-wave is never evaluated and keeps `0`. Writing the same transition twice leaves the document
-unchanged, and a decided wave's membership and `started_at` are never rewritten — they are the
-denominator and the window its decision was measured over.
+`evaluating` (every target has settled — reported success, reported failure, or run out of time —
+and the wave is inside its health window or being re-measured), `skipped` (a share that added no
+device: recorded, not dispatched, and not gated on health), `healthy` or `unhealthy` (the gate's
+decision), or `failed` (its update commands could not be delivered). `success_rate` is `0` until
+the wave's health has been evaluated and then carries the evaluated success ratio; a skipped wave
+is never evaluated and keeps `0`. Writing the same transition twice leaves the document unchanged,
+and a decided wave's membership and `started_at` are never rewritten — they are the denominator and
+the window its decision was measured over.
 
 `device_ids` is the wave's membership as resolved when it started, recorded rather than
 re-derived: a device that re-registers or changes model mid-rollout must not silently move the
@@ -142,6 +146,16 @@ recorded, with an empty array. Health evaluation reads heartbeats of exactly the
 **never heartbeats older than `started_at`** — pre-wave samples come from devices still running
 the previous firmware, so counting them would make a regressing wave look healthiest exactly when
 the gate must be strictest.
+
+`failed_device_ids` and `unreported_device_ids` are the outcomes the wave's per-device update
+dispatch collected. A device is *failed* when its workflow reported that the update command
+concluded unsuccessfully, and *unreported* when it never reported before the wave stopped waiting
+(`rollout.result_timeout`, default five minutes). They are written by every wave write, always as
+arrays — a wave whose devices all succeeded carries two empty arrays rather than a missing field.
+They are deliberately optional in the validator, so a document written before they existed stays
+updatable by the new build and a document written with them stays valid for the previous one.
+Neither set decides a wave by itself: promotion remains the configured health gate's verdict, and
+the sets record who did not take the update.
 
 Indexes: `_id_` (unique), `idx_rollout_percent {rollout_id, percent}` (waves of a rollout in wave
 order). No unique `(rollout_id, percent)` constraint — a rollback may re-run a wave size. No TTL.
@@ -226,3 +240,22 @@ The consumer dedup ledger is bookkeeping and expires too: `processed_events` doc
 `FLEETOPS_PROCESSED_EVENTS_RETENTION_DAYS` (default 7, the same pattern). Past that window a
 redelivery is applied again, which is why every consumer side effect is idempotent by
 construction.
+
+### Rollout lifecycle statuses
+
+A rollout document's `status` is a projection of the workflow's own state, so the document, the
+state query an operator reads, and the `RolloutStatus` search attribute cannot disagree:
+
+| Status | Meaning | Terminal |
+|---|---|---|
+| `running` | driving its sequence: dispatching a wave, waiting in its health window, or measuring it | no |
+| `paused` | an operator paused it: no further wave is resolved or dispatched until it is resumed | no |
+| `awaiting_approval` | holding at a wave configured to require an operator's approval | no |
+| `rolled_back` | a wave failed its gate, its decision timeout, or its delivery, and the rollout stopped | yes |
+| `completed` | the whole configured sequence was promoted | yes |
+| `failed` | it could not start (unknown firmware, or one that does not target the selector's model) | yes |
+
+A pause holds promotion, never safety: a wave already in flight is measured and recorded as it
+would have been, and a regression still rolls a paused rollout back. The `paused` value needs no
+validator change — `status` is a plain string in the schema, and the vocabulary is this document
+and the `rollout.RolloutStatus` constants in code.

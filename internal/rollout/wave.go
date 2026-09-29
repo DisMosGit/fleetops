@@ -14,6 +14,10 @@ const (
 	// RolloutRunning is a rollout driving its sequence: waiting on a gate, dispatching, or
 	// measuring a wave.
 	RolloutRunning RolloutStatus = "running"
+	// RolloutPaused is a rollout an operator held: it starts no further wave until it is
+	// resumed. A wave already in flight is still driven to its decision and can still roll the
+	// rollout back, so a pause holds promotion and never safety. It is never terminal.
+	RolloutPaused RolloutStatus = "paused"
 	// RolloutAwaitingApproval is a rollout holding at a wave that requires an operator approval.
 	RolloutAwaitingApproval RolloutStatus = "awaiting_approval"
 	// RolloutRolledBack is a concluded rollout that stopped on a wave which failed its gate.
@@ -80,7 +84,8 @@ type RolloutRecord struct {
 }
 
 // WaveRecord is one waves document: which devices the wave targets over the share of the pool it
-// owns, when its health window opened, and the status and success rate its gate recorded.
+// owns, when its health window opened, the status and success rate its gate recorded, and how its
+// devices' updates ended.
 type WaveRecord struct {
 	// ID is the wave id; the _id of the wave document.
 	ID string `bson:"_id"`
@@ -98,6 +103,12 @@ type WaveRecord struct {
 	DeviceIDs []string `bson:"device_ids"`
 	// StartedAt is when the wave started: the earliest time its health window may read from.
 	StartedAt time.Time `bson:"started_at"`
+	// FailedDeviceIDs are the devices that reported a failed update. It is empty — never
+	// absent — for a wave whose devices all succeeded.
+	FailedDeviceIDs []string `bson:"failed_device_ids"`
+	// UnreportedDeviceIDs are the devices that never reported a result before the wave stopped
+	// waiting on them. It is empty — never absent — for a wave whose devices all reported.
+	UnreportedDeviceIDs []string `bson:"unreported_device_ids"`
 }
 
 // WaveID returns the id of the wave at the given zero-based position of a rollout's sequence.
