@@ -151,6 +151,9 @@ func TestRolloutWorkflowSearchAttributes(t *testing.T) {
 		expectAttrs(env,
 			wantRolloutAttrs("", region, string(rollout.RolloutRunning)),
 			wantRolloutAttrs(deployed, region, string(rollout.RolloutRunning)),
+			// The compensating phase is mirrored too: an operator filtering the Temporal UI by
+			// status sees the rollback while it runs, not only once it has concluded.
+			wantRolloutAttrs(deployed, region, string(rollout.RolloutRollingBack)),
 			wantRolloutAttrs(deployed, region, string(rollout.RolloutRolledBack)),
 		)
 		view := runRollout(t, env, rolloutInputFor(settings))

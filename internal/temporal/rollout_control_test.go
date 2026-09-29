@@ -401,9 +401,13 @@ func TestRolloutStatePauseTransitions(t *testing.T) {
 			want:  rollout.RolloutCompleted,
 		},
 		{
-			name:  "a rolled-back rollout ignores a pause",
-			apply: func(s *rolloutState) { s.rollback(0, OutcomeUnhealthyWave, nil); s.pause() },
-			want:  rollout.RolloutRolledBack,
+			name: "a rolled-back rollout ignores a pause",
+			apply: func(s *rolloutState) {
+				s.beginRollback(0, OutcomeUnhealthyWave, nil)
+				s.finishRollback()
+				s.pause()
+			},
+			want: rollout.RolloutRolledBack,
 		},
 		{
 			name:  "a failed rollout ignores a pause",

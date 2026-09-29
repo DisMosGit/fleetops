@@ -3,12 +3,14 @@ package temporal
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/workflow"
 
 	"github.com/DisMosGit/fleetops/internal/rollout"
+	"github.com/DisMosGit/fleetops/internal/telemetry"
 	"github.com/DisMosGit/fleetops/internal/wavehealth"
 )
 
@@ -330,8 +332,10 @@ func gateWave(
 	}
 }
 
-// rollback concludes a rollout on the wave that ended it, carrying that wave's decision, and
-// records the terminal state. No further wave is resolved, dispatched, or gated.
+// rollback ends a rollout on the wave that failed it and runs the plan of compensations the rollout
+// derives from its own recorded progress. No further wave is resolved, dispatched, or gated: the
+// rollout stops deciding, reports the compensating phase while it works, and records its terminal
+// status only once the plan has run.
 func rollback(
 	ctx workflow.Context,
 	state *rolloutState,
@@ -339,12 +343,222 @@ func rollback(
 	outcome RolloutOutcome,
 	decision *WaveHealth,
 ) error {
-	state.rollback(position, outcome, decision)
+	state.beginRollback(position, outcome, decision)
 	workflow.GetLogger(ctx).Error("rollout rolled back",
 		"rollout_id", state.RolloutID,
 		"wave_id", state.EndedBy,
-		"outcome", outcome)
+		"outcome", outcome,
+		"steps", len(state.Rollback.Steps))
+	if err := recordRollout(ctx, state); err != nil {
+		return err
+	}
+	return runRollbackPlan(ctx, state)
+}
+
+// runRollbackPlan executes the plan's steps in order, recording each step as it happens and
+// recording the terminal status once the plan has run. A step whose own work fails permanently is
+// recorded with its failure and the plan continues: the reconciliation and the completion
+// announcement are what make a partial rollback legible, and aborting before them would leave the
+// fleet's records unreconciled and the failure unannounced.
+//
+// Only a failure of the plan's own machinery — a record write — stops it, and that fails the
+// workflow run rather than being recorded against a step.
+func runRollbackPlan(ctx workflow.Context, state *rolloutState) error {
+	progress := state.Rollback
+	for position := range progress.Steps {
+		progress.startStep(position)
+		if err := recordRollout(ctx, state); err != nil {
+			return err
+		}
+
+		var err error
+		switch progress.Steps[position].Kind {
+		case rollout.RollbackNotifyStarted, rollout.RollbackNotifyCompleted:
+			err = announceRollback(ctx, state, position)
+		case rollout.RollbackDowngrade:
+			err = downgradeWave(ctx, state, position)
+		case rollout.RollbackReconcileInventory:
+			err = reconcileInventory(ctx, state, position)
+		default:
+			return fmt.Errorf("rollback step %d of rollout %s has unknown kind %q",
+				position, state.RolloutID, progress.Steps[position].Kind)
+		}
+		if err != nil {
+			return err
+		}
+		if err := recordRollout(ctx, state); err != nil {
+			return err
+		}
+	}
+
+	state.finishRollback()
 	return recordRollout(ctx, state)
+}
+
+// downgradeWave compensates one wave's firmware updates: one downgrade activity per device of the
+// wave, every one scheduled before any is awaited so the wave's devices are restored concurrently,
+// and one outcome collected per device.
+//
+// Nothing here fails the step. An activity that could not restore its device after its retries is
+// recorded as that device's unavailable outcome, and the step's other devices are still restored:
+// one unreachable device must not cancel its peers' restore and must not abort the plan.
+func downgradeWave(ctx workflow.Context, state *rolloutState, position int) error {
+	step := &state.Rollback.Steps[position]
+	// The deadline is computed here, from the workflow's own clock reading, and carried in every
+	// request: a replay, a retry, or a restart recomputes the same one.
+	deadline := workflow.Now(ctx).Add(state.Settings.ResultTimeout)
+	ctx = workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+		StartToCloseTimeout: state.Settings.ResultTimeout + resultTimeoutSlack,
+		HeartbeatTimeout:    heartbeatTimeout(state.Settings.ResultTimeout),
+		RetryPolicy:         dispatchRetryPolicy(),
+	})
+
+	restores := make([]workflow.Future, 0, len(step.Devices))
+	for _, deviceID := range step.Devices {
+		restores = append(restores, workflow.ExecuteActivity(ctx, DowngradeDeviceActivityName,
+			DowngradeDeviceRequest{
+				RolloutID:  state.RolloutID,
+				WaveID:     step.WaveID,
+				DeviceID:   deviceID,
+				DeployedFw: state.FirmwareVersion,
+				Deadline:   deadline,
+			}))
+	}
+
+	outcomes := make([]DeviceRestore, 0, len(restores))
+	for i, restore := range restores {
+		var result DeviceRestore
+		if err := restore.Get(ctx, &result); err != nil {
+			// The activity's retries are exhausted, so the device's restore could not be
+			// attempted or its outcome determined. It is recorded as unrestored with the
+			// failure as its reason rather than passed over.
+			result = DeviceRestore{
+				DeviceID: step.Devices[i],
+				Outcome:  RestoreUnavailable,
+				Detail:   fmt.Sprintf("restore device %s: %v", step.Devices[i], err),
+			}
+			workflow.GetLogger(ctx).Error("restore device failed",
+				"rollout_id", state.RolloutID, "device_id", step.Devices[i], "error", err)
+		}
+		outcomes = append(outcomes, result)
+	}
+	state.Rollback.recordDowngrade(position, outcomes)
+	return nil
+}
+
+// reconcileInventory reconciles the fleet's recorded firmware version of every device the rollback
+// compensates against the version that device's workflow holds — the authority — and stores the
+// inventory the reconciliation established.
+//
+// One activity per device, mirroring the downgrade fan-out: each is small and uniformly retryable,
+// and the step's timeout does not scale with a wave's size. A device whose reconciliation outlives
+// its retries is recorded as unverified with the failure as its reason, so the step still accounts
+// for every device it was given.
+func reconcileInventory(ctx workflow.Context, state *rolloutState, position int) error {
+	devices := compensatedDevices(state.Rollback)
+	ctx = workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+		StartToCloseTimeout: 30 * time.Second,
+		RetryPolicy:         storeRetryPolicy(),
+	})
+
+	reconciliations := make([]workflow.Future, 0, len(devices))
+	for _, deviceID := range devices {
+		reconciliations = append(reconciliations, workflow.ExecuteActivity(ctx,
+			ReconcileInventoryActivityName, ReconcileInventoryRequest{
+				RolloutID: state.RolloutID,
+				WaveID:    compensatedWaveOf(state.Rollback, deviceID),
+				DeviceID:  deviceID,
+			}))
+	}
+
+	outcomes := make([]DeviceInventory, 0, len(reconciliations))
+	for i, reconciliation := range reconciliations {
+		var result DeviceInventory
+		if err := reconciliation.Get(ctx, &result); err != nil {
+			result = DeviceInventory{
+				DeviceID: devices[i],
+				Outcome:  InventoryUnverified,
+				Detail:   fmt.Sprintf("reconcile device %s: %v", devices[i], err),
+			}
+			workflow.GetLogger(ctx).Error("reconcile device inventory failed",
+				"rollout_id", state.RolloutID, "device_id", devices[i], "error", err)
+		}
+		outcomes = append(outcomes, result)
+	}
+	state.Rollback.recordReconciliation(position, outcomes)
+	return nil
+}
+
+// compensatedWaveOf returns the wave a device belongs to within the rollback's plan: the wave whose
+// downgrade step compensates it. The waves of one rollout target disjoint devices, so the first
+// match is the only one.
+func compensatedWaveOf(progress *rollbackProgress, deviceID string) string {
+	for _, step := range progress.Steps {
+		if step.Kind == rollout.RollbackDowngrade && slices.Contains(step.Devices, deviceID) {
+			return step.WaveID
+		}
+	}
+	return ""
+}
+
+// announceRollback publishes one phase of the rollback's announcement. The started phase runs
+// before any compensation and the completed phase after all of them, both through the notification
+// seam that waits for the broker's confirmation.
+//
+// An announcement that cannot be published is recorded against its own step and changes nothing
+// else: the rollout's recorded rollback is authoritative, the compensations that ran are still
+// recorded, and the rollout still concludes with the outcome that ended it.
+func announceRollback(ctx workflow.Context, state *rolloutState, position int) error {
+	phase := telemetry.RollbackStarted
+	if state.Rollback.Steps[position].Kind == rollout.RollbackNotifyCompleted {
+		phase = telemetry.RollbackCompleted
+	}
+	ctx = workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+		StartToCloseTimeout: announcementTimeout,
+		RetryPolicy:         announcementRetryPolicy(),
+	})
+
+	req := AnnounceRollbackRequest{
+		Phase:           phase,
+		RolloutID:       state.RolloutID,
+		FirmwareID:      state.FirmwareID,
+		FirmwareVersion: state.FirmwareVersion,
+		Region:          state.Region,
+		Model:           state.Model,
+		WaveID:          state.EndedBy,
+		Outcome:         state.Outcome,
+		Decision:        state.Decision,
+		PlanSteps:       len(state.Rollback.Steps),
+		PlanDevices:     len(compensatedDevices(state.Rollback)),
+		OccurredAt:      workflow.Now(ctx),
+	}
+	if phase == telemetry.RollbackCompleted {
+		req.Rollback = state.Rollback.view()
+	}
+	if err := workflow.ExecuteActivity(ctx, AnnounceRollbackActivityName, req).Get(ctx, nil); err != nil {
+		state.Rollback.failStep(position, err.Error())
+		workflow.GetLogger(ctx).Error("rollback announcement failed",
+			"rollout_id", state.RolloutID, "phase", phase, "error", err)
+		return nil
+	}
+	state.Rollback.completeStep(position)
+	return nil
+}
+
+// announcementTimeout bounds one announcement publication: it waits for the broker's verdict, which
+// is a round trip rather than a wait on a device.
+const announcementTimeout = 10 * time.Second
+
+// announcementRetryPolicy is the notification policy: an announcement is not safety-critical, so its
+// retry budget is deliberately short. A broker outage costs the rollback seconds rather than its
+// deadline, and the compensations are never gated on the announcements.
+func announcementRetryPolicy() *temporal.RetryPolicy {
+	return &temporal.RetryPolicy{
+		InitialInterval:    500 * time.Millisecond,
+		BackoffCoefficient: 2,
+		MaximumInterval:    5 * time.Second,
+		MaximumAttempts:    3,
+	}
 }
 
 // loadFirmware loads the metadata of the firmware the rollout deploys.
@@ -427,6 +641,7 @@ func recordRollout(ctx workflow.Context, state *rolloutState) error {
 		Region:     state.Region,
 		Model:      state.Model,
 		Status:     state.reported(),
+		Rollback:   state.Rollback.record(),
 	}
 	if err := workflow.ExecuteActivity(ctx, RecordRolloutStateActivityName, req).Get(ctx, nil); err != nil {
 		return fmt.Errorf("record rollout %s as %s: %w", state.RolloutID, req.Status, err)

@@ -11,8 +11,12 @@ import (
 // device the rollout cannot command at all looks like to its update activity.
 var ErrDeviceUnreachable = errors.New("device workflow is unreachable")
 
-// device is one scripted device in the world: the conclusions it schedules and the commands it has
-// accepted.
+// deviceInitialFw is the firmware version a device in the world starts out running: the version a
+// rollout's deployed firmware replaces, and therefore the one a downgrade restores.
+const deviceInitialFw = "1.0.0"
+
+// device is one scripted device in the world: the conclusions it schedules, the commands it has
+// accepted, and the firmware history those commands left behind.
 type device struct {
 	// concludes schedules a conclusion for the delivery at that position: entry i is the
 	// outcome the device reports after its (i+1)-th delivery of the wave's command. An empty
@@ -20,6 +24,10 @@ type device struct {
 	concludes []ConcludedCommand
 	// commands are the commands the device accepted, in delivery order.
 	commands []CommandIssuedSignal
+	// currentFw and previousFw are the firmware the device ran before any of those commands; a
+	// concluded update moves them the way the entity's adoption rule does.
+	currentFw  string
+	previousFw string
 	// unreachable reports that the device's workflow refuses every delivery.
 	unreachable bool
 }
@@ -37,18 +45,21 @@ type device struct {
 type deviceWorld struct {
 	mu      sync.Mutex
 	devices map[string]*device
+	// model is the registered model every device in the world reports. The fleet a rollout
+	// drives is one target group, so one model is what its devices have in common.
+	model string
 }
 
 // newDeviceWorld returns a device world in which every device accepts its command and never
 // concludes it: scripts are what make a device report.
 func newDeviceWorld() *deviceWorld {
-	return &deviceWorld{devices: map[string]*device{}}
+	return &deviceWorld{devices: map[string]*device{}, model: rolloutTestFirmware().Models[0]}
 }
 
 // machine returns a device's entry, creating it on first use. The caller holds the lock.
 func (w *deviceWorld) machine(deviceID string) *device {
 	if w.devices[deviceID] == nil {
-		w.devices[deviceID] = &device{}
+		w.devices[deviceID] = &device{currentFw: deviceInitialFw}
 	}
 	return w.devices[deviceID]
 }
@@ -80,6 +91,27 @@ func (w *deviceWorld) succeed(deviceIDs ...string) {
 func (w *deviceWorld) failWith(detail string, deviceIDs ...string) {
 	for _, id := range deviceIDs {
 		w.concludeOnDelivery(id, 1, OutcomeFailed, detail)
+	}
+}
+
+// succeedUpdateThenRestore scripts a device to take the firmware a wave commands on its first
+// delivery and to conclude the rollback's restore on the second with the given outcome — an empty
+// outcome being a device that never reports its restore. It is the delivery sequence one compensated
+// device sees, which is what makes a rollback's per-device outcomes scriptable.
+func (w *deviceWorld) succeedUpdateThenRestore(deviceID string, outcome CommandOutcome, detail string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.machine(deviceID).concludes = []ConcludedCommand{
+		{Outcome: OutcomeSucceeded},
+		{Outcome: outcome, Detail: detail},
+	}
+}
+
+// concludeRestores scripts devices to take the firmware a wave commands and to conclude the
+// rollback's restore successfully.
+func (w *deviceWorld) concludeRestores(outcome CommandOutcome, deviceIDs ...string) {
+	for _, deviceID := range deviceIDs {
+		w.succeedUpdateThenRestore(deviceID, outcome, "")
 	}
 }
 
@@ -116,9 +148,14 @@ func (w *deviceWorld) SignalCommandIssued(_ context.Context, cmd CommandIssuedSi
 	return nil
 }
 
-// State implements DeviceStateReader: it answers the device's state, which reports the command's
-// conclusion once the delivery that concludes it has happened. A device nothing has signalled has
-// no workflow execution to read.
+// State implements DeviceStateReader: it answers the device's state, which reports the commands it
+// has concluded, the one it has pending, and the firmware history those conclusions left behind. A
+// device nothing has signalled has no workflow execution to read.
+//
+// The world mirrors the entity's own rules: the last concluded command is what a reader waiting on a
+// command compares against, only the newest delivery can be pending — an earlier unconcluded
+// delivery is superseded — and a successful firmware command moves the device onto the version it
+// commanded, leaving the version it ran before as its previous one.
 func (w *deviceWorld) State(_ context.Context, deviceID string) (State, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -126,20 +163,26 @@ func (w *deviceWorld) State(_ context.Context, deviceID string) (State, error) {
 	if machine == nil || len(machine.commands) == 0 {
 		return State{}, fmt.Errorf("read device %s state: %w", deviceID, ErrDeviceNotFound)
 	}
-	state := State{DeviceID: deviceID, CurrentFw: "1.0.0"}
-	delivered := len(machine.commands)
-	// The device reports the conclusion its delivery count has reached: a script that concludes
-	// on a later delivery leaves the command pending until then, exactly as a real device that
-	// takes a while does.
-	for i := min(delivered, len(machine.concludes)) - 1; i >= 0; i-- {
-		if machine.concludes[i].Outcome == "" {
+	state := State{
+		DeviceID:   deviceID,
+		Model:      w.model,
+		CurrentFw:  machine.currentFw,
+		PreviousFw: machine.previousFw,
+	}
+	for i, cmd := range machine.commands {
+		if i >= len(machine.concludes) || machine.concludes[i].Outcome == "" {
 			continue
 		}
 		concluded := machine.concludes[i]
-		concluded.Command = machine.commands[i]
+		concluded.Command = cmd
 		state.LastCommand = &concluded
-		return state, nil
+		if concluded.Outcome == OutcomeSucceeded && cmd.Version != "" && cmd.Version != state.CurrentFw {
+			state.PreviousFw, state.CurrentFw = state.CurrentFw, cmd.Version
+		}
 	}
-	state.Pending = &PendingCommand{Command: machine.commands[delivered-1], Dispatched: true}
+	newest := len(machine.commands) - 1
+	if newest >= len(machine.concludes) || machine.concludes[newest].Outcome == "" {
+		state.Pending = &PendingCommand{Command: machine.commands[newest], Dispatched: true}
+	}
 	return state, nil
 }

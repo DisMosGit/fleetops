@@ -14,8 +14,10 @@ import (
 	"go.temporal.io/sdk/testsuite"
 	"go.temporal.io/sdk/workflow"
 
+	"github.com/DisMosGit/fleetops/internal/devices"
 	"github.com/DisMosGit/fleetops/internal/firmware"
 	"github.com/DisMosGit/fleetops/internal/rollout"
+	"github.com/DisMosGit/fleetops/internal/telemetry"
 	"github.com/DisMosGit/fleetops/internal/wavehealth"
 )
 
@@ -39,9 +41,14 @@ type rolloutFakes struct {
 	// rollouts and waves are the recorded documents, keyed by id.
 	rollouts map[string]rollout.RolloutRecord
 	waves    map[string]rollout.WaveRecord
-	// device is the scriptable device world the update activities command devices through and
-	// read their results from.
+	// device is the scriptable device world the update and downgrade activities command devices
+	// through and read their results from.
 	device *deviceWorld
+	// fleet is the firmware version each device's record holds — the projection a rollback's
+	// reconciliation checks against the device's own state.
+	fleet map[string]string
+	// announcements are the rollback announcements the notifier accepted, in publication order.
+	announcements []telemetry.RollbackEvent
 	// commands are the update commands the seam accepted, in delivery order.
 	commands []CommandIssuedSignal
 	// evaluations are the health evaluations the gate asked for, in order.
@@ -70,6 +77,10 @@ type rolloutFakes struct {
 	dispatchErr   error
 	dispatchFails map[string]int
 	healthFails   int
+	// reconcileErr fails every reconciliation the inventory seam is asked for.
+	reconcileErr error
+	// announceErr fails every announcement the notifier is asked to publish.
+	announceErr error
 	// recordFails fails that many recording calls before they succeed, which is how a retried
 	// write is simulated.
 	recordFails int
@@ -90,10 +101,32 @@ func newRolloutFakes(settings RolloutSettings, rec firmware.Record, pool ...stri
 		rollouts:      map[string]rollout.RolloutRecord{},
 		waves:         map[string]rollout.WaveRecord{},
 		device:        newDeviceWorld(),
+		fleet:         map[string]string{},
 		dispatchFails: map[string]int{},
 	}
 	fakes.device.succeed(pool...)
+	// The fleet's records follow the updates a rollout dispatches: they start out naming the
+	// firmware the rollout deploys, which is what a reconciliation corrects for a device that
+	// never took it.
+	for _, deviceID := range pool {
+		fakes.fleet[deviceID] = rec.Version
+	}
 	return fakes
+}
+
+// addFirmware adds one firmware to the fake registry, so a rollback can resolve the version a
+// device ran before.
+func (f *rolloutFakes) addFirmware(rec firmware.Record) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.firmware[rec.ID] = rec
+}
+
+// recordedAnnouncements returns the rollback announcements the notifier accepted, in order.
+func (f *rolloutFakes) recordedAnnouncements() []telemetry.RollbackEvent {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]telemetry.RollbackEvent(nil), f.announcements...)
 }
 
 // devices returns the scriptable device world the update activities run against.
@@ -198,6 +231,54 @@ func (f *rolloutFakes) Metadata(_ context.Context, id string) (firmware.Record, 
 	return rec, nil
 }
 
+// MetadataByVersion implements FirmwareVersions: it resolves a version to the fake registry's
+// record carrying it, reporting it as not found when no record does.
+func (f *rolloutFakes) MetadataByVersion(_ context.Context, version string) (firmware.Record, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.firmwareErr != nil {
+		return firmware.Record{}, f.firmwareErr
+	}
+	for _, rec := range f.firmware {
+		if rec.Version == version {
+			return rec, nil
+		}
+	}
+	return firmware.Record{}, fmt.Errorf("firmware version %s: %w", version, firmware.ErrNotFound)
+}
+
+// ReconcileFirmware implements FirmwareInventory over the fake fleet, mirroring the store's
+// semantics: a device with no record is missing, a record that already holds the version agreed,
+// and any other record is corrected to the version the device reports.
+func (f *rolloutFakes) ReconcileFirmware(_ context.Context, deviceID, version string) (devices.FirmwareState, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.reconcileErr != nil {
+		return "", f.reconcileErr
+	}
+	recorded, ok := f.fleet[deviceID]
+	switch {
+	case !ok:
+		return devices.FirmwareMissing, nil
+	case recorded == version:
+		return devices.FirmwareAgreed, nil
+	default:
+		f.fleet[deviceID] = version
+		return devices.FirmwareCorrected, nil
+	}
+}
+
+// Announce implements RollbackNotifier: it records the announcement the workflow published.
+func (f *rolloutFakes) Announce(_ context.Context, event telemetry.RollbackEvent) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.announceErr != nil {
+		return f.announceErr
+	}
+	f.announcements = append(f.announcements, event)
+	return nil
+}
+
 // ResolveWave implements TargetResolver: it records one wave document per wave id, resolving its
 // membership the way the store does — the share's slice of the pool minus what earlier waves
 // already target — and returns the recorded document on every later call.
@@ -253,6 +334,14 @@ func (f *rolloutFakes) RecordRollout(_ context.Context, rec rollout.RolloutRecor
 		hook(rec.Status)
 	}
 	return nil
+}
+
+// setRecordErr makes every later record write fail with err, which is how a test scripts a store
+// that goes down mid-rollout.
+func (f *rolloutFakes) setRecordErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.recordErr = err
 }
 
 // observeControlRecord registers a hook that runs after every non-running rollout write, which is
@@ -440,6 +529,15 @@ func (f *rolloutFakes) recordedCommands() []CommandIssuedSignal {
 	return commands
 }
 
+// commandDeliveries returns every command the seam accepted, in delivery order. The wave's own
+// per-device updates run concurrently, so only the order across steps — a barrier between them — is
+// meaningful; recordedCommands is the sorted view a per-wave assertion uses.
+func (f *rolloutFakes) commandDeliveries() []CommandIssuedSignal {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]CommandIssuedSignal(nil), f.commands...)
+}
+
 // recordedEvaluations returns the health evaluations the gate asked for, in order.
 func (f *rolloutFakes) recordedEvaluations() []EvaluateWaveRequest {
 	f.mu.Lock()
@@ -491,6 +589,14 @@ func newRolloutEnv(fakes *rolloutFakes) *testsuite.TestWorkflowEnvironment {
 		activity.RegisterOptions{Name: UpdateDeviceActivityName})
 	env.RegisterActivityWithOptions(NewEvaluateWaveActivity(fakes),
 		activity.RegisterOptions{Name: EvaluateWaveHealthActivityName})
+	env.RegisterActivityWithOptions(
+		NewDowngradeDeviceActivity(fakes, fakes.devices(), fakes,
+			WithDowngradePollInterval(10*time.Millisecond)),
+		activity.RegisterOptions{Name: DowngradeDeviceActivityName})
+	env.RegisterActivityWithOptions(NewReconcileInventoryActivity(fakes.devices(), fakes),
+		activity.RegisterOptions{Name: ReconcileInventoryActivityName})
+	env.RegisterActivityWithOptions(NewAnnounceRollbackActivity(fakes),
+		activity.RegisterOptions{Name: AnnounceRollbackActivityName})
 	return env
 }
 

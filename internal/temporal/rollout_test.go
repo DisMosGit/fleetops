@@ -298,7 +298,8 @@ func TestRolloutView(t *testing.T) {
 					Verdict: wavehealth.VerdictUnhealthy, SuccessRatio: 0.4,
 					SampleSize: 120, WindowStart: time.Unix(1000, 0), WindowEnd: time.Unix(1300, 0),
 				}
-				s.rollback(1, OutcomeUnhealthyWave, &health)
+				s.beginRollback(1, OutcomeUnhealthyWave, &health)
+				s.finishRollback()
 			},
 			want: RolloutView{
 				RolloutID: "ro-1", Status: rollout.RolloutRolledBack,
@@ -314,6 +315,24 @@ func TestRolloutView(t *testing.T) {
 					Verdict: wavehealth.VerdictUnhealthy, SuccessRatio: 0.4,
 					SampleSize: 120, WindowStart: time.Unix(1000, 0), WindowEnd: time.Unix(1300, 0),
 				},
+				// The plan the view reports compensates the waves in reverse: the wave that
+				// ended the rollout is restored before the one it promoted over.
+				Rollback: &RollbackView{Plan: []RollbackStepView{
+					{Kind: rollout.RollbackNotifyStarted, Status: rollout.RollbackStepPending},
+					{
+						Kind: rollout.RollbackDowngrade, WaveID: "ro-1-w1-100",
+						Status: rollout.RollbackStepPending, Devices: 1,
+					},
+					{
+						Kind: rollout.RollbackDowngrade, WaveID: "ro-1-w0-10",
+						Status: rollout.RollbackStepPending, Devices: 1,
+					},
+					{
+						Kind: rollout.RollbackReconcileInventory, Status: rollout.RollbackStepPending,
+						Devices: 2,
+					},
+					{Kind: rollout.RollbackNotifyCompleted, Status: rollout.RollbackStepPending},
+				}},
 			},
 		},
 		{
@@ -375,7 +394,10 @@ func TestRolloutStateTransitions(t *testing.T) {
 
 		for _, conclude := range []func(*rolloutState){
 			func(s *rolloutState) { s.complete() },
-			func(s *rolloutState) { s.rollback(0, OutcomeUnhealthyWave, nil) },
+			func(s *rolloutState) {
+				s.beginRollback(0, OutcomeUnhealthyWave, nil)
+				s.finishRollback()
+			},
 			func(s *rolloutState) { s.fail(OutcomeFirmwareUnknown) },
 		} {
 			state := newRolloutState(rolloutTestInput())
