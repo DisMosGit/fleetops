@@ -117,3 +117,162 @@ To watch a rollout, query its state or read the `rollouts` and `waves` documents
 ```sh
 temporal workflow query --workflow-id rollout-ro-2026-01-02 --type get-rollout-state
 ```
+
+## The operator HTTP API
+
+`controlplane -http-addr :8080` serves two APIs on one listener: the firmware upload API under
+`/api/firmwares` and the rollout API under `/api/rollouts`. Each route is a method-scoped pattern,
+so a method that does not match its route is answered `405 Method Not Allowed` and a path that
+matches no route is answered `404 Not Found`; every JSON rejection carries an operator-safe
+`{"error": "..."}` body, and a backend failure is logged at the boundary and answered
+`{"error": "internal error"}` rather than echoing driver or server internals.
+
+Every rollout call is bounded: the API gives the workflow backend a few seconds and answers a
+failure rather than holding an operator's request open behind a query nothing is running.
+
+| Route | Purpose |
+|---|---|
+| `POST /api/rollouts` | start a rollout |
+| `GET /api/rollouts/{id}` | read a rollout's current state |
+| `POST /api/rollouts/{id}/approve` | authorize the next approval-gated wave |
+| `POST /api/rollouts/{id}/pause` | hold the rollout |
+| `POST /api/rollouts/{id}/resume` | continue a held rollout |
+
+### Starting a rollout
+
+```sh
+curl -sS -X POST localhost:8080/api/rollouts -H 'Content-Type: application/json' -d '{
+  "rollout_id":  "ro-2026-01-02",
+  "firmware_id": "fw-1a2b3c",
+  "region":      "eu-west",
+  "model":       "oak-s3"
+}'
+```
+
+```json
+{"rollout_id":"ro-2026-01-02","workflow_id":"rollout-ro-2026-01-02","status":"running"}
+```
+
+The **rollout id is the request's idempotency key**: it determines the workflow identity, so a
+retried start is refused rather than beginning a second run chain beside the first one's records.
+A client that wants to know whether its first attempt landed reads `409` as "already started" and
+then reads the state.
+
+The endpoint deliberately does not verify the firmware. A firmware that is unknown, or one that
+does not target the selector's model, is the rollout's own recorded failure — a `failed` rollout
+with `firmware_unknown` or `firmware_mismatch` — not a start refusal, because the load-firmware
+activity is the single decider and its decision is what an operator reads.
+
+| Status | Meaning |
+|---|---|
+| `202 Accepted` | the rollout was started; the body names it, its workflow id, and its status |
+| `400 Bad Request` | the body is not valid JSON, carries an unknown field, or leaves `rollout_id`, `firmware_id`, `region`, or `model` empty |
+| `409 Conflict` | that rollout id already has a workflow execution |
+| `500 Internal Server Error` | the backend could not be reached |
+| `405 Method Not Allowed` | the route exists under another method |
+
+### Reading a rollout's state
+
+```sh
+curl -sS localhost:8080/api/rollouts/ro-2026-01-02
+```
+
+The response is the rollout workflow's own state view, verbatim — the same answer the
+`get-rollout-state` query gives, so the API cannot drift from what the rollout reports:
+
+```json
+{
+  "rollout_id": "ro-2026-01-02",
+  "status": "running",
+  "firmware_id": "fw-1a2b3c",
+  "firmware_version": "2.0.0",
+  "region": "eu-west",
+  "model": "oak-s3",
+  "waves": [
+    {"percent": 25, "status": "healthy", "success_rate": 0.99, "target_count": 4,
+     "failed_count": 0, "unreported_count": 0},
+    {"percent": 100, "status": "evaluating", "success_rate": 0, "target_count": 12,
+     "failed_count": 1, "unreported_count": 2}
+  ],
+  "current": 1,
+  "approval_outstanding": false
+}
+```
+
+`status` is the [rollout lifecycle status](../deploy/README.md#rollout-lifecycle-statuses), and
+`firmware_version` is empty until the rollout has loaded its firmware's metadata. A concluded
+rollout adds `outcome`, `ended_by`, and the `decision` its failing wave was measured on. The state
+is read from the workflow execution rather than from the `rollouts` document, so a wave in flight
+is reported as it stands.
+
+| Status | Meaning |
+|---|---|
+| `200 OK` | the body is the rollout's current state |
+| `404 Not Found` | no workflow execution exists for that rollout id |
+| `500 Internal Server Error` | the state could not be read |
+
+### Sending a command
+
+```sh
+curl -sS -X POST localhost:8080/api/rollouts/ro-2026-01-02/approve
+curl -sS -X POST localhost:8080/api/rollouts/ro-2026-01-02/pause
+curl -sS -X POST localhost:8080/api/rollouts/ro-2026-01-02/resume
+```
+
+```json
+{"rollout_id":"ro-2026-01-02","signal":"pause_rollout"}
+```
+
+Each command delivers the workflow's own signal — `approve_next_wave`, `pause_rollout`, or
+`resume_rollout` — so the HTTP surface and the Temporal CLI drive a rollout the same way, and the
+signal names in the response are the ones the workflow registers. A command on a rollout that has
+already concluded is refused: the endpoint reads the state first, so a concluded rollout answers
+`409` instead of accepting a signal that could no longer change anything.
+
+| Status | Meaning |
+|---|---|
+| `202 Accepted` | the signal was delivered; the body names the rollout and the signal |
+| `404 Not Found` | no workflow execution exists for that rollout id |
+| `409 Conflict` | the rollout has already completed, rolled back, or failed |
+| `500 Internal Server Error` | the signal could not be delivered |
+| `405 Method Not Allowed` | the route exists under another method |
+
+## Filtering runs in the Temporal UI
+
+The worker's startup bootstrap registers the namespace's custom search attributes before it polls,
+so every run is filterable from the first workflow task: an attribute that does not exist in the
+namespace is created, an attribute that already exists is left unchanged, and several replicas
+starting at once is harmless. Device runs carry:
+
+| Attribute | Type | Mirrors |
+|---|---|---|
+| `DeviceRegion` | Keyword | the device's registered region |
+| `DeviceModel` | Keyword | the device's registered model |
+| `DeviceFirmware` | Keyword | the firmware version the device runs |
+| `DeviceOnline` | Bool | whether a heartbeat arrived within `liveness.offline_threshold` |
+
+Rollout runs carry:
+
+| Attribute | Type | Mirrors |
+|---|---|---|
+| `RolloutFirmware` | Keyword | the version of the firmware the rollout deploys; **empty until its metadata has been loaded** |
+| `RolloutRegion` | Keyword | the target selector's region |
+| `RolloutStatus` | Keyword | the rollout's lifecycle status (`running`, `paused`, `awaiting_approval`, `rolled_back`, `completed`, `failed`) |
+
+Both sets are derived from workflow state by one function per workflow family and upserted as the
+state changes, so a filter can never disagree with the run. A UI (or CLI) list query selects runs
+by any combination of them, for example every running canary of firmware `2.0.0` in `eu-west`:
+
+```
+RolloutFirmware = "2.0.0" AND RolloutRegion = "eu-west" AND RolloutStatus = "running"
+```
+
+`RolloutFirmware` holds an empty value for a rollout whose firmware metadata never loaded (an
+unknown firmware, or one that does not target the selector's model): the version is not knowable
+from the start input, and such a rollout is findable by region and status — as `failed` — rather
+than by a version it never had.
+
+- `agent` runs `simulation.fleet_size` simulated devices against `grpc.control_plane_addr`:
+  periodic heartbeats (event id, firmware, status, cpu/mem/health) over one multiplexed
+  `AgentService.Connect` stream that re-registers and reconnects with capped exponential
+  backoff, and stops cleanly on SIGINT/SIGTERM.
