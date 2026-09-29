@@ -36,6 +36,10 @@ const (
 	startupTimeout = 60 * time.Second
 	// database is the fleet database name the bootstrap populates.
 	database = "fleetops"
+	// cacheSizeGB caps the container's WiredTiger cache. MongoDB defaults to half the host's
+	// memory per instance, which over-commits badly once several integration tests run their
+	// containers in parallel on one machine: a capped cache keeps the whole suite reliable.
+	cacheSizeGB = "0.25"
 )
 
 // Harness is a booted MongoDB carrying the FleetOps schema, with write-command counters that
@@ -86,6 +90,7 @@ func Start(t *testing.T) *Harness {
 	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
 		ContainerRequest: testcontainers.ContainerRequest{
 			Image:        image,
+			Cmd:          []string{"--wiredTigerCacheSizeGB", cacheSizeGB},
 			ExposedPorts: []string{"27017/tcp"},
 			WaitingFor:   wait.ForListeningPort("27017/tcp").WithStartupTimeout(startupTimeout),
 		},
