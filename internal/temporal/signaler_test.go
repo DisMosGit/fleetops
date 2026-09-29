@@ -128,6 +128,12 @@ func TestSignalerDeliversOneSignalPerCall(t *testing.T) {
 			t.Errorf("call %d start argument = %+v, want the empty state of dev-1 under the settings",
 				i, call.workflowArg)
 		}
+		// The seeded settings name the queue this device's commands are dispatched on, which
+		// is what lets a continuing run schedule dispatch off the queue it runs on.
+		if seed.Settings.DispatchTaskQueue != testSettings().DispatchTaskQueue {
+			t.Errorf("call %d seeded dispatch queue = %q, want %q",
+				i, seed.Settings.DispatchTaskQueue, testSettings().DispatchTaskQueue)
+		}
 	}
 
 	if diff := cmp.Diff(HeartbeatSignal{

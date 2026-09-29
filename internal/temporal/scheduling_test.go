@@ -81,6 +81,7 @@ func TestDeviceWorkflowSearchAttributes(t *testing.T) {
 
 		state := newDeviceState("dev-1", DeviceSettings{
 			SnapshotInterval: time.Hour, OfflineThreshold: 10 * time.Second,
+			DispatchTaskQueue: testSettings().DispatchTaskQueue,
 		})
 		env.RegisterDelayedCallback(func() {
 			env.SignalWorkflow(HeartbeatSignalName, HeartbeatSignal{
@@ -129,6 +130,7 @@ func TestDeviceWorkflowSnapshotScheduling(t *testing.T) {
 		env := newDeviceWorkflowEnv(&dispatchRecorder{}, snaps)
 		state := newDeviceState("dev-1", DeviceSettings{
 			SnapshotInterval: time.Second, OfflineThreshold: 30 * time.Second,
+			DispatchTaskQueue: testSettings().DispatchTaskQueue,
 		})
 
 		var ticks int
@@ -197,6 +199,7 @@ func TestDeviceWorkflowSnapshotScheduling(t *testing.T) {
 		env.SetStartTime(base)
 		state := newDeviceState("dev-1", DeviceSettings{
 			SnapshotInterval: time.Hour, OfflineThreshold: 10 * time.Second,
+			DispatchTaskQueue: testSettings().DispatchTaskQueue,
 		})
 
 		var observed []Snapshot

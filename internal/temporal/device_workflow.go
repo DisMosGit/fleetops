@@ -71,6 +71,11 @@ func DeviceWorkflow(ctx workflow.Context, state deviceState) error {
 		update:    workflow.GetSignalChannel(ctx, UpdateStatusSignalName),
 	}
 	dispatchCtx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+		// The activity's side effect is the agent hub in the control-plane process, so the
+		// task is scheduled on the queue that process polls rather than on the queue this
+		// workflow runs on. Carried in the settings, so a continuing run keeps the same
+		// destination for its whole chain.
+		TaskQueue:           state.Settings.DispatchTaskQueue,
 		StartToCloseTimeout: 10 * time.Second,
 		// Delivery waits for the device to be reachable: retries back off to a capped
 		// interval and continue for the life of the run. A malformed command is the one

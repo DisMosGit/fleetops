@@ -12,8 +12,9 @@ import (
 // state it cannot understand instead of guessing at a foreign shape. Version 2 added the
 // identity attributes, the liveness status, and the settings to the carried state; version 3
 // added the update status; version 4 added the last concluded command; version 5 added the
-// firmware version the device ran before its current one.
-const carryVersion = 5
+// firmware version the device ran before its current one; version 6 added the task queue the
+// device's commands are dispatched on to the settings.
+const carryVersion = 6
 
 // Bounds of the dedup memory carried across continuations. The rings are the fast path of
 // signal idempotency; the structural guards in the apply methods are the backstop.
@@ -198,14 +199,19 @@ type ConfigSnapshot struct {
 }
 
 // DeviceSettings are the configured knobs the entity's own decisions depend on, seeded into
-// the state at run-chain start and carried with it: the periodic snapshot cadence and the
-// silence after which the device counts as offline. Configuration is deploy-time, so the
-// values a run chain starts with stay its values for its life.
+// the state at run-chain start and carried with it: the periodic snapshot cadence, the silence
+// after which the device counts as offline, and the task queue its commands are dispatched on.
+// Configuration is deploy-time, so the values a run chain starts with stay its values for its
+// life.
 type DeviceSettings struct {
 	// SnapshotInterval is the cadence of periodic state snapshots.
 	SnapshotInterval time.Duration `json:"snapshot_interval"`
 	// OfflineThreshold is the silence after which the device counts as offline.
 	OfflineThreshold time.Duration `json:"offline_threshold"`
+	// DispatchTaskQueue is the task queue the command-dispatch activity is scheduled on. The
+	// workflow decides where to schedule dispatch, so it has to know the queue; carrying it
+	// keeps that decision deploy-time and consistent for the whole run chain.
+	DispatchTaskQueue string `json:"dispatch_task_queue"`
 }
 
 // State is the authoritative device state a state query returns: the fields the device
@@ -356,6 +362,12 @@ func (s deviceState) validate() error {
 	}
 	if s.Settings.OfflineThreshold <= 0 {
 		return errors.New("device state without positive offline threshold")
+	}
+	// An empty task queue does not fail anything on its own: it leaves the dispatch activity
+	// unschedulable, which surfaces as commands silently never reaching devices. Refusing the
+	// carried state at the top of the run fails it visibly instead.
+	if s.Settings.DispatchTaskQueue == "" {
+		return errors.New("device state without dispatch task queue")
 	}
 	return nil
 }

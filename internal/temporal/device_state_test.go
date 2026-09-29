@@ -3,6 +3,7 @@ package temporal
 import (
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -367,7 +368,11 @@ func TestDeviceStateApply(t *testing.T) {
 // testSettings returns valid entity settings for tests: anything positive works, but every
 // test shares one value so comparisons read the same everywhere.
 func testSettings() DeviceSettings {
-	return DeviceSettings{SnapshotInterval: time.Minute, OfflineThreshold: 30 * time.Second}
+	return DeviceSettings{
+		SnapshotInterval:  time.Minute,
+		OfflineThreshold:  30 * time.Second,
+		DispatchTaskQueue: "fleetops-controlplane",
+	}
 }
 
 // newDeviceStateSetup returns the identity setup so table cases can share the fresh-state
@@ -423,6 +428,21 @@ func TestDeviceStateValidate(t *testing.T) {
 		}
 	})
 
+	t.Run("settings without dispatch task queue fails loudly", func(t *testing.T) {
+		t.Parallel()
+		// An empty queue leaves the dispatch activity unschedulable rather than failing
+		// anything, so it is refused at run start instead of silently stranding commands.
+		s := newDeviceState("dev-1", testSettings())
+		s.Settings.DispatchTaskQueue = ""
+		err := s.validate()
+		if err == nil {
+			t.Fatal("validate() on an empty dispatch task queue returned nil")
+		}
+		if !strings.Contains(err.Error(), "dispatch task queue") {
+			t.Errorf("validate() error = %q, want it to name the dispatch task queue", err)
+		}
+	})
+
 	t.Run("carry version 1 payload is refused", func(t *testing.T) {
 		t.Parallel()
 		// A state as the previous build carried it: no identity, liveness, or settings
@@ -472,6 +492,25 @@ func TestDeviceStateValidate(t *testing.T) {
 		}
 		if err := s.validate(); !errors.Is(err, ErrUnsupportedCarryVersion) {
 			t.Errorf("validate() on a v4 payload = %v, want ErrUnsupportedCarryVersion", err)
+		}
+	})
+
+	t.Run("carry version 5 payload is refused", func(t *testing.T) {
+		t.Parallel()
+		// The schema before this change: every field it knew, but settings that name only the
+		// snapshot cadence and the offline threshold. Accepting it would schedule the device's
+		// commands on an empty task queue, where nothing polls, so it is refused loudly.
+		const v5 = `{"carry_version":5,"device_id":"dev-1","current_fw":"fw-2","previous_fw":"fw-1",` +
+			`"settings":{"snapshot_interval":60000000000,"offline_threshold":30000000000}}`
+		var s deviceState
+		if err := json.Unmarshal([]byte(v5), &s); err != nil {
+			t.Fatalf("decode v5 payload: %v", err)
+		}
+		if s.Settings.DispatchTaskQueue != "" {
+			t.Errorf("a v5 payload decoded a dispatch task queue: %q", s.Settings.DispatchTaskQueue)
+		}
+		if err := s.validate(); !errors.Is(err, ErrUnsupportedCarryVersion) {
+			t.Errorf("validate() on a v5 payload = %v, want ErrUnsupportedCarryVersion", err)
 		}
 	})
 }
@@ -799,6 +838,12 @@ func TestCarryRoundTrip(t *testing.T) {
 	}
 	if diff := cmp.Diff(s, decoded); diff != "" {
 		t.Errorf("carry round trip lost state (-want +got):\n%s", diff)
+	}
+	// The dispatch queue rides the settings, so a continuing run schedules its commands on the
+	// same queue the chain started under rather than on an empty one.
+	if decoded.Settings.DispatchTaskQueue != testSettings().DispatchTaskQueue {
+		t.Errorf("carried dispatch task queue = %q, want %q",
+			decoded.Settings.DispatchTaskQueue, testSettings().DispatchTaskQueue)
 	}
 	if err := decoded.validate(); err != nil {
 		t.Fatalf("validate() decoded state: %v", err)

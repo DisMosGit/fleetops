@@ -505,6 +505,37 @@ func TestDeviceWorkflowCommandLifecycle(t *testing.T) {
 	})
 }
 
+// TestDeviceWorkflowDispatchTaskQueue pins the queue the dispatch activity is scheduled on: the
+// control-plane queue carried in the entity settings, not the queue the workflow itself runs on.
+// The test environment is told dispatch-command is available on that queue alone, so the activity
+// executes only if the workflow put its task there — the scheduling decision is asserted, not
+// restated. A workflow that left the queue at its default would find no executor and never reach
+// the device.
+func TestDeviceWorkflowDispatchTaskQueue(t *testing.T) {
+	t.Parallel()
+
+	settings := testSettings()
+	update := CommandIssuedSignal{
+		CommandID: "cmd-1", DeviceID: "dev-1", Kind: CommandKindUpdate,
+		FirmwareID: "fw-2", Version: "fw-2",
+	}
+	rec := &dispatchRecorder{}
+	env := newDeviceWorkflowEnv(rec, &snapshotRecorder{})
+	env.SetActivityTaskQueue(settings.DispatchTaskQueue, DispatchActivityName)
+
+	queueSignals(env, testSignal{CommandIssuedSignalName, update})
+	padToRollover(env, 1)
+	env.ExecuteWorkflow(DeviceWorkflow, newDeviceState("dev-1", settings))
+
+	carried := finishRun(t, env)
+	if diff := cmp.Diff([]CommandIssuedSignal{update}, rec.recorded()); diff != "" {
+		t.Errorf("dispatches mismatch (-want +got):\n%s", diff)
+	}
+	if carried.Pending == nil || !carried.Pending.Dispatched {
+		t.Errorf("carried pending = %+v, want the command marked dispatched", carried.Pending)
+	}
+}
+
 func TestDeviceWorkflowRollingContinuation(t *testing.T) {
 	t.Parallel()
 
