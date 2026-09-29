@@ -72,6 +72,15 @@ func (c Config) Validate() error {
 	if !(c.Rollout.MinSuccessRatio >= 0 && c.Rollout.MinSuccessRatio <= 1) {
 		add("rollout.min_success_ratio", "must be in [0, 1]")
 	}
+	validateWaveSequence(add, "rollout.waves", c.Rollout.Waves)
+	validateDuration(add, "rollout.decision_timeout", c.Rollout.DecisionTimeout)
+	// A decision timeout below the window would decide a wave before its first measurement could
+	// be taken. Comparing only parsed values keeps a malformed duration from reporting two
+	// violations for one field.
+	if !c.Rollout.HealthWindow.invalid && !c.Rollout.DecisionTimeout.invalid &&
+		c.Rollout.DecisionTimeout.Duration < c.Rollout.HealthWindow.Duration {
+		add("rollout.decision_timeout", "must not be below rollout.health_window")
+	}
 	validateHostPort(add, "temporal.address", c.Temporal.Address)
 	validateNonEmpty(add, "temporal.namespace", c.Temporal.Namespace)
 	validateNonEmpty(add, "temporal.task_queue", c.Temporal.TaskQueue)
@@ -124,6 +133,31 @@ func validateScheme(add func(field, reason string), field, value string, allowed
 func validateNonEmpty(add func(field, reason string), field, value string) {
 	if strings.TrimSpace(value) == "" {
 		add(field, "must not be empty")
+	}
+}
+
+// validateWaveSequence reports field unless waves is an ordered canary sequence: at least one
+// entry, every share inside (0, 100], each share strictly above the one before it, and the last
+// entry covering the whole pool so a completed rollout means the whole target group was reached.
+// The first violation is the one reported: a broken sequence makes every later rule meaningless.
+func validateWaveSequence(add func(field, reason string), field string, waves []Wave) {
+	if len(waves) == 0 {
+		add(field, "must not be empty")
+		return
+	}
+	for i, wave := range waves {
+		if wave.Percent <= 0 || wave.Percent > 100 {
+			add(field, fmt.Sprintf("entry %d: percent must be in (0, 100], got %d", i, wave.Percent))
+			return
+		}
+		if i > 0 && wave.Percent <= waves[i-1].Percent {
+			add(field, fmt.Sprintf("entry %d: percent must be above the previous entry's %d",
+				i, waves[i-1].Percent))
+			return
+		}
+	}
+	if last := waves[len(waves)-1].Percent; last != 100 {
+		add(field, fmt.Sprintf("last entry: percent must be 100, got %d", last))
 	}
 }
 

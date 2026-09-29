@@ -85,6 +85,13 @@ func TestRolloutDefaults(t *testing.T) {
 		{"rollout.sample_health_threshold", got.Rollout.SampleHealthThreshold, 0.6},
 		{"rollout.min_success_ratio", got.Rollout.MinSuccessRatio, 0.95},
 		{"rollout.min_samples", got.Rollout.MinSamples, 10},
+		{"rollout.decision_timeout", got.Rollout.DecisionTimeout.Duration, 30 * time.Minute},
+		{"rollout.waves", got.Rollout.Waves, []Wave{
+			{Percent: 1},
+			{Percent: 5},
+			{Percent: 25, RequireApproval: true},
+			{Percent: 100, RequireApproval: true},
+		}},
 	}
 	for _, tc := range defaults {
 		t.Run(tc.field, func(t *testing.T) {
@@ -186,6 +193,25 @@ func TestLoad(t *testing.T) {
 				c.Rollout.SampleHealthThreshold = 0.5
 				c.Rollout.MinSuccessRatio = 0.9
 				c.Rollout.MinSamples = 25
+			},
+		},
+		{
+			name: "rollout sequence overrides the default",
+			file: "rollout:\n" +
+				"  waves:\n" +
+				"    - percent: 10\n" +
+				"      require_approval: false\n" +
+				"    - percent: 100\n" +
+				"      require_approval: false\n",
+			mutate: func(c *Config) {
+				c.Rollout.Waves = []Wave{{Percent: 10}, {Percent: 100}}
+			},
+		},
+		{
+			name: "rollout decision timeout overrides the default",
+			file: "rollout:\n  decision_timeout: 10m\n",
+			mutate: func(c *Config) {
+				c.Rollout.DecisionTimeout = Duration{Duration: 10 * time.Minute}
 			},
 		},
 		{

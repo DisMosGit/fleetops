@@ -115,9 +115,9 @@ type Alerting struct {
 	HealthThreshold float64 `yaml:"health_threshold"`
 }
 
-// Rollout configures canary wave health gating: how wide a window a wave's health is measured
-// over, what counts as a successful sample, and when the measurement is evidence enough to
-// decide with. The per-sample threshold is deliberately separate from
+// Rollout configures a canary rollout: the sequence of waves it drives, how wide a window a
+// wave's health is measured over, what counts as a successful sample, and when the measurement
+// is evidence enough to decide with. The per-sample threshold is deliberately separate from
 // alerting.health_threshold even though their defaults agree — alert sensitivity and the
 // promote/rollback boundary are different decisions, and one shared value would let a change to
 // alerting silently move the gate.
@@ -130,6 +130,21 @@ type Rollout struct {
 	MinSuccessRatio float64 `yaml:"min_success_ratio"`
 	// MinSamples is the number of samples a window must hold before its verdict is decided.
 	MinSamples int `yaml:"min_samples"`
+	// Waves is the canary sequence a rollout drives, in order.
+	Waves []Wave `yaml:"waves"`
+	// DecisionTimeout is the longest a wave may stay undecided before its gate treats it as
+	// unhealthy.
+	DecisionTimeout Duration `yaml:"decision_timeout"`
+}
+
+// Wave is one entry of the canary sequence: the share of the rollout's eligible pool the wave
+// covers and whether it may start only after an operator approved it. Shares are cumulative, so
+// a wave targets the devices its share adds beyond the shares of the waves before it.
+type Wave struct {
+	// Percent is the wave's cumulative share of the rollout's eligible pool, in (0, 100].
+	Percent int `yaml:"percent"`
+	// RequireApproval reports whether the wave waits for an operator's approval before it starts.
+	RequireApproval bool `yaml:"require_approval"`
 }
 
 // Temporal configures the orchestration backend.
@@ -187,6 +202,15 @@ func Defaults() Config {
 			SampleHealthThreshold: 0.6,
 			MinSuccessRatio:       0.95,
 			MinSamples:            10,
+			// The demo canary: two waves an operator watches without being asked, then the
+			// two that commit real capacity and wait for approval.
+			Waves: []Wave{
+				{Percent: 1},
+				{Percent: 5},
+				{Percent: 25, RequireApproval: true},
+				{Percent: 100, RequireApproval: true},
+			},
+			DecisionTimeout: Duration{Duration: 30 * time.Minute},
 		},
 		Temporal: Temporal{Address: "localhost:7233", Namespace: "default", TaskQueue: "fleetops"},
 		Observability: Observability{

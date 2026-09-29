@@ -74,6 +74,24 @@ rollout:
   # Samples a window must hold before its verdict is decided; below it the wave is undecided
   # rather than healthy, so thin evidence can never promote a wave.
   min_samples: 10
+  # The canary sequence a rollout drives, in order. Each entry's `percent` is a cumulative share
+  # of the rollout's eligible pool — a wave targets the devices its share adds beyond the shares
+  # before it — and `require_approval` makes the wave wait for an operator's approve_next_wave
+  # signal before it starts. Validation keeps the sequence honest: non-empty, every share in
+  # (0, 100], strictly increasing, and the last entry at 100.
+  waves:
+    - percent: 1
+      require_approval: false
+    - percent: 5
+      require_approval: false
+    - percent: 25
+      require_approval: true
+    - percent: 100
+      require_approval: true
+  # Longest a wave may stay undecided before its gate treats it as unhealthy, measured from the
+  # wave's start (Go duration string). Must not be shorter than health_window, which would decide
+  # a wave before its first measurement could be taken.
+  decision_timeout: "30m"
 
 temporal:
   # Temporal frontend address.

@@ -135,6 +135,42 @@ func TestValidate(t *testing.T) {
 		{name: "negative min success ratio", mutate: func(c *Config) {
 			c.Rollout.MinSuccessRatio = -0.1
 		}, wantErrs: []string{"rollout.min_success_ratio"}},
+		{name: "empty wave sequence", mutate: func(c *Config) {
+			c.Rollout.Waves = nil
+		}, wantErrs: []string{"rollout.waves"}},
+		{name: "zero wave percentage", mutate: func(c *Config) {
+			c.Rollout.Waves = []Wave{{Percent: 0}, {Percent: 100}}
+		}, wantErrs: []string{"rollout.waves"}},
+		{name: "wave percentage above one hundred", mutate: func(c *Config) {
+			c.Rollout.Waves = []Wave{{Percent: 101}}
+		}, wantErrs: []string{"rollout.waves"}},
+		{name: "negative wave percentage", mutate: func(c *Config) {
+			c.Rollout.Waves = []Wave{{Percent: -5}, {Percent: 100}}
+		}, wantErrs: []string{"rollout.waves"}},
+		{name: "repeated wave percentage", mutate: func(c *Config) {
+			c.Rollout.Waves = []Wave{{Percent: 25}, {Percent: 25}, {Percent: 100}}
+		}, wantErrs: []string{"rollout.waves"}},
+		{name: "descending wave percentage", mutate: func(c *Config) {
+			c.Rollout.Waves = []Wave{{Percent: 50}, {Percent: 25}, {Percent: 100}}
+		}, wantErrs: []string{"rollout.waves"}},
+		{name: "wave sequence ends below one hundred", mutate: func(c *Config) {
+			c.Rollout.Waves = []Wave{{Percent: 10}, {Percent: 50}}
+		}, wantErrs: []string{"rollout.waves"}},
+		{name: "single full wave is valid", mutate: func(c *Config) {
+			c.Rollout.Waves = []Wave{{Percent: 100}}
+		}},
+		{name: "unparseable decision timeout", mutate: func(c *Config) {
+			c.Rollout.DecisionTimeout = Duration{invalid: true}
+		}, wantErrs: []string{"rollout.decision_timeout"}},
+		{name: "zero decision timeout", mutate: func(c *Config) {
+			c.Rollout.DecisionTimeout = Duration{}
+		}, wantErrs: []string{"rollout.decision_timeout"}},
+		{name: "decision timeout below the health window", mutate: func(c *Config) {
+			c.Rollout.DecisionTimeout = Duration{Duration: time.Minute}
+		}, wantErrs: []string{"rollout.decision_timeout"}},
+		{name: "decision timeout at the health window is valid", mutate: func(c *Config) {
+			c.Rollout.DecisionTimeout = c.Rollout.HealthWindow
+		}},
 		{name: "temporal addr without port", mutate: func(c *Config) {
 			c.Temporal.Address = "temporal"
 		}, wantErrs: []string{"temporal.address"}},
