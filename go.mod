@@ -4,7 +4,10 @@ go 1.27.1
 
 require (
 	github.com/google/go-cmp v0.7.0
+	github.com/moby/moby/api v1.55.0
 	github.com/prometheus/client_golang v1.24.1
+	github.com/prometheus/client_model v0.6.2
+	github.com/rabbitmq/amqp091-go v1.15.0
 	github.com/testcontainers/testcontainers-go v0.44.0
 	go.mongodb.org/mongo-driver/v2 v2.9.1
 	go.temporal.io/api v1.63.5
@@ -48,7 +51,6 @@ require (
 	github.com/magiconair/properties v1.8.10 // indirect
 	github.com/moby/docker-image-spec v1.3.1 // indirect
 	github.com/moby/go-archive v0.2.0 // indirect
-	github.com/moby/moby/api v1.55.0 // indirect
 	github.com/moby/moby/client v0.5.0 // indirect
 	github.com/moby/patternmatcher v0.6.1 // indirect
 	github.com/moby/sys/sequential v0.7.0 // indirect
@@ -62,7 +64,6 @@ require (
 	github.com/opencontainers/image-spec v1.1.1 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/power-devops/perfstat v0.0.0-20240221224432-82ca36839d55 // indirect
-	github.com/prometheus/client_model v0.6.2 // indirect
 	github.com/prometheus/common v0.70.1 // indirect
 	github.com/prometheus/procfs v0.21.1 // indirect
 	github.com/robfig/cron v1.2.0 // indirect
