@@ -5,10 +5,12 @@ package rollout
 import (
 	"context"
 	"errors"
+	"reflect"
 	"slices"
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 
@@ -425,6 +427,105 @@ func TestStore(t *testing.T) {
 		}
 		if stored := readRollout(t, rec.ID); stored.Status != RolloutRolledBack {
 			t.Errorf("stored status = %q, want the terminal %q", stored.Status, RolloutRolledBack)
+		}
+	})
+
+	t.Run("a rollback record rides the rollout write and converges", func(t *testing.T) {
+		rec := rolloutRecord("ro-rollback", RolloutRunning)
+		if err := store.RecordRollout(ctx, rec); err != nil {
+			t.Fatalf("RecordRollout() error = %v", err)
+		}
+
+		rec.Status = RolloutRollingBack
+		rec.Rollback = &RollbackRecord{
+			Outcome: "unhealthy_wave",
+			Steps: []RollbackStepRecord{
+				{Kind: RollbackNotifyStarted, Status: RollbackStepCompleted},
+				{
+					Kind: RollbackDowngrade, WaveID: "ro-rollback-w1-5",
+					Status: RollbackStepRunning, Devices: 8, Restored: 3,
+				},
+			},
+			Inventory:           []FirmwareInventoryRecord{},
+			UnrestoredDeviceIDs: []string{},
+		}
+		if err := store.RecordRollout(ctx, rec); err != nil {
+			t.Fatalf("RecordRollout() rollback error = %v", err)
+		}
+		stored := readRollout(t, rec.ID)
+		if stored.Status != RolloutRollingBack {
+			t.Errorf("stored status = %q, want the non-terminal %q", stored.Status, RolloutRollingBack)
+		}
+		if diff := cmp.Diff(rec.Rollback, stored.Rollback); diff != "" {
+			t.Errorf("stored rollback mismatch (-want +got):\n%s", diff)
+		}
+
+		// The same record written again leaves the document as it stands, and the plan's next
+		// step replaces it whole rather than appending to it.
+		before := readRollout(t, rec.ID)
+		if err := store.RecordRollout(ctx, rec); err != nil {
+			t.Fatalf("RecordRollout() retry error = %v", err)
+		}
+		if after := readRollout(t, rec.ID); !reflect.DeepEqual(before, after) {
+			t.Errorf("a retried write changed the document:\nbefore %+v\nafter  %+v", before, after)
+		}
+
+		rec.Rollback.Steps[1].Status = RollbackStepCompleted
+		rec.Rollback.Steps[1].Restored = 8
+		rec.Rollback.Inventory = []FirmwareInventoryRecord{{Version: "1.0.0", Devices: 8}}
+		rec.Status = RolloutRolledBack
+		if err := store.RecordRollout(ctx, rec); err != nil {
+			t.Fatalf("RecordRollout() terminal error = %v", err)
+		}
+		concluded := readRollout(t, rec.ID)
+		if concluded.Status != RolloutRolledBack {
+			t.Errorf("stored status = %q, want %q", concluded.Status, RolloutRolledBack)
+		}
+		if len(concluded.Rollback.Steps) != 2 || concluded.Rollback.Steps[1].Restored != 8 {
+			t.Errorf("stored rollback = %+v, want the plan replaced whole", concluded.Rollback)
+		}
+
+		// A concluded rollout with a rollback record still refuses to move.
+		rec.Status = RolloutRunning
+		if err := store.RecordRollout(ctx, rec); err != nil {
+			t.Fatalf("RecordRollout() after conclusion error = %v", err)
+		}
+		if stored := readRollout(t, rec.ID); stored.Status != RolloutRolledBack {
+			t.Errorf("stored status = %q, want the terminal %q", stored.Status, RolloutRolledBack)
+		}
+	})
+
+	t.Run("a document written without a rollback record stays writable", func(t *testing.T) {
+		// The shape a document written before the rollback record existed has: no rollback
+		// field at all. A later write that carries one sets it, and one that does not leaves
+		// the stored record alone.
+		if _, err := rollouts.InsertOne(ctx, bson.D{
+			{Key: "_id", Value: "ro-before"},
+			{Key: "firmware_id", Value: "fw-1"},
+			{Key: "status", Value: RolloutRunning},
+			{Key: "temporal_wf_id", Value: "rollout-ro-before"},
+			{Key: "region", Value: "eu-west"},
+			{Key: "model", Value: "oak-s3"},
+		}); err != nil {
+			t.Fatalf("insert an older document: %v", err)
+		}
+
+		rec := rolloutRecord("ro-before", RolloutRollingBack)
+		if err := store.RecordRollout(ctx, rec); err != nil {
+			t.Fatalf("RecordRollout() without a record error = %v", err)
+		}
+		stored := readRollout(t, rec.ID)
+		if stored.Status != RolloutRollingBack || stored.Rollback != nil {
+			t.Errorf("stored rollout = %+v, want the status moved and no rollback record", stored)
+		}
+
+		rec.Rollback = &RollbackRecord{Outcome: "decision_timeout", Steps: []RollbackStepRecord{}}
+		if err := store.RecordRollout(ctx, rec); err != nil {
+			t.Fatalf("RecordRollout() with a record error = %v", err)
+		}
+		stored = readRollout(t, rec.ID)
+		if stored.Rollback == nil || stored.Rollback.Outcome != "decision_timeout" {
+			t.Errorf("stored rollback = %+v, want the record written", stored.Rollback)
 		}
 	})
 

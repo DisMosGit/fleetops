@@ -73,6 +73,11 @@ func NewStore(db *mongo.Database) *Store {
 // RecordRollout ensures the rollout document exists and moves its status. The write is
 // idempotent and terminal-status preserving: recording a status the document already holds
 // changes nothing, and a document that has concluded is never moved again.
+//
+// A record carrying a rollback writes it too, on every write from the moment the rollout enters
+// rollback: the steps' outcomes are replaced whole, so a step transition recorded twice converges
+// on the same document instead of duplicating it. A nil rollback leaves a stored one alone, which
+// is what every write before the rollback does.
 func (s *Store) RecordRollout(ctx context.Context, rec RolloutRecord) error {
 	if rec.ID == "" {
 		return errors.New("record rollout: rollout id required")
@@ -83,6 +88,9 @@ func (s *Store) RecordRollout(ctx context.Context, rec RolloutRecord) error {
 		{Key: "temporal_wf_id", Value: rec.WorkflowID},
 		{Key: "region", Value: rec.Region},
 		{Key: "model", Value: rec.Model},
+	}
+	if rec.Rollback != nil {
+		fields = append(fields, bson.E{Key: "rollback", Value: rec.Rollback.document()})
 	}
 
 	live := bson.D{

@@ -20,6 +20,11 @@ const (
 	RolloutPaused RolloutStatus = "paused"
 	// RolloutAwaitingApproval is a rollout holding at a wave that requires an operator approval.
 	RolloutAwaitingApproval RolloutStatus = "awaiting_approval"
+	// RolloutRollingBack is a rollout that has stopped deciding and is running the compensations
+	// its rollback derived from the wave that failed it. It is never terminal: the terminal
+	// status `rolled_back` is recorded only once every compensating step has run, so "rolled
+	// back" means the fleet is back rather than that someone intended it.
+	RolloutRollingBack RolloutStatus = "rolling_back"
 	// RolloutRolledBack is a concluded rollout that stopped on a wave which failed its gate.
 	RolloutRolledBack RolloutStatus = "rolled_back"
 	// RolloutCompleted is a concluded rollout whose whole sequence was promoted.
@@ -81,6 +86,11 @@ type RolloutRecord struct {
 	Region string `bson:"region"`
 	// Model is the target selector's device model.
 	Model string `bson:"model"`
+	// Rollback is the rollback the rollout ran, written as it compensates: its steps with what
+	// each achieved, the inventory the reconciliation established, and the devices it could not
+	// restore. It is nil for a rollout that never entered rollback, and a write leaves the stored
+	// record alone when it is nil.
+	Rollback *RollbackRecord `bson:"rollback,omitempty"`
 }
 
 // WaveRecord is one waves document: which devices the wave targets over the share of the pool it
