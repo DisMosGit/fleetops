@@ -54,6 +54,14 @@ func newMetrics() (*prometheus.Registry, prometheus.Counter) {
 	return reg, counter
 }
 
+// heartbeatSink returns the sink the agent hub routes accepted heartbeats through: the ordered
+// fan-out of the durable ingest write and the broker publication. Ingest decides acceptance — a
+// heartbeat it refuses is never published — and broker trouble never fails a heartbeat, because
+// storage stays the source of truth. newPipeline wires the real pair through it.
+func heartbeatSink(ingest telemetry.HeartbeatIngest, publisher telemetry.HeartbeatPublisher) agentserver.HeartbeatSink {
+	return telemetry.NewFanout(ingest, publisher)
+}
+
 // metricsHandler serves reg in the Prometheus exposition format on /metrics.
 func metricsHandler(reg *prometheus.Registry) http.Handler {
 	mux := http.NewServeMux()
@@ -83,12 +91,91 @@ func main() {
 	}
 }
 
+// pipeline is the control plane's telemetry event pipeline: the batched ingest write, the broker
+// fan-out published beside it, the alerting consumer that turns degraded heartbeats into alerts,
+// and the queue-depth sampler. run starts every part of it and the end-to-end test drives the
+// same wiring.
+type pipeline struct {
+	// sink is the ordered fan-out the agent hub routes accepted heartbeats through.
+	sink      agentserver.HeartbeatSink
+	ingest    *telemetry.Writer
+	publisher *telemetry.Publisher
+	consumer  *telemetry.Consumer
+	sampler   *telemetry.QueueSampler
+	metrics   *telemetry.Metrics
+}
+
+// newPipeline returns the telemetry pipeline configured by cfg over db, with its collectors
+// registered on registry so a scrape sees them as soon as the metrics endpoint serves.
+func newPipeline(cfg config.Config, db *mongo.Database, registry *prometheus.Registry, log *slog.Logger) (*pipeline, error) {
+	store := devices.NewStore(db)
+	ingest := telemetry.NewWriter(
+		db.Collection("telemetry"),
+		store,
+		cfg.Telemetry.BatchSize,
+		cfg.Telemetry.FlushInterval.Duration,
+		log,
+	)
+	metrics := telemetry.NewMetrics(registry)
+
+	// The broker layout, the fan-out publisher, the alerting consumer, and the queue-depth
+	// sampler are all built from the same configuration, so what a running control plane
+	// declares is what its configuration describes.
+	topology := telemetry.NewTopology(
+		cfg.RabbitMQ.MaxAttempts,
+		cfg.RabbitMQ.RetryBase.Duration,
+		cfg.RabbitMQ.RetryMax.Duration,
+	)
+	publisher := telemetry.NewPublisher(
+		cfg.RabbitMQ.URL,
+		topology,
+		cfg.RabbitMQ.PublishBuffer,
+		metrics,
+		log,
+	)
+	alertingQueue, err := topology.WorkQueue(telemetry.HeartbeatQueue)
+	if err != nil {
+		return nil, fmt.Errorf("resolve the alerting work queue: %w", err)
+	}
+	// The consumer's side effect is one alert document per device whose health fell below the
+	// configured threshold; deduplication makes redeliveries no-ops.
+	consumer := telemetry.NewConsumer(
+		cfg.RabbitMQ.URL,
+		alertingQueue,
+		topology,
+		telemetry.NewLedger(db.Collection("processed_events")),
+		telemetry.NewAlerting(db.Collection("device_alerts"), cfg.Alerting.HealthThreshold),
+		telemetry.ConsumerOptions{
+			Prefetch: cfg.RabbitMQ.Prefetch,
+			Metrics:  metrics,
+			Source:   publisher,
+		},
+		log,
+	)
+	sampler := telemetry.NewQueueSampler(
+		cfg.RabbitMQ.URL,
+		topology,
+		cfg.RabbitMQ.QueueDepthInterval.Duration,
+		metrics,
+		log,
+	)
+	return &pipeline{
+		sink:      heartbeatSink(ingest, publisher),
+		ingest:    ingest,
+		publisher: publisher,
+		consumer:  consumer,
+		sampler:   sampler,
+		metrics:   metrics,
+	}, nil
+}
+
 // run serves the liveness/readiness probes on the configured health address and AgentService
 // on the configured gRPC address until ctx is cancelled. Accepted streams persist device
 // records and heartbeats through the batched ingest pipeline and signal the device workflow,
 // the dispatch-command activity delivers the workflow's commands back onto the streams, and
 // firmware binaries stream to agents over their download RPC. The HTTP gateway serves the
 // firmware upload API on httpAddr; its SSE routes join the same lifecycle at stage 5.
+
 func run(ctx context.Context, cfg config.Config, httpAddr string) error {
 	log := slog.Default()
 
@@ -105,14 +192,11 @@ func run(ctx context.Context, cfg config.Config, httpAddr string) error {
 	db := client.Database(cfg.MongoDB.Database)
 	registry := devices.NewStore(db)
 	firmwareStore := firmware.NewStore(db)
-	ingest := telemetry.NewWriter(
-		db.Collection("telemetry"),
-		registry,
-		cfg.Telemetry.BatchSize,
-		cfg.Telemetry.FlushInterval.Duration,
-		log,
-	)
 	metrics, offlineTransitions := newMetrics()
+	events, err := newPipeline(cfg, db, metrics, log)
+	if err != nil {
+		return err
+	}
 	sweeper := devices.NewSweeper(
 		registry,
 		cfg.Liveness.OfflineThreshold.Duration,
@@ -140,9 +224,10 @@ func run(ctx context.Context, cfg config.Config, httpAddr string) error {
 		Handler: firmware.NewHandler(firmwareStore, registry, log),
 	}
 
-	// The hub is the command seam the dispatch activity sends through; its sink is the
-	// ingest pipeline and its registry records accepted registrations. Accepted heartbeats
-	// and command results reach the device workflow through the signaler.
+	// The hub is the command seam the dispatch activity sends through; its registry records
+	// accepted registrations, and its sink is the ordered fan-out of the durable ingest write
+	// and the broker publication. Accepted heartbeats and command results reach the device
+	// workflow through the signaler.
 	tc, err := temporalclient.Dial(temporalclient.Options{
 		HostPort:  cfg.Temporal.Address,
 		Namespace: cfg.Temporal.Namespace,
@@ -158,7 +243,7 @@ func run(ctx context.Context, cfg config.Config, httpAddr string) error {
 		SnapshotInterval: cfg.Snapshots.Interval.Duration,
 		OfflineThreshold: cfg.Liveness.OfflineThreshold.Duration,
 	})
-	hub := agentserver.NewHub(ingest, log)
+	hub := agentserver.NewHub(events.sink, log)
 	grpcServer := grpc.NewServer(agentserver.ServerOptions(log)...)
 	agentv1.RegisterAgentServiceServer(grpcServer, agentserver.NewServer(hub, registry, signaler, firmwareStore, log))
 
@@ -204,7 +289,18 @@ func run(ctx context.Context, cfg config.Config, httpAddr string) error {
 	})
 	g.Go(func() error {
 		// The ingest pipeline stops with the process and flushes what it holds first.
-		return ingest.Run(gctx)
+		return events.ingest.Run(gctx)
+	})
+	g.Go(func() error {
+		// The publisher reconnects on its own: a broker outage degrades the fan-out and is
+		// counted, it never stops the control plane.
+		return events.publisher.Run(gctx)
+	})
+	g.Go(func() error {
+		return events.consumer.Run(gctx)
+	})
+	g.Go(func() error {
+		return events.sampler.Run(gctx)
 	})
 	g.Go(func() error {
 		return sweeper.Run(gctx)

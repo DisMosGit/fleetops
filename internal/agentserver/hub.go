@@ -21,9 +21,10 @@ type DeviceRegistry interface {
 	Upsert(ctx context.Context, rec devices.Record) error
 }
 
-// HeartbeatSink receives routed heartbeats on their way to the telemetry path. It is the seam
-// the stage-3 RabbitMQ publisher and the stage-2 workflow signal implement; today
-// cmd/controlplane wires the batched ingest writer.
+// HeartbeatSink receives routed heartbeats on their way to the telemetry path. It is the seam the
+// ingest writer, the stage-3 RabbitMQ publisher, and the stage-2 workflow signal implement;
+// cmd/controlplane wires the ordered fan-out of the durable ingest write and the broker
+// publication, so a heartbeat is stored before it is published.
 type HeartbeatSink interface {
 	// Handle consumes one heartbeat exactly as it arrived on the stream, plus the device
 	// identity its registration established — the meta fields ingestion stores with it.
