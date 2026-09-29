@@ -165,6 +165,61 @@ func TestStore(t *testing.T) {
 		}
 	})
 
+	t.Run("reconcile corrects a stale record without touching the rest of it", func(t *testing.T) {
+		seen := time.Now().UTC().Truncate(time.Millisecond)
+		rec := Record{
+			ID: "dev-reconcile", Model: "v3", Region: "eu-west",
+			CurrentFw: "2.0.0", Status: StatusOnline, LastSeen: seen,
+		}
+		if err := store.Upsert(ctx, rec); err != nil {
+			t.Fatalf("Upsert() error = %v", err)
+		}
+
+		state, err := store.ReconcileFirmware(ctx, rec.ID, "1.0.0")
+		if err != nil {
+			t.Fatalf("ReconcileFirmware() error = %v", err)
+		}
+		if state != FirmwareCorrected {
+			t.Errorf("ReconcileFirmware() state = %q, want %q", state, FirmwareCorrected)
+		}
+		want := deviceDoc{
+			ID: "dev-reconcile", Model: "v3", Region: "eu-west",
+			CurrentFw: "1.0.0", Status: StatusOnline, LastSeen: seen,
+		}
+		if got := find(t, rec.ID); got != want {
+			t.Errorf("device record = %+v, want %+v", got, want)
+		}
+
+		// A rerun converges: the record already agrees, so nothing is written.
+		state, err = store.ReconcileFirmware(ctx, rec.ID, "1.0.0")
+		if err != nil {
+			t.Fatalf("ReconcileFirmware() second call error = %v", err)
+		}
+		if state != FirmwareAgreed {
+			t.Errorf("ReconcileFirmware() second call state = %q, want %q", state, FirmwareAgreed)
+		}
+		if got := find(t, rec.ID); got != want {
+			t.Errorf("device record after the rerun = %+v, want %+v", got, want)
+		}
+	})
+
+	t.Run("reconcile invents no record", func(t *testing.T) {
+		state, err := store.ReconcileFirmware(ctx, "dev-absent", "1.0.0")
+		if err != nil {
+			t.Fatalf("ReconcileFirmware() error = %v", err)
+		}
+		if state != FirmwareMissing {
+			t.Errorf("ReconcileFirmware() state = %q, want %q", state, FirmwareMissing)
+		}
+		count, err := devices.CountDocuments(ctx, bson.D{{Key: "_id", Value: "dev-absent"}})
+		if err != nil {
+			t.Fatalf("CountDocuments() error = %v", err)
+		}
+		if count != 0 {
+			t.Errorf("documents for dev-absent = %d, want 0", count)
+		}
+	})
+
 	t.Run("mark stale leaves reporting devices online", func(t *testing.T) {
 		if err := store.Upsert(ctx, Record{
 			ID: "dev-fresh", Model: "v3", Region: "us-east",
