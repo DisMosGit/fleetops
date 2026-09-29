@@ -93,6 +93,14 @@ func (f *fakeSession) publishes() []sentMessage {
 // Lost reports the session's loss notification.
 func (f *fakeSession) Lost() <-chan struct{} { return f.lost }
 
+// isClosed reports whether the session was released, read under the lock so a test can observe it
+// while a supervisor goroutine closes it.
+func (f *fakeSession) isClosed() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.closed
+}
+
 // Close records that the session was released.
 func (f *fakeSession) Close() error {
 	f.mu.Lock()
