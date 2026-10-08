@@ -4,7 +4,7 @@ description: "Review all uncommitted changes and split them into separate logica
 allowed-tools: Bash(git:*)
 license: MIT
 metadata:
-  author: fleetops
+  author: DisMosGit
   version: "1.0"
 ---
 
@@ -50,8 +50,8 @@ Turn the current uncommitted work into a sequence of self-contained conventional
    - **Types**: `feat`, `fix`, `docs`, `test`, `chore`, `build` are in use here; `refactor`, `perf`, `ci` are allowed when none of those fit.
    - **Scopes**: pick from the ones in use — `cmd`, `config`, `proto`, `mongo`, `temporal`, `telemetry`, `agent`, `agentserver`, `devices`, `firmware`, `wavehealth`, `health`, `deploy`, `web`, `deps`, `agents`, `openspec`, `repo`. Fall back to the package directory name; do not invent a new scope without a reason. `cmd` for entrypoint wiring, `deps` for `go.mod`, `agents` for `AGENTS.md` and skills, `openspec` for change plans, `repo` for repo-wide chores.
    - Imperative mood, lowercase, no trailing period, subject at most 72 characters.
-   - A body only when the *why* is non-obvious; wrap it at 72.
-   - No `Co-Authored-By` or "Generated with" trailers unless the user asks for them — this repo's history has none.
+   - **The message is exactly one line.** No body, no description, no trailer — the subject is the whole message. The subject therefore has to carry the change and its justification on its own: write what changed and why it is not obvious into that line rather than below it, and never pass a second `-m`.
+   - No `Co-Authored-By` or "Generated with" trailers — this repo's history has none.
 
 5. **Stage explicitly**
 
@@ -73,7 +73,7 @@ Turn the current uncommitted work into a sequence of self-contained conventional
 
 7. **Commit and confirm the sequence**
 
-   Commit each group with its message (`git commit -m "<subject>"`, plus `-m "<body>"` when there is one), then re-run `git status --short` before starting the next group. Never `--amend` unless the user asks for it, and never amend a commit that may be pushed — check `git branch -r --contains <sha>` first.
+   Commit each group with its single-line message (`git commit -m "<subject>"` and nothing after it), then re-run `git status --short` before starting the next group. Never `--amend` unless the user asks for it, and never amend a commit that may be pushed — check `git branch -r --contains <sha>` first.
 
 8. **Stop and ask when a grouping is ambiguous**
 
@@ -94,6 +94,7 @@ Turn the current uncommitted work into a sequence of self-contained conventional
    After the last commit, check the result:
 
    - `git log --oneline <original-head>..HEAD` — the commits, in order
+   - `git log --format='%h %s%n%b' <original-head>..HEAD` — every message is one line; a body on any of them is a defect, reword that commit before reporting
    - `git status --short` — only intentionally-left changes remain
 
    Report each commit with its hash, message, and files/hunks; what was intentionally left uncommitted and why; anything the safety gate skipped; and any commit that did not come out self-contained.
