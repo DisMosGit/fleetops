@@ -1,32 +1,96 @@
 schema: spec-driven
 
 # Project context (optional)
-# This is shown to AI when creating artifacts.
-# Add your tech stack, conventions, style guides, domain knowledge, etc.
-# Example:
-#   context: |
-#     Tech stack: TypeScript, React, Node.js
-#     We use conventional commits
-#     Domain: e-commerce platform
+# Shown to AI when creating artifacts, and as an input to apply and archive.
+# Deliberately a pointer rather than a copy: the rules themselves live in the
+# files named here, and restating them would let this block drift from them.
+
+context: |
+  FleetOps: a control plane and device-fleet simulator for over-the-air
+  firmware updates. Go (module github.com/DisMosGit/fleetops), Temporal,
+  gRPC/Protobuf, MongoDB, RabbitMQ, React + Vite, Docker + k3d. Delivery is
+  staged; the stage table lives in README.md.
+
+  The authoritative sources, none of them duplicated here:
+  - AGENTS.md -- the engineering rules: the golden rules, concurrency, errors
+    and logging, Temporal determinism, gRPC, MongoDB, RabbitMQ, observability,
+    testing, style, dependencies, and the four-command Definition of Done.
+  - CONTRIBUTING.md -- the contribution process: setup, PR workflow, review
+    expectations, and where a change proposal belongs.
+  - README.md -- the stage table that gates what may land when, and the
+    repository map.
+  - docs/README.md -- the documentation backlog, one document per trigger
+    milestone; docs/telemetry.md is the one written so far.
+  - Makefile -- the project targets every gate and codegen step is named by.
+  - .agents/skills/commit/SKILL.md -- the dependency ladder commits follow and
+    the one scope list; a task group is one commit.
+  - openspec/specs/ -- the durable capability baseline, flat kebab-case paths.
+    It is still EMPTY: all 16 changes under openspec/changes/ are unarchived,
+    so every delta written so far is an ADDED operation and the first archive
+    of a capability is what creates its base spec. A MODIFIED or REMOVED delta
+    against a capability with no base spec is refused at archive time, so
+    archive in dependency order and keep ADDED first.
 
 # Per-artifact rules (optional)
-# Add custom rules for specific artifacts.
-# Example:
-#   rules:
-#     proposal:
-#       - Keep proposals under 500 words
-#       - Always include a "Non-goals" section
-#     tasks:
-#       - Break tasks into chunks of max 2 hours
+# Additive to the schema's built-in guidance, so each entry carries only what
+# that guidance does NOT already say.
+#
+# Written without a colon inside each entry on purpose. A plain YAML scalar
+# containing a colon followed by a space parses as a mapping, which silently
+# drops the whole rules list for that artifact with a warning.
+
+rules:
+  proposal:
+    - Name the delivery stage the change belongs to, or say why it lands
+      outside the staged plan in README.md. Work that belongs to a stage that
+      has not landed waits for it.
+    - Name the capability paths under openspec/specs/ that the change adds or
+      modifies. They are the contract the specs artifact has to fulfil, and an
+      invented path targets a capability that does not exist.
+    - An idea that is not yet a change belongs in a GitHub issue, not in
+      openspec/changes/.
+
+  specs:
+    - A capability with no base spec takes an ADDED delta. A MODIFIED or
+      REMOVED delta against a capability that has no base spec is refused at
+      archive time, so a change that reshapes one records what it needs in the
+      change that first introduces the capability instead.
+    - Keep the flat kebab-case layout under specs/. A capability directory
+      holds spec.md and nothing else.
+
+  tasks:
+    - Name the artefact or the command a task changes, never the behaviour
+      alone, and name its verification as the command that proves it. A task
+      whose verification says what it checks rather than what to run cannot be
+      run.
+    - Name the project target or command -- among them `make check`, `make
+      proto`, `make proto-tools`, `go test -race -count=1` and the
+      `integration`-tagged suite -- rather than describing what the gate does.
+    - A task group is a commit unit. Groups land in the dependency ladder order
+      in .agents/skills/commit/SKILL.md, each as one commit, and a group
+      carries the tests and documentation its own work calls for.
+    - A task that cannot be finished yet says so in the task and names what
+      unblocks it. An unfinished task is not a placeholder.
 
 # Per-operation guidance (optional)
-# Add advisory guidance for how apply and archive work should be conducted.
-# This is separate from artifact rules above.
-# Example:
-#   operations:
-#     apply:
-#       guidance:
-#         - Keep test summaries concise
-#     archive:
-#       guidance:
-#         - Summarize the archive outcome before finishing
+# Advisory, and shown alongside the project context as an apply or archive input.
+
+operations:
+  apply:
+    guidance:
+      - Run `openspec validate "<change>" --strict` before starting and
+        whenever the artifacts change. CONTRIBUTING.md makes the plan the thing
+        implementation is measured against.
+      - Run `make check` once the work of each task group lands. It wraps the
+        four Definition of Done commands in AGENTS.md, and it rewrites files
+        through `goimports -w .`, so re-read `git status` afterwards.
+      - Run the command a task names. Ticking a box without running its
+        verification is the failure the verification column exists to prevent.
+
+  archive:
+    guidance:
+      - Archive only once every box in tasks.md is ticked, and validate with
+        `openspec validate "<change>" --strict` first.
+      - Archive in dependency order. The first archive of a capability is what
+        merges its base spec into openspec/specs/, and a MODIFIED delta
+        archived before that base spec exists is refused.
