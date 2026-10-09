@@ -1,0 +1,7 @@
+schema: spec-driven
+created: 2026-10-09
+# No spec-level behaviour changes: this change reconciles delta documents with the
+# base spec they will merge into, and archives them. The capabilities it lands are
+# already specified by the deltas it archives, so a delta here would describe
+# nothing new. The durable rule it establishes belongs in openspec/config.yaml.
+skip_specs: true
