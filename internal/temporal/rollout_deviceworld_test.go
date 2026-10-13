@@ -11,6 +11,10 @@ import (
 // device the rollout cannot command at all looks like to its update activity.
 var ErrDeviceUnreachable = errors.New("device workflow is unreachable")
 
+// ErrDeviceStateUnreadable reports a device whose workflow refuses every state read, which is what
+// a device the rollout can observe no facts about looks like to the activities that read it.
+var ErrDeviceStateUnreadable = errors.New("device state is unreadable")
+
 // deviceInitialFw is the firmware version a device in the world starts out running: the version a
 // rollout's deployed firmware replaces, and therefore the one a downgrade restores.
 const deviceInitialFw = "1.0.0"
@@ -30,13 +34,17 @@ type device struct {
 	previousFw string
 	// unreachable reports that the device's workflow refuses every delivery.
 	unreachable bool
+	// unreadable reports that the device's workflow refuses every state read: the device the
+	// activities that observe it can learn nothing about.
+	unreadable bool
 }
 
 // deviceWorld is a scriptable stand-in for the fleet's device entity workflows. It is the device
 // half of the rollout test world: the update activity's delivery seam signals it, and its state
 // reader answers from it, so a workflow test exercises the real activity over devices whose
 // behaviour the test scripts — a device that concludes successfully, one that concludes with a
-// failure, one that never reports, and one whose delivery is refused.
+// failure, one that never reports, one whose delivery is refused, and one whose state cannot be
+// read.
 //
 // The world mirrors the entity's semantics the update activity depends on: a command becomes the
 // device's last concluded command only once the delivery that concludes it has happened, a device
@@ -135,6 +143,29 @@ func (w *deviceWorld) refuseDelivery(deviceIDs ...string) {
 	}
 }
 
+// refuseStateReads makes a device's authoritative state unreadable: every read fails. It is the
+// device whose restore cannot be attempted and whose record cannot be verified — the failure a
+// rollback step has to record against that device alone rather than assume anything about it.
+func (w *deviceWorld) refuseStateReads(deviceIDs ...string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for _, id := range deviceIDs {
+		w.machine(id).unreadable = true
+	}
+}
+
+// firmwareOf returns the firmware version a device's workflow holds, for the assertions a rollback
+// test makes about where a restore left it. It reads the world's own state rather than going through
+// State, so a device scripted as unreadable is still inspectable by the test.
+func (w *deviceWorld) firmwareOf(deviceID string) string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if machine := w.devices[deviceID]; machine != nil {
+		return machine.currentFw
+	}
+	return ""
+}
+
 // SignalCommandIssued implements DeviceCommander: it accepts one command for one device, which is
 // what makes the device's later deliveries possible.
 func (w *deviceWorld) SignalCommandIssued(_ context.Context, cmd CommandIssuedSignal) error {
@@ -150,7 +181,8 @@ func (w *deviceWorld) SignalCommandIssued(_ context.Context, cmd CommandIssuedSi
 
 // State implements DeviceStateReader: it answers the device's state, which reports the commands it
 // has concluded, the one it has pending, and the firmware history those conclusions left behind. A
-// device nothing has signalled has no workflow execution to read.
+// device nothing has signalled has no workflow execution to read, and a device the test scripted as
+// unreadable refuses every read.
 //
 // The world mirrors the entity's own rules: the last concluded command is what a reader waiting on a
 // command compares against, only the newest delivery can be pending — an earlier unconcluded
@@ -160,6 +192,9 @@ func (w *deviceWorld) State(_ context.Context, deviceID string) (State, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	machine := w.devices[deviceID]
+	if machine != nil && machine.unreadable {
+		return State{}, fmt.Errorf("read device %s state: %w", deviceID, ErrDeviceStateUnreadable)
+	}
 	if machine == nil || len(machine.commands) == 0 {
 		return State{}, fmt.Errorf("read device %s state: %w", deviceID, ErrDeviceNotFound)
 	}

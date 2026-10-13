@@ -51,6 +51,11 @@ type rolloutFakes struct {
 	announcements []telemetry.RollbackEvent
 	// commands are the update commands the seam accepted, in delivery order.
 	commands []CommandIssuedSignal
+	// dispatches are the commands the seam accepted, each with the wave document that stood at
+	// the instant it accepted them. It is what lets a test assert the ordering the workflow
+	// promises — a wave's membership is recorded before anything is dispatched — at the moment of
+	// the dispatch rather than after it.
+	dispatches []dispatchRecord
 	// evaluations are the health evaluations the gate asked for, in order.
 	evaluations []EvaluateWaveRequest
 	// answers are the health measurements the evaluator returned, in order.
@@ -397,10 +402,22 @@ func (f *rolloutFakes) observeWaveState(hook func(rollout.WaveStateUpdate)) {
 // SignalCommandIssued implements DeviceCommander. A device with scripted failures left rejects
 // its command that many times, which is how a partly delivered wave is simulated; otherwise the
 // command reaches the scriptable device world, where the device's scripted conclusion lives.
+//
+// A command whose wave has no document yet is still accepted — the store is what a real dispatch
+// would have had to record first — and the gap is visible in the recorded dispatch instead of
+// being turned into a failure here.
 func (f *rolloutFakes) SignalCommandIssued(ctx context.Context, cmd CommandIssuedSignal) error {
 	f.mu.Lock()
 	f.commands = append(f.commands, cmd)
 	f.events = append(f.events, "command "+cmd.DeviceID)
+	// The wave is derived from the command id the update command is built from, and the document
+	// is captured as it stands now: a later write to the wave document cannot change what this
+	// dispatch saw.
+	waveID := strings.TrimSuffix(cmd.CommandID, "-"+cmd.DeviceID)
+	wave, recorded := f.waves[waveID]
+	f.dispatches = append(f.dispatches, dispatchRecord{
+		CommandID: cmd.CommandID, WaveID: waveID, Recorded: recorded, Wave: wave,
+	})
 	switch {
 	case f.dispatchFails[cmd.DeviceID] > 0:
 		f.dispatchFails[cmd.DeviceID]--
@@ -538,6 +555,29 @@ func (f *rolloutFakes) commandDeliveries() []CommandIssuedSignal {
 	return append([]CommandIssuedSignal(nil), f.commands...)
 }
 
+// dispatchRecord is one command the seam accepted, with the wave document the store held at that
+// instant. Recorded is false when the command's wave had no document yet — the regression the
+// dispatch-ordering assertion exists to catch.
+type dispatchRecord struct {
+	// CommandID is the command the seam accepted.
+	CommandID string
+	// WaveID is the wave the command belongs to, derived from the command id the update command
+	// is built from: one wave's command ids carry its own id as their prefix.
+	WaveID string
+	// Recorded reports whether that wave already had a document when the command was accepted.
+	Recorded bool
+	// Wave is the document as it stood then.
+	Wave rollout.WaveRecord
+}
+
+// recordedDispatches returns every accepted command with the wave document it was accepted under,
+// in delivery order.
+func (f *rolloutFakes) recordedDispatches() []dispatchRecord {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]dispatchRecord(nil), f.dispatches...)
+}
+
 // recordedEvaluations returns the health evaluations the gate asked for, in order.
 func (f *rolloutFakes) recordedEvaluations() []EvaluateWaveRequest {
 	f.mu.Lock()
@@ -658,18 +698,24 @@ func (q *scheduledQuery) result(t *testing.T) RolloutView {
 // workflow is still running.
 func scheduleQuery(env *testsuite.TestWorkflowEnvironment, at time.Duration) *scheduledQuery {
 	query := &scheduledQuery{}
-	env.RegisterDelayedCallback(func() {
-		value, err := env.QueryWorkflow(GetRolloutStateQueryType)
-		if err != nil {
-			query.record(RolloutView{}, err)
-			return
-		}
-		var view RolloutView
-		if err := value.Get(&view); err != nil {
-			query.record(RolloutView{}, err)
-			return
-		}
-		query.record(view, nil)
-	}, at)
+	env.RegisterDelayedCallback(func() { recordQuery(env, query) }, at)
 	return query
+}
+
+// recordQuery evaluates the rollout's state query and records its answer into query. It is called
+// from inside a workflow-side callback — a delayed callback, or a hook an activity ran — so a test
+// observes the state the workflow had reached at a moment it chose rather than at a wall-clock
+// instant it guessed at.
+func recordQuery(env *testsuite.TestWorkflowEnvironment, query *scheduledQuery) {
+	value, err := env.QueryWorkflow(GetRolloutStateQueryType)
+	if err != nil {
+		query.record(RolloutView{}, err)
+		return
+	}
+	var view RolloutView
+	if err := value.Get(&view); err != nil {
+		query.record(RolloutView{}, err)
+		return
+	}
+	query.record(view, nil)
 }
