@@ -17,6 +17,10 @@ coverage.*
 *.coverprofile
 profile.cov
 
+# ...but the coverage ledger is a committed artifact, not a profile: openspec/coverage.md is the
+# repository's record of which capability scenario each test backs.
+!openspec/coverage.md
+
 # Dependency directories (remove the comment below to include it)
 # vendor/
 
