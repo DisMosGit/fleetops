@@ -137,17 +137,24 @@ type rolloutDeps struct {
 	updateOptions []temporal.UpdateDeviceOption
 }
 
-// newRolloutDeps wires the rollout's side effects to the fleet database, the configured health
-// policy, the device signaler of this process, and the broker publisher a rollback's announcements
-// are published through.
-func newRolloutDeps(
+// newRolloutDepsWithPools wires the rollout's side effects to the fleet database, the configured
+// health policy, the device signaler of this process, and the broker publisher a rollback's
+// announcements are published through. Wave resolutions read the eligible pool from view, which
+// the devices change stream keeps current, rather than re-querying devices on every resolution; a
+// nil view leaves resolutions on the query path, which is what the tests that run against a
+// standalone MongoDB need.
+func newRolloutDepsWithPools(
 	db *mongo.Database,
+	view rollout.PoolResolver,
 	commands temporal.DeviceCommander,
 	deviceStates temporal.DeviceStateReader,
 	health wavehealth.Settings,
 	notifier temporal.RollbackNotifier,
 ) rolloutDeps {
 	store := rollout.NewStore(db)
+	if view != nil {
+		store = rollout.NewStoreWithPools(db, view)
+	}
 	// The same fleet database answers both halves of an evaluation: which devices a wave
 	// targets and what their heartbeats reported.
 	samples := wavehealth.NewStore(db)
@@ -167,6 +174,27 @@ func newRolloutDeps(
 		health:    wavehealth.New(samples, samples, health),
 		notifier:  notifier,
 	}
+}
+
+// workerFactory builds the poller a replica runs. worker.New satisfies it, and a test substitutes
+// one that records the queue it was handed, so which queue a replica polls is asserted without
+// standing up a Temporal server.
+type workerFactory func(tc client.Client, taskQueue string, options worker.Options) worker.Worker
+
+// startWorker builds the replica's Temporal worker from cfg — the device entity and its snapshot
+// activity, and the rollout workflow with its worker-hosted activities — on the configured work
+// queue and never on the control-plane queue. Temporal delivers a task to any poller of its queue
+// rather than to one that registered its type, and this binary hosts none of the control-plane
+// types (the agent-bound dispatch activity, the firmware upload's workflow and steps), so a
+// replica on that queue would be handed tasks it must fail as unknown.
+func startWorker(
+	build workerFactory, tc client.Client, cfg config.Config,
+	snapshots temporal.StateSnapshotter, deps rolloutDeps,
+) worker.Worker {
+	w := build(tc, cfg.Temporal.TaskQueue, worker.Options{WorkerStopTimeout: shutdownTimeout})
+	registerDevice(w, snapshots)
+	registerRollout(w, deps)
+	return w
 }
 
 // registerRollout registers the rollout workflow and its worker-hosted activities under their
@@ -230,6 +258,52 @@ func startNotifier(notifier *telemetry.Notifier, ctx context.Context) (run func(
 	}, started
 }
 
+// poolWatcher keeps the eligible-device view current for as long as the worker runs. Watch returns
+// when ctx ends or when the stream cannot be kept, and closes ready once a stream is established.
+// *rollout.PoolView implements it.
+type poolWatcher interface {
+	Watch(ctx context.Context, ready chan<- struct{}) error
+}
+
+// startPoolWatcher runs the eligible-device watcher on g's context and returns only once its
+// change stream is established, so the worker polls its first task with wave resolutions already
+// answered from a maintained view. A stream that cannot be established is a startup failure: a
+// worker whose view nobody maintains cannot tell, and a stale pool would silently change which
+// devices a wave targets. A stream lost after startup ends the run through g, which is the same
+// posture: stop rather than answer from a view with no freshness guarantee.
+func startPoolWatcher(ctx context.Context, g *errgroup.Group, watcher poolWatcher) error {
+	ready := make(chan struct{})
+	ended := make(chan error, 1)
+	g.Go(func() error {
+		err := watcher.Watch(ctx, ready)
+		ended <- err
+		return err
+	})
+	select {
+	case <-ready:
+		return nil
+	case err := <-ended:
+		// A stream lost in the same instant it was established is a running failure rather than
+		// a startup one, so establishment wins when both signals are ready.
+		select {
+		case <-ready:
+			return nil
+		default:
+			return err
+		}
+	}
+}
+
+// probeServer returns the liveness/readiness listener the configuration names: it serves the
+// probe handler on the configured health address, so every replica answers its probes where its
+// configuration says rather than on an address this process chose.
+func probeServer(cfg config.Config, checks ...health.Check) *http.Server {
+	return &http.Server{
+		Addr:    cfg.Observability.HealthAddr,
+		Handler: health.NewHandler(checks...),
+	}
+}
+
 // run serves the liveness/readiness probes on the configured health address and runs the
 // Temporal worker hosting DeviceWorkflow and the rollout workflow on the configured task queue
 // until ctx is cancelled. The namespace's custom search attributes are registered before the first
@@ -283,23 +357,26 @@ func run(ctx context.Context, cfg config.Config) error {
 	)
 
 	// The worker keeps no replica-local state, so any replica may execute any workflow or
-	// activity task and replicas can come and go without coordinating.
-	w := worker.New(tc, cfg.Temporal.TaskQueue, worker.Options{WorkerStopTimeout: shutdownTimeout})
-	registerDevice(w, devices.NewSnapshotStore(db))
-	registerRollout(w, newRolloutDeps(
-		db, signaler, temporal.NewDeviceStates(tc), rolloutHealthSettings(cfg.Rollout), notifier,
+	// activity task and replicas can come and go without coordinating. Its eligible-device view
+	// is process-local by design (it is derived from devices and rebuildable from it), so it is
+	// the one thing a replica does keep — and the change stream is what keeps it current.
+	view := rollout.NewPoolView(db.Collection("devices"), slog.Default())
+	w := startWorker(worker.New, tc, cfg, devices.NewSnapshotStore(db), newRolloutDepsWithPools(
+		db, view, signaler, temporal.NewDeviceStates(tc), rolloutHealthSettings(cfg.Rollout), notifier,
 	))
 
 	checks, err := health.NewDependencyChecks(cfg.MongoDB.URI, cfg.RabbitMQ.URL, cfg.Temporal.Address)
 	if err != nil {
 		return fmt.Errorf("dependency checks: %w", err)
 	}
-	srv := &http.Server{
-		Addr:    cfg.Observability.HealthAddr,
-		Handler: health.NewHandler(checks...),
-	}
+	srv := probeServer(cfg, checks...)
 
 	g, gctx := errgroup.WithContext(ctx)
+	// The view's stream is established before the worker polls its first task, so no wave
+	// resolution is ever answered from a view nobody is maintaining.
+	if err := startPoolWatcher(gctx, g, view); err != nil {
+		return err
+	}
 	// The publisher is started first and the worker waits for its loop to be running before it
 	// polls, so a rollback's first announcement finds a publisher rather than racing its startup.
 	notifierRun, notifierReady := startNotifier(notifier, gctx)

@@ -2,9 +2,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -13,6 +16,8 @@ import (
 	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/api/operatorservice/v1"
 	"go.temporal.io/sdk/activity"
+	temporalclient "go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/worker"
 	"go.temporal.io/sdk/workflow"
 	"google.golang.org/grpc"
 
@@ -607,4 +612,219 @@ func TestRolloutHealthSettings(t *testing.T) {
 	if got != want {
 		t.Errorf("health settings = %+v, want %+v", got, want)
 	}
+}
+
+// reachableCheck is a dependency probe that always passes: the readiness answer proves the checks
+// a replica's probe listener was built with reached its handler, and that a replica whose
+// dependencies are reachable reports ready.
+type reachableCheck struct {
+	name string
+}
+
+// Name implements health.Check.
+func (c reachableCheck) Name() string { return c.name }
+
+// Check implements health.Check.
+func (c reachableCheck) Check(context.Context) error { return nil }
+
+// probeReport is the probe handler's JSON body: the status the endpoint reports and, for
+// readiness, one result per dependency.
+type probeReport struct {
+	Status string                `json:"status"`
+	Checks map[string]probeCheck `json:"checks"`
+}
+
+// probeCheck is one dependency's readiness result as the report renders it.
+type probeCheck struct {
+	Status  string `json:"status"`
+	Summary string `json:"summary"`
+}
+
+// TestReplicaProbesAnswerOnConfiguredHealthAddr backs "temporal-worker | Probes answer per
+// replica": the listener a replica serves its probes on is the configured health address, and it
+// answers there — liveness, and readiness over the dependency checks the replica wired. The
+// address is a free loopback address the test reserved rather than a fixed port, so a probe
+// server built from any other (for example the default) address cannot satisfy the test.
+func TestReplicaProbesAnswerOnConfiguredHealthAddr(t *testing.T) {
+	t.Parallel()
+
+	addr := freeLoopbackAddr(t)
+	cfg := config.Defaults()
+	cfg.Observability.HealthAddr = addr
+
+	srv := probeServer(cfg, reachableCheck{name: "mongodb"})
+	if srv.Addr != addr {
+		t.Fatalf("probe listener address = %q, want the configured %q", srv.Addr, addr)
+	}
+	if srv.Addr == config.Defaults().Observability.HealthAddr {
+		t.Fatalf("probe listener address = %q, want the configured address, not the default", srv.Addr)
+	}
+
+	served := make(chan error, 1)
+	go func() { served <- srv.ListenAndServe() }()
+	t.Cleanup(func() {
+		if err := srv.Close(); err != nil {
+			t.Errorf("close probe server: %v", err)
+		}
+		if err := <-served; err != nil && !errors.Is(err, http.ErrServerClosed) {
+			t.Errorf("probe server stopped with %v, want a clean shutdown", err)
+		}
+	})
+
+	tests := []struct {
+		name     string
+		path     string
+		wantCode int
+		want     probeReport
+	}{
+		{
+			name:     "liveness answers on the configured address",
+			path:     "/healthz",
+			wantCode: http.StatusOK,
+			want:     probeReport{Status: "ok"},
+		},
+		{
+			name:     "readiness answers on the configured address with its dependencies reachable",
+			path:     "/readyz",
+			wantCode: http.StatusOK,
+			want: probeReport{
+				Status: "ready",
+				Checks: map[string]probeCheck{"mongodb": {Status: "ok"}},
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := getEventually(t, "http://"+addr+tc.path)
+			t.Cleanup(func() {
+				if err := resp.Body.Close(); err != nil {
+					t.Errorf("close %s response body: %v", tc.path, err)
+				}
+			})
+
+			if resp.StatusCode != tc.wantCode {
+				t.Errorf("GET %s status = %d, want %d on the configured address",
+					tc.path, resp.StatusCode, tc.wantCode)
+			}
+			var got probeReport
+			if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+				t.Fatalf("decode %s report: %v", tc.path, err)
+			}
+			if diff := cmp.Diff(tc.want, got); diff != "" {
+				t.Errorf("%s report mismatch (-want +got):\n%s", tc.path, diff)
+			}
+		})
+	}
+}
+
+// recordingWorker is a worker.Worker double: it records the registrations the binary lands on the
+// poller it built, so a test can assert what a replica runs without a Temporal server. The nil
+// embedded Worker panics if anything but registration is called on it.
+type recordingWorker struct {
+	worker.Worker
+	workflows  map[string]any
+	activities map[string]any
+}
+
+func newRecordingWorker() *recordingWorker {
+	return &recordingWorker{workflows: map[string]any{}, activities: map[string]any{}}
+}
+
+func (w *recordingWorker) RegisterWorkflowWithOptions(fn any, options workflow.RegisterOptions) {
+	w.workflows[options.Name] = fn
+}
+
+func (w *recordingWorker) RegisterActivityWithOptions(a any, options activity.RegisterOptions) {
+	w.activities[options.Name] = a
+}
+
+// TestWorkerPollsOnlyTheConfiguredWorkQueue backs "temporal-worker | The worker never polls the
+// control-plane queue": replicas of the worker binary start on the configured work queue and never
+// on the control-plane queue. Temporal delivers a task to whichever poller of a queue is available
+// rather than to one that registered its type, and this binary hosts none of the control-plane
+// types (the agent-bound dispatch activity, the firmware upload's workflow and steps), so a
+// replica on that queue would be handed tasks it must fail as unknown. The two queues carry
+// distinct names here, so the assertion says which configuration field a replica reads rather than
+// agreeing with whichever one it happens to pick.
+func TestWorkerPollsOnlyTheConfiguredWorkQueue(t *testing.T) {
+	t.Parallel()
+
+	cfg := config.Defaults()
+	cfg.Temporal.TaskQueue = "work"
+	cfg.Temporal.DispatchTaskQueue = "dispatch"
+
+	for _, replica := range []string{"replica a", "replica b"} {
+		t.Run(replica, func(t *testing.T) {
+			t.Parallel()
+
+			built := newRecordingWorker()
+			var polled string
+			build := func(_ temporalclient.Client, queue string, options worker.Options) worker.Worker {
+				polled = queue
+				if options.WorkerStopTimeout <= 0 {
+					t.Errorf("WorkerStopTimeout = %v, want a bounded stop so shutdown drains",
+						options.WorkerStopTimeout)
+				}
+				return built
+			}
+			deps := &fakeRolloutDeps{}
+
+			startWorker(build, nil, cfg, &fakeSnapshotStore{}, rolloutDeps{
+				firmware: deps, versions: deps, targets: deps, rollouts: deps, waves: deps,
+				inventory: deps, commands: deps, devices: deps, health: deps, notifier: deps,
+			})
+
+			if polled != cfg.Temporal.TaskQueue {
+				t.Errorf("polled queue = %q, want the configured work queue %q",
+					polled, cfg.Temporal.TaskQueue)
+			}
+			if polled == cfg.Temporal.DispatchTaskQueue {
+				t.Errorf("polled queue = control-plane queue %q, want the worker off it", polled)
+			}
+			// The registrations land on the poller the factory built, so the worker a replica
+			// runs hosts the work queue's families; TestWorkerRegistersTheWholeWorkQueue pins
+			// the whole set.
+			for _, name := range []string{temporal.DeviceWorkflowName, temporal.RolloutWorkflowName} {
+				if _, ok := built.workflows[name]; !ok {
+					t.Errorf("workflow %q is not registered on the built worker", name)
+				}
+			}
+		})
+	}
+}
+
+// freeLoopbackAddr reserves a loopback address by asking the OS for one and releasing it, so a
+// test configures an address nothing else holds and never a fixed port.
+func freeLoopbackAddr(t *testing.T) string {
+	t.Helper()
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve loopback address: %v", err)
+	}
+	addr := lis.Addr().String()
+	if err := lis.Close(); err != nil {
+		t.Fatalf("release loopback address: %v", err)
+	}
+	return addr
+}
+
+// getEventually polls url until the listener answers or the budget runs out: the server binds in
+// its own goroutine, so a request may race the bind.
+func getEventually(t *testing.T, url string) *http.Response {
+	t.Helper()
+
+	client := &http.Client{Timeout: time.Second}
+	deadline := time.Now().Add(5 * time.Second)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		resp, err := client.Get(url)
+		if err == nil {
+			return resp
+		}
+		lastErr = err
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("GET %s: %v", url, lastErr)
+	return nil
 }

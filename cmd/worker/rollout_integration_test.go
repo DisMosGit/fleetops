@@ -857,7 +857,7 @@ func startSmokeWorker(
 		t.Fatalf("bootstrap namespace: %v", err)
 	}
 
-	deps := newRolloutDeps(db, commands, devices, rolloutHealthSettings(cfg.Rollout), notifier)
+	deps := newRolloutDepsWithPools(db, nil, commands, devices, rolloutHealthSettings(cfg.Rollout), notifier)
 	deps.updateOptions = []temporal.UpdateDeviceOption{
 		temporal.WithUpdatePollInterval(smokeUpdatePollInterval),
 	}

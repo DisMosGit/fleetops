@@ -65,7 +65,7 @@ func newRestartableWorker(
 	gate *activityGate,
 ) *restartableWorker {
 	t.Helper()
-	deps := newRolloutDeps(db, commands, devices, rolloutHealthSettings(cfg.Rollout), notifier)
+	deps := newRolloutDepsWithPools(db, nil, commands, devices, rolloutHealthSettings(cfg.Rollout), notifier)
 	// The observation interval is shrunk the way the smoke shrinks it: the suite drives the real
 	// update activity, and a device that never reports has to be provable in seconds.
 	deps.updateOptions = []temporal.UpdateDeviceOption{
