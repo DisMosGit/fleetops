@@ -2,10 +2,12 @@ package agent
 
 import (
 	"context"
+	"runtime"
 	"testing"
 	"time"
 
 	agentv1 "github.com/DisMosGit/fleetops/api/proto/agent/v1"
+	"github.com/DisMosGit/fleetops/internal/testexec"
 )
 
 // testFleetOptions returns options with a scripted source and a seeded id nonce.
@@ -133,5 +135,134 @@ func TestFleetRunLifecycle(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("fleet did not stop after ctx cancellation")
+	}
+}
+
+// TestFleetEmitsOnTheConfiguredPeriod asserts the fleet's cadence is a real ticker at the
+// configured period rather than a burst at startup: an operator's dashboards and a rollout's
+// health windows both measure heartbeats that arrive on that cadence.
+func TestFleetEmitsOnTheConfiguredPeriod(t *testing.T) {
+	t.Parallel()
+
+	const period = 40 * time.Millisecond
+	opts := testFleetOptions(t)
+	opts.Period = period
+	fleet, err := NewFleet(1, opts)
+	if err != nil {
+		t.Fatalf("NewFleet: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	out := make(chan *agentv1.Heartbeat, 4)
+	done := make(chan error, 1)
+	go func() { done <- fleet.Run(ctx, out) }()
+
+	arrivals := make([]time.Time, 0, 4)
+	for range 4 {
+		select {
+		case <-out:
+			arrivals = append(arrivals, time.Now())
+		case <-time.After(5 * time.Second):
+			t.Fatal("the fleet emitted no heartbeat on its period")
+		}
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("Run returned %v, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the fleet did not stop after ctx cancellation")
+	}
+
+	for i := 1; i < len(arrivals); i++ {
+		gap := arrivals[i].Sub(arrivals[i-1])
+		// The lower bound is what makes this a cadence rather than a burst; the generous upper
+		// bound keeps a loaded machine from turning the assertion into a flake.
+		if gap < period/2 || gap > period*5 {
+			t.Errorf("heartbeat %d arrived %v after the one before it, want about %v",
+				i, gap, period)
+		}
+	}
+}
+
+// TestFleetScalesAndLeavesNoGoroutines runs the documented fleet sizes, waits until every device
+// has reported, and cancels them: each must stop within the run's wait budget, and the process
+// must be left with no goroutine watching a device. A run that cannot afford a size skips it
+// saying so rather than simulating a smaller fleet than the test claims to verify.
+func TestFleetScalesAndLeavesNoGoroutines(t *testing.T) {
+	// Deliberately not parallel: the goroutine count is only meaningful while no other test is
+	// running its own goroutines.
+
+	tests := []struct {
+		name string
+		size int
+	}{
+		{name: "a hundred devices", size: 100},
+		{name: "a thousand devices", size: 1000},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := testexec.Get(t)
+			cfg.RequireFleetSize(t, tc.size)
+
+			baseline := runtime.NumGoroutine()
+			opts := testFleetOptions(t)
+			fleet, err := NewFleet(tc.size, opts)
+			if err != nil {
+				t.Fatalf("NewFleet(%d): %v", tc.size, err)
+			}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			out := make(chan *agentv1.Heartbeat, tc.size)
+			done := make(chan error, 1)
+			go func() { done <- fleet.Run(ctx, out) }()
+
+			started := time.Now()
+			seen := make(map[string]bool, tc.size)
+			deadline := time.Now().Add(cfg.Wait(30 * time.Second))
+			for len(seen) < tc.size && time.Now().Before(deadline) {
+				select {
+				case hb := <-out:
+					seen[hb.DeviceId] = true
+				case <-time.After(10 * time.Millisecond):
+				}
+			}
+			if len(seen) != tc.size {
+				t.Fatalf("%d of %d devices reported within %v, want every device",
+					len(seen), tc.size, time.Since(started))
+			}
+
+			cancel()
+			stopped := time.Now()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Errorf("Run returned %v, want nil", err)
+				}
+			case <-time.After(cfg.Wait(30 * time.Second)):
+				t.Fatal("the fleet did not stop after ctx cancellation")
+			}
+			t.Logf("%d devices reported within %v and stopped within %v",
+				tc.size, stopped.Sub(started), time.Since(stopped))
+
+			// The goroutines are joined by Run, so the count returns to what it was before the
+			// fleet started. A little slack absorbs the runtime's own bookkeeping goroutines.
+			settle := time.Now().Add(cfg.Wait(5 * time.Second))
+			for {
+				got := runtime.NumGoroutine()
+				if got <= baseline+2 {
+					return
+				}
+				if time.Now().After(settle) {
+					t.Errorf("goroutines after the fleet stopped = %d, want at most %d",
+						got, baseline+2)
+					return
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		})
 	}
 }
