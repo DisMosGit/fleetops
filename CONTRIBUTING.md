@@ -80,6 +80,10 @@ make test-integration   # the suite as a capable machine runs it
 make test-weak          # the same suite configured for a 4 GB / 4 CPU machine
 ```
 
+`make test-weak` also runs one package at a time (`-p 1`). Each package boots its own container
+stack, so Go's default of one package per CPU runs several stacks at once; the weak run trades wall
+clock for the concurrent-container count its budget is about.
+
 A package's integration tests share one container stack — one MongoDB, one RabbitMQ, and one
 Temporal server per package — and isolate themselves from each other by database name, by purging
 the broker queues they use, and by namespace. That is what keeps a package's peak memory from

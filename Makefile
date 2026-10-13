@@ -15,6 +15,13 @@ PROTO_FILES := $(shell find api/proto -name '*.proto' -print)
 # default and the Docker daemon CONTRIBUTING.md lists as a prerequisite. `test-weak` runs the same
 # suite under the weak-host profile: narrower workloads and budgets for a 4 GB / 4 CPU machine,
 # with the same assertions. The variable set is documented in CONTRIBUTING.md.
+#
+# The weak run also executes one package at a time. Go's default is one package per CPU, and each
+# package boots its own container stack, so the default runs several stacks at once — which is what
+# the weak profile's budget is about: measured on this repository's host, four packages in parallel
+# held thirteen containers live and pushed container readiness past the weak profile's startup
+# budget, failing packages for a resource reason rather than for their assertions. Serializing the
+# packages trades wall clock for the concurrent-container count the profile promises.
 INTEGRATION := -tags integration -count=1 -timeout 30m
 
 # Generator toolchain pins: the exact protoc plugin and goimports versions `make proto`
@@ -52,8 +59,8 @@ check: ## Definition of Done: goimports -w . && go vet ./... && golangci-lint ru
 test-integration: ## Run the container-backed suite: go test -tags integration -count=1 -timeout 30m ./...
 	$(GO) test $(INTEGRATION) ./...
 
-test-weak: ## Run the container-backed suite for a 4 GB / 4 CPU machine: FLEETOPS_TEST_PROFILE=weak go test -tags integration -count=1 -timeout 30m ./...
-	FLEETOPS_TEST_PROFILE=weak $(GO) test $(INTEGRATION) ./...
+test-weak: ## Run the container-backed suite for a 4 GB / 4 CPU machine: FLEETOPS_TEST_PROFILE=weak go test -tags integration -count=1 -timeout 30m -p 1 ./...
+	FLEETOPS_TEST_PROFILE=weak $(GO) test $(INTEGRATION) -p 1 ./...
 
 proto: ## Regenerate Go client and server stubs from api/proto: protoc --go_out=... --go-grpc_out=... && goimports -w api/proto
 	@command -v protoc >/dev/null || { echo "make proto: protoc not found (install protoc and its include/ tree)" >&2; exit 1; }
