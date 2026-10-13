@@ -50,23 +50,50 @@ type WaveStateUpdate struct {
 	UnreportedDeviceIDs []string
 }
 
-// Store is the fleet database as a rollout consumes it: the devices a selector's pool holds, the
-// waves that say which of them earlier waves already target, and the rollout and wave records the
-// workflow drives. It has no workflow dependency — every method is a plain, idempotent write or
-// read the workflow calls through an activity.
+// PoolResolver resolves one selector's eligible devices in identity order. Store consumes it: the
+// default reads the devices collection on every resolution, and the worker passes the view its
+// change stream keeps current.
+type PoolResolver interface {
+	// Resolve returns the selector's eligible device ids, ordered by device identity.
+	Resolve(ctx context.Context, sel Selector) ([]string, error)
+}
+
+// queryPoolResolver reads a selector's eligible devices from the devices collection. It is the
+// rollout store's default, and it is what a store built without a view pays on every resolution.
+type queryPoolResolver struct {
+	devices *mongo.Collection
+}
+
+// Resolve implements PoolResolver with one ordered read of devices.
+func (q queryPoolResolver) Resolve(ctx context.Context, sel Selector) ([]string, error) {
+	return readPool(ctx, q.devices, sel)
+}
+
+// Store is the fleet database as a rollout consumes it: the eligible pools a selector's waves
+// draw from, the waves that say which devices earlier waves already target, and the rollout and
+// wave records the workflow drives. It has no workflow dependency — every method is a plain,
+// idempotent write or read the workflow calls through an activity.
 type Store struct {
 	rollouts *mongo.Collection
 	waves    *mongo.Collection
-	devices  *mongo.Collection
+	pools    PoolResolver
 }
 
-// NewStore returns the rollout store over the fleet database's rollouts, waves, and devices
-// collections.
+// NewStore returns the rollout store over the fleet database's rollouts and waves collections,
+// resolving eligible pools by querying devices on every resolution.
 func NewStore(db *mongo.Database) *Store {
+	return NewStoreWithPools(db, queryPoolResolver{devices: db.Collection("devices")})
+}
+
+// NewStoreWithPools returns the rollout store over the fleet database whose wave resolution reads
+// eligible pools from the given resolver, which must be non-nil. The worker passes the
+// change-stream-maintained view, so a wave resolves against a pool the fleet's own writes keep
+// current rather than one re-queried on every resolution.
+func NewStoreWithPools(db *mongo.Database, pools PoolResolver) *Store {
 	return &Store{
 		rollouts: db.Collection("rollouts"),
 		waves:    db.Collection("waves"),
-		devices:  db.Collection("devices"),
+		pools:    pools,
 	}
 }
 
@@ -224,29 +251,11 @@ func (s *Store) wave(ctx context.Context, rolloutID, waveID string) (WaveRecord,
 	return rec, nil
 }
 
-// eligiblePool lists the devices a selector names, ordered by identity. The order is what makes
-// membership reproducible: the same pool and the same shares always resolve to the same target
-// sets, so a re-run of a rollout's arithmetic cannot shuffle a wave's devices.
+// eligiblePool returns the devices a selector names, in identity order, as the store's resolver
+// holds them. A view-backed resolver answers from the maintained view; the default queries
+// devices. Either way an empty pool is an empty answer rather than an error.
 func (s *Store) eligiblePool(ctx context.Context, region, model string) ([]string, error) {
-	cursor, err := s.devices.Find(ctx,
-		bson.D{{Key: "region", Value: region}, {Key: "model", Value: model}},
-		options.Find().
-			SetSort(bson.D{{Key: "_id", Value: 1}}).
-			SetProjection(bson.D{{Key: "_id", Value: 1}}))
-	if err != nil {
-		return nil, fmt.Errorf("query devices in %s/%s: %w", region, model, err)
-	}
-	var docs []struct {
-		ID string `bson:"_id"`
-	}
-	if err := cursor.All(ctx, &docs); err != nil {
-		return nil, fmt.Errorf("read devices in %s/%s: %w", region, model, err)
-	}
-	ids := make([]string, 0, len(docs))
-	for _, doc := range docs {
-		ids = append(ids, doc.ID)
-	}
-	return ids, nil
+	return s.pools.Resolve(ctx, Selector{Region: region, Model: model})
 }
 
 // targetedDevices returns the devices the rollout's other waves already target, so a wave's own
