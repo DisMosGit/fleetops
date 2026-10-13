@@ -17,7 +17,7 @@ import (
 func TestSchema(t *testing.T) {
 	t.Parallel()
 
-	db := Start(t).DB
+	db := For(t).DB
 	ctx := context.Background()
 
 	t.Run("fleet collections exist", func(t *testing.T) {
@@ -232,4 +232,71 @@ func listIndexes(t *testing.T, coll *mongo.Collection) []bson.M {
 		t.Fatalf("decode indexes: %v", err)
 	}
 	return specs
+}
+
+// TestTelemetryIsAPlainCollectionWithUniqueIDs pins the telemetry collection's actual contract
+// rather than leaving it incidental: the collection is plain — a MongoDB time-series collection
+// carries no unique `_id` index and accepts duplicate `_id` rows — it expires its documents
+// through the TTL index the bootstrap builds, and it refuses a second document under an `_id` it
+// already holds, which is the storage-layer guarantee the idempotent ingestion no-op rests on.
+//
+// `openspec/specs/mongo-data-model/spec.md` says "time-series collection"; the implementation is a
+// plain collection on purpose, and this test is where that divergence is asserted.
+func TestTelemetryIsAPlainCollectionWithUniqueIDs(t *testing.T) {
+	t.Parallel()
+	db := For(t).DB
+	ctx := context.Background()
+
+	cursor, err := db.ListCollections(ctx, bson.D{{Key: "name", Value: "telemetry"}})
+	if err != nil {
+		t.Fatalf("list the telemetry collection: %v", err)
+	}
+	var infos []struct {
+		Name string `bson:"name"`
+		Type string `bson:"type"`
+	}
+	if err := cursor.All(ctx, &infos); err != nil {
+		t.Fatalf("decode the telemetry collection's description: %v", err)
+	}
+	if len(infos) != 1 {
+		t.Fatalf("the server reports %d collections named telemetry, want 1", len(infos))
+	}
+	if infos[0].Type != "collection" {
+		t.Errorf("telemetry is a %q, want a plain collection", infos[0].Type)
+	}
+
+	ttl := false
+	for _, spec := range listIndexes(t, db.Collection("telemetry")) {
+		if spec["name"] != "idx_ts_ttl" {
+			continue
+		}
+		if _, ok := spec["expireAfterSeconds"]; !ok {
+			t.Error("idx_ts_ttl carries no expireAfterSeconds")
+		}
+		ttl = true
+	}
+	if !ttl {
+		t.Error("idx_ts_ttl is missing: the collection has no retention")
+	}
+
+	sample := func() bson.D {
+		return bson.D{
+			{Key: "_id", Value: "evt-unique"},
+			{Key: "ts", Value: time.Now().UTC()},
+			{Key: "meta", Value: bson.D{
+				{Key: "device_id", Value: "dev-unique"},
+				{Key: "region", Value: "eu-west"},
+				{Key: "model", Value: "v3"},
+			}},
+			{Key: "cpu", Value: 0.2},
+			{Key: "mem", Value: 0.3},
+			{Key: "health", Value: 0.95},
+		}
+	}
+	if _, err := db.Collection("telemetry").InsertOne(ctx, sample()); err != nil {
+		t.Fatalf("insert the first event: %v", err)
+	}
+	if _, err := db.Collection("telemetry").InsertOne(ctx, sample()); !mongo.IsDuplicateKeyError(err) {
+		t.Errorf("inserting a duplicate event id returned %v, want a duplicate-key error", err)
+	}
 }
