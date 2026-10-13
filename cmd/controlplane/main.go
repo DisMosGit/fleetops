@@ -200,6 +200,28 @@ func rolloutSettings(cfg config.Rollout) (temporal.RolloutSettings, error) {
 	return settings, nil
 }
 
+// deviceSettings maps the configured snapshot cadence, offline threshold, and dispatch queue onto
+// the entity settings every new device workflow run chain is seeded with. Each run chain captures
+// these at start and carries them in its state, so the cadence a device snapshots at and the
+// silence after which it reports itself offline are the configured ones for the whole run chain.
+func deviceSettings(cfg config.Config) temporal.DeviceSettings {
+	return temporal.DeviceSettings{
+		SnapshotInterval:  cfg.Snapshots.Interval.Duration,
+		OfflineThreshold:  cfg.Liveness.OfflineThreshold.Duration,
+		DispatchTaskQueue: cfg.Temporal.DispatchTaskQueue,
+	}
+}
+
+// probeServer returns the liveness/readiness listener the configuration names: it serves the
+// probe handler on the configured health address, and nothing else — the deployment's probes are
+// answered where its configuration says, never on a default this process chose.
+func probeServer(cfg config.Config, checks ...health.Check) *http.Server {
+	return &http.Server{
+		Addr:    cfg.Observability.HealthAddr,
+		Handler: health.NewHandler(checks...),
+	}
+}
+
 // rolloutClient is the slice of the Temporal client the rollout surface needs: starting a
 // workflow, reading one's state query, and signalling one. *temporalclient.Client satisfies it,
 // and a test hand-writes a double.
@@ -354,10 +376,7 @@ func run(ctx context.Context, cfg config.Config, httpAddr string) error {
 	if err != nil {
 		return fmt.Errorf("dependency checks: %w", err)
 	}
-	srv := &http.Server{
-		Addr:    cfg.Observability.HealthAddr,
-		Handler: health.NewHandler(checks...),
-	}
+	srv := probeServer(cfg, checks...)
 	metricsSrv := &http.Server{
 		Addr:    cfg.Observability.MetricsAddr,
 		Handler: metricsHandler(metrics),
@@ -380,11 +399,7 @@ func run(ctx context.Context, cfg config.Config, httpAddr string) error {
 	// and dispatch queue; all three are captured at chain start and carried with the entity
 	// state. The signaler starts workflows on the work queue — the dispatch queue is only
 	// where this process later receives their commands.
-	signaler := temporal.NewSignaler(tc, cfg.Temporal.TaskQueue, temporal.DeviceSettings{
-		SnapshotInterval:  cfg.Snapshots.Interval.Duration,
-		OfflineThreshold:  cfg.Liveness.OfflineThreshold.Duration,
-		DispatchTaskQueue: cfg.Temporal.DispatchTaskQueue,
-	})
+	signaler := temporal.NewSignaler(tc, cfg.Temporal.TaskQueue, deviceSettings(cfg))
 	hub := agentserver.NewHub(events.sink, log)
 	grpcServer := grpc.NewServer(agentserver.ServerOptions(log)...)
 	agentv1.RegisterAgentServiceServer(grpcServer, agentserver.NewServer(hub, registry, signaler, firmwareStore, log))
