@@ -24,7 +24,16 @@
 // a rollout has begun compensating. Every step is idempotent — a restore is addressed by a command
 // id derived from the rollback and the device, the reconciliation writes only a version a device
 // reported and only where the record disagrees, and an announcement repeats its event identity — so
-// an interrupted rollback is safe to continue. The FirmwareWorkflow is the stage still deferred.
+// an interrupted rollback is safe to continue.
+//
+// FirmwareWorkflow owns one firmware upload end to end: it is addressed by the version it stores
+// (firmware-upload-<version>), so a retried upload reaches the execution that already owns the
+// version instead of starting a second one. It validates the upload's target models, claims the
+// version's record, streams the binary the endpoint spooled into GridFS as its checksum is
+// computed, and records each state transition on the firmware document — concluding available, or
+// failed with an operator-safe reason after removing what it stored — while its state query
+// answers what the upload has reached. It and its activities run in the control plane, beside the
+// request body and the store binding they own.
 //
 // The activities run beside their side effects: dispatch-command (in the control plane, beside
 // the agent hub) and snapshot-device-state plus the rollout's fleet-database, per-device update,

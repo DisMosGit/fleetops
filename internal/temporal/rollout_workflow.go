@@ -432,11 +432,7 @@ func downgradeWave(ctx workflow.Context, state *rolloutState, position int) erro
 			// The activity's retries are exhausted, so the device's restore could not be
 			// attempted or its outcome determined. It is recorded as unrestored with the
 			// failure as its reason rather than passed over.
-			result = DeviceRestore{
-				DeviceID: step.Devices[i],
-				Outcome:  RestoreUnavailable,
-				Detail:   fmt.Sprintf("restore device %s: %v", step.Devices[i], err),
-			}
+			result = deviceRestoreFailure(step.Devices[i], err)
 			workflow.GetLogger(ctx).Error("restore device failed",
 				"rollout_id", state.RolloutID, "device_id", step.Devices[i], "error", err)
 		}
@@ -444,6 +440,17 @@ func downgradeWave(ctx workflow.Context, state *rolloutState, position int) erro
 	}
 	state.Rollback.recordDowngrade(position, outcomes)
 	return nil
+}
+
+// deviceRestoreFailure is the outcome recorded for one device whose restore activity exhausted its
+// retries: the restore could not be attempted or its outcome could not be determined, so the device
+// is unavailable — carrying which device it is and the failure that left it unrestored.
+func deviceRestoreFailure(deviceID string, err error) DeviceRestore {
+	return DeviceRestore{
+		DeviceID: deviceID,
+		Outcome:  RestoreUnavailable,
+		Detail:   fmt.Sprintf("restore device %s: %v", deviceID, err),
+	}
 }
 
 // reconcileInventory reconciles the fleet's recorded firmware version of every device the rollback
