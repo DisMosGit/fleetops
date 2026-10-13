@@ -81,9 +81,9 @@ Engineering rules for this layout live in [AGENTS.md](AGENTS.md).
 
 | Stage | Scope | Status |
 |-------|-------|--------|
-| 1 | Protobuf contracts, service skeletons, agent emulator with heartbeats (no Temporal), compose → k3d manifests | Not started |
-| 2 | Temporal: `DeviceWorkflow` entity, `RolloutWorkflow` waves + health window + saga rollback, workflow tests | Not started |
-| 3 | gRPC bidi streams, RabbitMQ telemetry fan-out, idempotent consumer, DLQ | Not started |
+| 1 | Protobuf contracts, service skeletons, agent emulator with heartbeats (no Temporal), k3d manifests | In progress |
+| 2 | Temporal: `DeviceWorkflow` entity, `RolloutWorkflow` waves + health window + saga rollback, workflow tests | Done |
+| 3 | gRPC bidi streams, RabbitMQ telemetry fan-out, idempotent consumer, DLQ | Done |
 | 4 | OTel instrumentation, Prometheus metrics, Grafana dashboard, Temporal UI in the stack | Not started |
 | 5 | React UI (devices list, rollout page, approve/pause), README refresh + demo GIF | Not started |
 
