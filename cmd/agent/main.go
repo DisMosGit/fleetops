@@ -96,6 +96,10 @@ func run(ctx context.Context, cfg config.Config) error {
 	if err != nil {
 		return fmt.Errorf("firmware downloader: %w", err)
 	}
+	fetcher, err := newFetcher(cfg.Simulation.Faults, downloader, rand.NewSource(seed))
+	if err != nil {
+		return fmt.Errorf("fault fetcher: %w", err)
+	}
 	applier, err := agent.NewApplier(
 		cfg.Simulation.ApplyDelay.Duration,
 		cfg.Simulation.ApplySuccessRate,
@@ -108,8 +112,8 @@ func run(ctx context.Context, cfg config.Config) error {
 	// the handler, and the handler reports update status through the client. The relay
 	// breaks that construction cycle and is bound once the client exists.
 	relay := &agent.StatusRelay{}
-	handler := agent.NewUpdateHandler(downloader, applier, fleet,
-		agent.NewUpdateReporter(relay, svc), slog.Default())
+	handler := agent.NewUpdateHandlerWithRetry(fetcher, applier, fleet,
+		agent.NewUpdateReporter(relay, svc), fetchRetry(cfg.Simulation.Faults), slog.Default())
 	client, err := agent.NewClient(svc, agent.Options{
 		Devices: fleet.Identities(),
 		Handler: handler,
@@ -131,4 +135,32 @@ func run(ctx context.Context, cfg config.Config) error {
 	}
 	slog.Info("emulator stopped")
 	return nil
+}
+
+// newFetcher returns the fetcher the update path downloads through: base itself when the
+// configuration injects no fault, and base decorated with the seeded injector when it does. A
+// configuration the injector cannot honour — a kind it does not know, or a stall with no stall
+// duration — is refused here, so a misconfigured emulator fails at startup rather than on the
+// first download.
+func newFetcher(
+	faults config.Faults, base agent.FirmwareFetcher, src rand.Source,
+) (agent.FirmwareFetcher, error) {
+	if !faults.Enabled() {
+		return base, nil
+	}
+	kinds := make([]agent.FaultKind, 0, len(faults.Kinds))
+	for _, kind := range faults.Kinds {
+		kinds = append(kinds, agent.FaultKind(kind))
+	}
+	return agent.NewFaultFetcher(base, agent.FaultConfig{
+		Share:         faults.Share,
+		Kinds:         kinds,
+		StallDuration: faults.StallDuration.Duration,
+	}, src)
+}
+
+// fetchRetry maps the configured fault settings onto the update path's retry budget: the attempts
+// one update command may make and the cap on the wait between them.
+func fetchRetry(faults config.Faults) agent.FetchRetry {
+	return agent.FetchRetry{Attempts: faults.Attempts, Max: faults.BackoffCap.Duration}
 }
