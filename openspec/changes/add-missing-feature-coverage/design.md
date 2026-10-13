@@ -43,6 +43,25 @@ See `proposal.md` — Why. The constraints that shape this design, verified agai
   whole package run is 1.1 s. The two fleet sizes are the emulator's scale story and they cost
   almost nothing, which is why both stay in the suite under the weak-host profile.
 
+**The shared stack's measured effect (task 2.5).** Both numbers are the same host, the same
+packages, and the same assertions; the "before" is the run taken before the per-package stacks
+landed, and the peak is the highest `docker stats` total sampled every three seconds during the run
+(`/tmp/stats_worker.log` before, `/tmp/samples-worker.log` and `/tmp/samples-telemetry.log` after):
+
+- `cmd/worker`: 519.4 s and 581.9 MiB peak across 5 containers before; **473.3 s and 557.1 MiB peak
+  across 5 containers** after. Eight restart worlds that each booted four containers now share one
+  stack, and the smoke no longer starts a Temporal dev-server subprocess.
+- `internal/telemetry`: the parallel per-test shape could hold up to nine Mongo and six RabbitMQ
+  containers live at once before; after, the package **completes in 218.5 s with a 769.4 MiB peak
+  across 6 containers** — the shared stack plus the two private brokers the two conflicting
+  declarations genuinely need. Runtime is not comparable to a "before" number: no wall clock was
+  recorded for the per-test shape.
+
+The `cmd/worker` peak barely moved because its stacks were already sequential — one test's four
+containers at a time. What the shared stack buys there is container churn and startup time, not peak
+memory; the telemetry package is where the peak itself drops, because its tests ran in parallel and
+each started its own stack.
+
 The scope of this change was widened, deliberately and by explicit decision, to implement the two
 requirements found entirely absent (the change-stream-maintained pool and `FirmwareWorkflow`) rather
 than only recording them. The design below treats that as a hard constraint and sequences the test
