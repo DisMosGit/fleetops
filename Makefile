@@ -11,6 +11,12 @@ export PATH := $(shell go env GOPATH)/bin:$(PATH)
 GO ?= go
 PROTO_FILES := $(shell find api/proto -name '*.proto' -print)
 
+# The integration suite boots real containers, so it needs a longer per-package timeout than the
+# default and the Docker daemon CONTRIBUTING.md lists as a prerequisite. `test-weak` runs the same
+# suite under the weak-host profile: narrower workloads and budgets for a 4 GB / 4 CPU machine,
+# with the same assertions. The variable set is documented in CONTRIBUTING.md.
+INTEGRATION := -tags integration -count=1 -timeout 30m
+
 # Generator toolchain pins: the exact protoc plugin and goimports versions `make proto`
 # compiles and formats with, so the same contracts produce byte-identical stubs on every
 # machine and never fight the goimports pass in the Definition of Done. Bump a pin here and
@@ -19,7 +25,7 @@ PROTOC_GEN_GO_VERSION := v1.36.12
 PROTOC_GEN_GO_GRPC_VERSION := v1.6.2
 GOIMPORTS_VERSION := v0.50.0
 
-.PHONY: help build vet lint test check proto proto-tools up down
+.PHONY: help build vet lint test check test-integration test-weak proto proto-tools up down
 
 help: ## Show this help: every target with its documented command
 	@grep -E '^[a-zA-Z0-9_-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "}; {printf "  %-8s %s\n", $$1, $$2}'
@@ -42,6 +48,12 @@ check: ## Definition of Done: goimports -w . && go vet ./... && golangci-lint ru
 	$(GO) vet ./...
 	golangci-lint run
 	$(GO) test -race -count=1 ./...
+
+test-integration: ## Run the container-backed suite: go test -tags integration -count=1 -timeout 30m ./...
+	$(GO) test $(INTEGRATION) ./...
+
+test-weak: ## Run the container-backed suite for a 4 GB / 4 CPU machine: FLEETOPS_TEST_PROFILE=weak go test -tags integration -count=1 -timeout 30m ./...
+	FLEETOPS_TEST_PROFILE=weak $(GO) test $(INTEGRATION) ./...
 
 proto: ## Regenerate Go client and server stubs from api/proto: protoc --go_out=... --go-grpc_out=... && goimports -w api/proto
 	@command -v protoc >/dev/null || { echo "make proto: protoc not found (install protoc and its include/ tree)" >&2; exit 1; }
