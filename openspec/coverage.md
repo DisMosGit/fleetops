@@ -238,7 +238,7 @@ test is not declared in the file the entry names.
 | message-broker-topology | Retry preserves the event | TestForwardMessage | internal/telemetry/envelope_test.go |
 | message-broker-topology | Retry attempts are bounded | TestConsumerRetriesThenDeadLetters | internal/telemetry/consumer_integration_test.go |
 | message-broker-topology | Exhausted attempts end in the dead-letter queue | TestConsumerRetriesThenDeadLetters | internal/telemetry/consumer_integration_test.go |
-| message-broker-topology | Undeliverable failure does not vanish | TestConsumerRejectsWhenTheRetryRepublishIsRefused | internal/telemetry/consumer_test.go |
+| message-broker-topology | Undeliverable failure does not vanish | TestTopologyAgainstBroker | internal/telemetry/topology_integration_test.go |
 | message-broker-topology | Dead letters wait for an operator | TestTopologyAgainstBroker | internal/telemetry/topology_integration_test.go |
 | message-broker-topology | Declaration is repeatable | TestTopologyAgainstBroker | internal/telemetry/topology_integration_test.go |
 | message-broker-topology | Conflicting declaration fails loudly | TestTopologyDeclarationConflictFailsLoudly | internal/telemetry/topology_integration_test.go |
@@ -290,7 +290,7 @@ test is not declared in the file the entry names.
 | rollout-api | A start request begins a rollout | TestHandlerStart | internal/rolloutapi/handler_test.go |
 | rollout-api | An incomplete request is rejected | TestHandlerStart | internal/rolloutapi/handler_test.go |
 | rollout-api | A running rollout reports where it stands | TestRolloutWorkflowAnswersTheStateQuery | internal/temporal/rollout_workflow_test.go |
-| rollout-api | A concluded rollout reports why it ended | TestRolloutGateRollsBackAndLeavesPromotedWavesAlone | internal/temporal/rollout_gate_test.go |
+| rollout-api | A concluded rollout reports why it ended | TestHandlerState | internal/rolloutapi/handler_test.go |
 | rollout-api | An unknown rollout is not found | TestHandlerState | internal/rolloutapi/handler_test.go |
 | rollout-api | An approval is delivered | TestRolloutSmoke | cmd/worker/rollout_integration_test.go |
 | rollout-api | A pause and a resume are delivered | TestRolloutSmoke | cmd/worker/rollout_integration_test.go |
@@ -419,16 +419,197 @@ test is not declared in the file the entry names.
 | functional-requirement-coverage | An added scenario without a test is caught | TestCoverageLedger | internal/speccoverage/speccoverage_test.go |
 | functional-requirement-coverage | A stack-dependent scenario is exempt with its blocker named | TestCheck | internal/speccoverage/speccoverage_test.go |
 | functional-requirement-coverage | An exemption is refused for a scenario a test could verify | TestCheck | internal/speccoverage/speccoverage_test.go |
+| runtime-config | Absent fields take defaults | TestLoad | internal/config/config_test.go |
+| runtime-config | Present fields override defaults | TestLoad | internal/config/config_test.go |
+| runtime-config | Liveness, telemetry, and snapshots sections default | TestLoad | internal/config/config_test.go |
+| runtime-config | The dispatch task queue defaults to its own queue | TestTemporalQueueDefaults | internal/config/config_test.go |
+| runtime-config | No config flag loads defaults only | TestLoadWithoutPathUsesDefaults | internal/config/config_test.go |
+| runtime-config | Named config file is required to exist | TestLoadMissingFile | internal/config/config_test.go |
+| runtime-config | Broker and alerting sections default | TestBrokerAndAlertingDefaults | internal/config/config_test.go |
+| runtime-config | Rollout gating section defaults | TestRolloutDefaults | internal/config/config_test.go |
+| runtime-config | Rollout wave sequence defaults | TestRolloutDefaults | internal/config/config_test.go |
+| runtime-config | A configured wave sequence overrides the default | TestLoad | internal/config/config_test.go |
+| runtime-config | Liveness and telemetry sections default | TestLoad | internal/config/config_test.go |
+| runtime-config | Unknown key is rejected | TestLoad | internal/config/config_test.go |
+| runtime-config | Malformed value is rejected | TestLoad | internal/config/config_test.go |
+| runtime-config | Invalid duration or scale value is rejected | TestValidate | internal/config/validate_test.go |
+| runtime-config | An empty queue name is rejected | TestValidate | internal/config/validate_test.go |
+| runtime-config | Valid partial file passes | TestLoad | internal/config/config_test.go |
+| runtime-config | Invalid broker pipeline value is rejected | TestValidate | internal/config/validate_test.go |
+| runtime-config | Invalid rollout gating value is rejected | TestValidate | internal/config/validate_test.go |
+| runtime-config | Invalid rollout result timeout is rejected | TestValidate | internal/config/validate_test.go |
+| runtime-config | Invalid rollout wave sequence is rejected | TestValidate | internal/config/validate_test.go |
+| runtime-config | Invalid liveness or telemetry value is rejected | TestValidate | internal/config/validate_test.go |
+| runtime-config | Agent emulator scale comes from configuration | TestRunRegistersTheConfiguredFleetSize | cmd/agent/main_test.go |
+| runtime-config | Both queues come from configuration | TestStartWorker | cmd/controlplane/main_test.go |
+| runtime-config | Event pipeline behaviour comes from configuration | TestEventPipelineEndToEnd | cmd/controlplane/pipeline_integration_test.go |
+| runtime-config | Wave health gating comes from configuration | TestGetWaveHealthServesAHandInsertedWave | cmd/controlplane/wavehealth_integration_test.go |
+| runtime-config | Rollout sequence and gate timing come from configuration | TestRolloutSettings | cmd/controlplane/main_test.go |
+| runtime-config | Rollout result waiting comes from configuration | TestRolloutSettings | cmd/controlplane/main_test.go |
+| agent-emulator | Emission is periodic | TestFleetEmitsOnTheConfiguredPeriod | internal/agent/fleet_test.go |
+| broker-observability | Dropped events are counted with a reason | TestPublisherCountsBrokerRefusals | internal/telemetry/publisher_test.go |
+| rollout-workflow | Starting a rollout records it as running | TestRolloutWorkflowDrivesTheSequenceInOrder | internal/temporal/rollout_workflow_test.go |
+| rollout-workflow | One workflow drives a rollout | TestRolloutStarterStart | internal/temporal/rollout_starter_test.go |
+| rollout-workflow | The selector does not move under a running rollout | TestResolutionReadsTheView | internal/rollout/store_view_integration_test.go |
+| rollout-workflow | A concluded rollout is terminal | TestRolloutRestartsAcrossEveryActivity | cmd/worker/rollout_restart_scenarios_integration_test.go |
+| rollout-workflow | Waves run in sequence order | TestRolloutWorkflowDrivesTheSequenceInOrder | internal/temporal/rollout_workflow_test.go |
+| rollout-workflow | Only one wave is in flight | TestRolloutWorkflowDrivesTheSequenceInOrder | internal/temporal/rollout_workflow_test.go |
+| rollout-workflow | Exhausting the sequence completes the rollout | TestRolloutWorkflowDrivesTheSequenceInOrder | internal/temporal/rollout_workflow_test.go |
+| rollout-workflow | Each wave targets its own added share | TestWaveTargets | internal/rollout/wave_test.go |
+| rollout-workflow | A retried resolution converges | TestStore | internal/rollout/store_integration_test.go |
+| rollout-workflow | A share that resolves to no device is recorded and skipped | TestRolloutWorkflowSkipsAWaveThatTargetsNobody | internal/temporal/rollout_workflow_test.go |
+| rollout-workflow | The wave waits for its devices' results | TestRolloutWorkflowUnreportedDeviceStopsTheWait | internal/temporal/rollout_deviceoutcomes_test.go |
+| rollout-workflow | A device that never reports stops the wait | TestRolloutWorkflowUnreportedDeviceStopsTheWait | internal/temporal/rollout_deviceoutcomes_test.go |
+| rollout-workflow | Mixed device outcomes are recorded | TestRolloutWorkflowRecordsPerDeviceOutcomes | internal/temporal/rollout_deviceoutcomes_test.go |
+| rollout-workflow | Redelivery repeats the command id | TestUpdateDeviceActivityRetriesRepeatTheCommandID | internal/temporal/device_update_test.go |
+| rollout-workflow | Incompatible firmware fails the rollout at start | TestRolloutWorkflowCannotStart | internal/temporal/rollout_workflow_test.go |
+| rollout-workflow | A wave that cannot be delivered is not promoted | TestRolloutWorkflowRollsBackOnDispatchFailure | internal/temporal/rollout_workflow_test.go |
+| rollout-workflow | Status transitions are recorded | TestRolloutWorkflowControlSignalsAreIdempotent | internal/temporal/rollout_control_test.go |
+| rollout-workflow | A compensating rollout is recorded while it compensates | TestRollbackPlanRunsAndIsRecorded | internal/temporal/rollback_workflow_test.go |
+| rollout-workflow | A concluded rollback carries what it achieved | TestRolloutSmoke | cmd/worker/rollout_integration_test.go |
+| rollout-workflow | A decided wave carries its measured health | TestRolloutGateDecidesOnTheVerdict | internal/temporal/rollout_gate_test.go |
+| rollout-workflow | A retried write does not regress the record | TestRolloutWorkflowRecordsRetriedWrites | internal/temporal/rollout_workflow_test.go |
+| rollout-workflow | A running rollout reports its position | TestRolloutWorkflowAnswersTheStateQuery | internal/temporal/rollout_workflow_test.go |
+| rollout-workflow | A wave's device outcomes are reported | TestRolloutWorkflowRecordsPerDeviceOutcomes | internal/temporal/rollout_deviceoutcomes_test.go |
+| rollout-workflow | A waiting rollout reports what it waits for | TestRolloutGateHoldsAGatedWaveUntilApproval | internal/temporal/rollout_gate_test.go |
+| rollout-workflow | A compensating rollout answers without waiting for its compensations | TestRollbackReportsItsProgressWithoutWaiting | internal/temporal/rollback_workflow_test.go |
+| rollout-workflow | A concluded rollout reports why | TestRolloutGateRollsBackAndLeavesPromotedWavesAlone | internal/temporal/rollout_gate_test.go |
+| agent-firmware-apply | Shutdown interrupts an in-flight application | TestApplierInterruptsPromptly | internal/agent/apply_test.go |
+| temporal-worker | A workflow added to the work queue cannot be bounced | TestStartWorker | cmd/controlplane/main_test.go |
+| device-registry | Heartbeat from an unregistered device changes nothing | TestUnenrolledHeartbeatNotRouted | internal/agentserver/server_test.go |
+| mongo-data-model | Target models are recorded | TestUploadStepsOnMongo | internal/firmware/upload_steps_integration_test.go |
+| mongo-data-model | A concluded rollback carries what it achieved | TestRollbackPlanRunsAndIsRecorded | internal/temporal/rollback_workflow_test.go |
+| mongo-data-model | A wave records the devices that did not take the update | TestStore | internal/rollout/store_integration_test.go |
+| mongo-data-model | A wave that targets no devices is still a record | TestStore | internal/rollout/store_integration_test.go |
+| mongo-data-model | Wave status reflects the wave's life | TestRolloutWorkflowDrivesTheSequenceInOrder | internal/temporal/rollout_workflow_test.go |
+| mongo-data-model | Old telemetry expires automatically | TestSchema | internal/mongotest/schema_test.go |
+| device-update | The wait survives an attempt that dies | TestRolloutRestartsAfterEveryEffect | cmd/worker/rollout_restart_scenarios_integration_test.go |
+| device-update | A retried attempt repeats the command id | TestUpdateDeviceActivityRetriesRepeatTheCommandID | internal/temporal/device_update_test.go |
+| wave-health-aggregation | Ratio and sample size over the wave's devices | TestEvaluate | internal/wavehealth/wavehealth_test.go |
+| wave-health-aggregation | Only the wave's target devices count | TestEvaluate | internal/wavehealth/wavehealth_test.go |
+| wave-health-aggregation | Redelivered heartbeats are counted once | TestStore | internal/wavehealth/store_integration_test.go |
+| wave-health-aggregation | Samples older than the window age out | TestEvaluate | internal/wavehealth/wavehealth_test.go |
+| wave-health-aggregation | The window never reaches back before the wave started | TestEvaluate | internal/wavehealth/wavehealth_test.go |
+| wave-health-aggregation | The window is reported with the result | TestEvaluate | internal/wavehealth/wavehealth_test.go |
+| wave-health-aggregation | Exactly at the boundary is healthy | TestBoundaryIsInclusive | internal/wavehealth/wavehealth_test.go |
+| wave-health-aggregation | One failing sample across the boundary flips the verdict | TestBoundaryIsInclusive | internal/wavehealth/wavehealth_test.go |
+| wave-health-aggregation | Too few samples cannot be healthy | TestTooFewSamplesCannotBeHealthy | internal/wavehealth/wavehealth_test.go |
+| wave-health-aggregation | A brief dip leaves a healthy wave healthy | TestTransientFailuresDoNotReadAsRegression | internal/wavehealth/wavehealth_test.go |
+| wave-health-aggregation | Sustained degradation crosses the boundary | TestTransientFailuresDoNotReadAsRegression | internal/wavehealth/wavehealth_test.go |
+| wave-health-aggregation | Recovery is visible once the dip ages out | TestTransientFailuresDoNotReadAsRegression | internal/wavehealth/wavehealth_test.go |
+| wave-health-aggregation | A wave without samples is undecided | TestEvaluate | internal/wavehealth/wavehealth_test.go |
+| wave-health-aggregation | A wave without target devices is undecided | TestStore | internal/wavehealth/store_integration_test.go |
+| wave-health-aggregation | An empty window is not a failure | TestEvaluate | internal/wavehealth/wavehealth_test.go |
+| rollback-notification | A rollback is announced before it compensates | TestRollbackPlanRunsAndIsRecorded | internal/temporal/rollback_workflow_test.go |
+| rollback-notification | A rollback is announced when its compensations have run | TestRollbackPlanRunsAndIsRecorded | internal/temporal/rollback_workflow_test.go |
+| rollback-notification | A consumer can narrow to rollback announcements | TestRollbackNotificationsAgainstBroker | internal/telemetry/rollback_notification_integration_test.go |
+| rollback-notification | The step completes only once the broker accepted the event | TestRollbackAnnouncementFailureIsRecordedAgainstItsStep | internal/temporal/rollback_workflow_test.go |
+| device-workflow | Workflow state wins over stored copies | TestRollbackBookkeepingMatchesTheDevices | cmd/worker/rollout_restart_rollback_scenarios_integration_test.go |
+| device-workflow | History stays bounded under sustained load | TestDeviceWorkflowRollingContinuation | internal/temporal/device_workflow_test.go |
+| heartbeat-consumption | In-flight work is bounded | TestConsumerServeBoundsInFlightWorkAndStopsOnLoss | internal/telemetry/consumer_test.go |
+| heartbeat-consumption | Consumer resumes after a broker restart | TestEventPipelineEndToEnd | cmd/controlplane/pipeline_integration_test.go |
+| heartbeat-consumption | Redelivery after reconnect is deduplicated | TestConsumerAcknowledgesDuplicatesWithoutApplying | internal/telemetry/consumer_test.go |
+| heartbeat-event-publication | Unroutable event is reported, not swallowed | TestUnroutablePublishIsReturnedAndCountable | internal/telemetry/publisher_integration_test.go |
+| telemetry-ingest | Heartbeat lands with timestamp and meta | TestWriterIngest | internal/telemetry/writer_integration_test.go |
+| telemetry-ingest | Meta comes from the registered identity | TestWriterIngest | internal/telemetry/writer_integration_test.go |
+| telemetry-ingest | Missing measurement time is not stored | TestWriterRefusesHeartbeatWithoutMeasurementTime | internal/telemetry/writer_test.go |
+| telemetry-ingest | Redelivered event is a no-op | TestWriterIngest | internal/telemetry/writer_integration_test.go |
+| telemetry-ingest | Mixed batch succeeds partially | TestWriterIngest | internal/telemetry/writer_integration_test.go |
+| telemetry-ingest | Steady heartbeats are written in batches | TestWriterIngest | internal/telemetry/writer_integration_test.go |
+| telemetry-ingest | Quiet fleet still persists promptly | TestWriterFlushesOnInterval | internal/telemetry/writer_test.go |
+| telemetry-ingest | Slow database does not grow unbounded memory | TestWriterBackpressureBlocksInsteadOfBuffering | internal/telemetry/writer_test.go |
+| device-liveness | Connected but silent is still marked offline | TestPersistencePathEndToEnd | internal/agentserver/persistence_integration_test.go |
+| device-liveness | Threshold drives detection | TestSweeperPassesStaleCutoff | internal/devices/sweeper_test.go |
+| repo-scaffold | Fresh clone exposes the layout | TestFreshCloneExposesTheLayout | internal/repolayout/layout_test.go |
+| repo-scaffold | No code outside the sanctioned directories | TestNoCodeOutsideSanctionedDirectories | internal/repolayout/layout_test.go |
+| repo-scaffold | Planned paths are not presented as working | TestPlannedPathsAreMarkedNotImplemented | internal/repolayout/layout_test.go |
+| repo-scaffold | Behavior is testable below the entrypoint | TestBehaviorIsTestableBelowTheEntrypoint | internal/repolayout/layout_test.go |
+| repo-scaffold | Definition of Done via the build tool | TestCheckRunsTheDefinitionOfDoneInOrder | internal/repolayout/makefile_test.go |
+| repo-scaffold | Single targets stay single-purpose | TestSingleTargetsRemainSinglePurpose | internal/repolayout/makefile_test.go |
+| repo-scaffold | Usable clone without submodule content | TestWebIsPlaceholderOnly | internal/repolayout/submodule_test.go |
+| repo-scaffold | Submodule registration is explicit | TestFrontendSubmoduleRegistrationIsExplicit | internal/repolayout/submodule_test.go |
+| proto-codegen | Predictable import path | TestContractLayout | internal/protocodegen/contract_test.go |
+| proto-codegen | One package per bounded context | TestContextsAreIndependent | internal/protocodegen/contexts_test.go |
+| proto-codegen | Reproducible across machines | TestRegenerationReproducesCommittedStubs | internal/protocodegen/regen_test.go |
+| proto-codegen | Tools are not runtime dependencies | TestGeneratorPluginsAreBuildOnly | internal/protocodegen/tooling_test.go |
+| proto-codegen | Regenerating the full stub surface | TestRegenerationReproducesCommittedStubs | internal/protocodegen/regen_test.go |
+| proto-codegen | Missing toolchain fails loudly | TestMissingToolchainFailsLoudly | internal/protocodegen/missingtool_test.go |
+| proto-codegen | Regeneration is idempotent | TestRegenerationIsIdempotent | internal/protocodegen/regen_test.go |
+| proto-codegen | Hand edits do not survive | TestHandEditsDoNotSurviveRegeneration | internal/protocodegen/regen_test.go |
+| proto-codegen | Review sees contracts first | TestContractLayout | internal/protocodegen/contract_test.go |
+| test-execution-profiles | The profile comes from the environment | TestGetHonoursTheProcessEnvironment | internal/testexec/profile_test.go |
+| test-execution-profiles | An undocumented variable changes nothing | TestResolveFrom | internal/testexec/profile_test.go |
+| test-execution-profiles | An unconfigured run is today's run | TestResolveFrom | internal/testexec/profile_test.go |
+| test-execution-profiles | A configured run narrows, not widens | TestWeakProfileNarrowsEveryKnob | internal/testexec/profile_test.go |
+| test-execution-profiles | An unaffordable test says so | TestRequireFleetSize | internal/testexec/profile_test.go |
+| test-execution-profiles | The same environment behaves the same on any host | TestResolveIgnoresTheHostShape | internal/testexec/profile_test.go |
+| test-execution-profiles | A resource-shaped run is an explicit choice | TestResolveIgnoresTheHostShape | internal/testexec/profile_test.go |
+| test-execution-profiles | An unknown profile name fails the run | TestMainFailsThePackageOnAnUnusableEnvironment | internal/testexec/profile_test.go |
+| test-execution-profiles | A non-positive size or budget fails the run | TestResolveFrom | internal/testexec/profile_test.go |
+| test-execution-profiles | One stack serves a package's tests | TestSharedGivesEveryTestItsOwnDatabase | internal/mongotest/shared_integration_test.go |
+| test-execution-profiles | Tests stay isolated from each other | TestSharedGivesEveryTestItsOwnDatabase | internal/mongotest/shared_integration_test.go |
+| test-execution-profiles | A stack failure fails the package, not one test | TestMainFailsThePackageWhenAStackCannotStart | internal/testexec/profile_test.go |
+| agent-stream-server | Complete registration is accepted | TestRegistrationAccepted | internal/agentserver/server_test.go |
+| agent-stream-server | Enrolled heartbeats reach the sink unchanged | TestHeartbeatRoutedUnchanged | internal/agentserver/server_test.go |
+| agent-stream-server | Repeated idempotency key is accepted with no second effect | TestRolloutReachesARealAgent | cmd/controlplane/rollout_agent_join_integration_test.go |
+| agent-stream-server | Redelivered heartbeats keep their identity end to end | TestHeartbeatsSignalDeviceWorkflow | internal/agentserver/server_test.go |
+| rollout-durability | The recorded state converges instead of accumulating | TestRolloutRestartsAfterEveryEffect | cmd/worker/rollout_restart_scenarios_integration_test.go |
+| runtime-config | Device workflow cadence comes from configuration | TestDeviceSettingsFromConfiguration | cmd/controlplane/config_wiring_test.go |
+| runtime-config | Probe listener comes from configuration | TestProbeListenerFromConfiguration | cmd/controlplane/config_wiring_test.go |
+| runtime-config | Invalid configuration starts no listener | TestRejectedConfigurationStartsNoListener | cmd/controlplane/config_wiring_test.go |
+| functional-requirement-coverage | A removed behavior fails its backing test | TestRemovedBehaviorFailsItsBackingTest | internal/speccoverage/mutation_test.go |
+| test-execution-profiles | A narrowed run asserts the same behavior | TestNarrowedRunAssertsTheSameBehavior | internal/testexec/narrowing_test.go |
+| temporal-worker | Probes answer per replica | TestReplicaProbesAnswerOnConfiguredHealthAddr | cmd/worker/main_test.go |
+| temporal-worker | The worker never polls the control-plane queue | TestWorkerPollsOnlyTheConfiguredWorkQueue | cmd/worker/main_test.go |
+| agent-emulator | Identity is stable across heartbeats | TestDeviceIdentityIsStableAcrossHeartbeats | internal/agent/identity_test.go |
+| agent-stream-client | A dead connection becomes a reconnect | TestKeepaliveTurnsASilentlyDeadConnectionIntoAReconnect | internal/agent/dial_test.go |
+| agent-control-plane-api | Adding a field keeps old clients working | TestAgentAddingFieldKeepsOldClientsWorking | internal/protocodegen/evolution_test.go |
+| agent-control-plane-api | Adding the field and RPC keeps old clients working | TestAgentAddingFieldAndRPCKeepsOldClientsWorking | internal/protocodegen/evolution_test.go |
+| agent-control-plane-api | Renumbering is rejected | TestRenumberingIsRejected | internal/protocodegen/renumbering_test.go |
+| rollout-health-api | Adding a field keeps old clients working | TestRolloutAddingFieldKeepsOldClientsWorking | internal/protocodegen/evolution_test.go |
+| device-liveness | Returning device goes online | TestWriterMarksReturningDeviceOnline | internal/telemetry/writer_ingest_integration_test.go |
+| device-registry | Firmware change is picked up from a heartbeat | TestWriterHeartbeatRecordsTheReportedFirmware | internal/telemetry/writer_ingest_integration_test.go |
+| heartbeat-consumption | Acknowledgement after the write | TestConsumerAcknowledgesOnlyAfterTheDurableWrite | internal/telemetry/consumer_delivery_integration_test.go |
+| heartbeat-consumption | Each consumer applies the event once | TestTwoConsumersEachApplyTheEventOnce | internal/telemetry/consumer_delivery_integration_test.go |
+| heartbeat-event-publication | Redelivered heartbeats are published with their original identity | TestPublisherRepublishesRedeliveredHeartbeatsWithTheirIdentity | internal/telemetry/publisher_integration_test.go |
+| message-broker-topology | A consumer narrows to one kind of notification | TestTopologyNarrowedNotificationBinding | internal/telemetry/topology_routing_integration_test.go |
+| message-broker-topology | Declaration precedes use | TestTopologyDeclaredBeforeFirstUse | internal/telemetry/topology_restart_integration_test.go |
+| message-broker-topology | Every event family has its own key space | TestTopologyEventFamiliesHaveDisjointKeySpaces | internal/telemetry/topology_routing_integration_test.go |
+| message-broker-topology | Layout survives a broker restart | TestTopologySurvivesBrokerRestartWithWaitingMessages | internal/telemetry/topology_restart_integration_test.go |
+| rollback-notification | A rejected publication is retried | TestNotifierRetriesARejectedPublication | internal/telemetry/notifier_test.go |
+| rollback-notification | A rollout that could not start announces nothing | TestRolloutThatCannotStartRunsNoCompensation | internal/temporal/rollback_saga_coverage_test.go |
+| telemetry-ingest | Heartbeats are queryable by device and time range | TestWriterHeartbeatsAreQueryableByDeviceAndTimeRange | internal/telemetry/writer_ingest_integration_test.go |
+| telemetry-ingest | Redelivery after a control-plane restart | TestWriterRedeliveryAfterRestartStoresOneDocumentPerEvent | internal/telemetry/writer_ingest_integration_test.go |
+| device-downgrade | A resolved failure is recorded for the device alone | TestDowngradeRecordsAResolvedFailureForTheDeviceAlone | internal/temporal/rollback_deviceworld_test.go |
+| firmware-inventory | An unreadable device is never assumed correct | TestReconcileInventoryLeavesAnUnreadableDeviceUnverified | internal/temporal/rollback_deviceworld_test.go |
+| firmware-registry | Resolving a version reads metadata, not payloads | TestMetadataByVersion | internal/firmware/store_test.go |
+| rollback-saga | A rollout that could not start runs no compensation | TestRolloutThatCannotStartRunsNoCompensation | internal/temporal/rollback_saga_coverage_test.go |
+| rollback-saga | Re-running a finished plan changes nothing | TestRerunningAFinishedPlanChangesNothing | internal/temporal/rollback_saga_coverage_test.go |
+| rollout-control | A pause during the dispatch wait is applied | TestRolloutWorkflowPauseDuringTheDispatchWaitIsApplied | internal/temporal/rollout_pause_coverage_test.go |
+| rollout-workflow | A paused rollout reports the pause | TestRolloutWorkflowPausedQueryReportsThePause | internal/temporal/rollout_pause_coverage_test.go |
+| rollout-workflow | Membership is recorded before anything is dispatched | TestRolloutWorkflowRecordsMembershipBeforeDispatch | internal/temporal/rollout_membership_test.go |
+| rollout-api | A repeated start is refused | TestHandlerStartRefusesASecondExecution | internal/rolloutapi/start_refusal_test.go |
+| rollout-api | A rollout that cannot start is still accepted | TestHandlerStartAcceptsARolloutThatCannotStart | internal/rolloutapi/cannot_start_test.go |
+| rollout-search-attributes | Filtering rollouts in the Temporal UI | TestRolloutVisibilityFiltersRolloutRuns | internal/rolloutapi/visibility_integration_test.go |
+| mongo-data-model | Dedup lookup is served by an index | TestDedupLookupIsServedByAnIndex | internal/telemetry/dedup_index_integration_test.go |
+| mongo-data-model | Device identity lookup | TestDeviceIdentityLookup | internal/devices/identity_integration_test.go |
+| mongo-data-model | Domain records never expire | TestDomainRecordsNeverExpire | internal/mongotest/retention_integration_test.go |
+| mongo-data-model | Metadata never holds payloads | TestMetadataNeverHoldsPayload | internal/firmware/metadata_integration_test.go |
+| mongo-data-model | Retention is bounded and configurable in one place | TestLedgerRetentionIsBoundedAndConfigurable | internal/mongotest/retention_integration_test.go |
+| mongo-data-model | Status queries | TestStatusQueriesUseStatusIndexes | internal/mongotest/index_usage_integration_test.go |
+| mongo-data-model | Waves roll up to their rollout | TestWavesRollUpToTheirRollout | internal/rollout/waves_rollup_integration_test.go |
+| device-search-attributes | Filtering devices in the Temporal UI | TestDeviceVisibilityFiltersDeviceRuns | internal/temporal/device_visibility_integration_test.go |
 
 ## Exemptions
 
-Each exemption below falls into one of two categories. **STACK-DEPENDENT**: the scenario's verification needs a running local stack - a live worker binary, several replicas, or the Temporal UI - that the delivery plan has not reached, so the behavior is implemented but unverifiable in this delivery's tests. **RECORDED-NOT-IMPLEMENTED**: the specified behavior this delivery deliberately does not implement, recorded as out of scope in `openspec/changes/add-missing-feature-coverage/proposal.md` under "Recorded but not implemented here"; the exemption is deleted when the owning change implements the behavior and its test.
+Each exemption below falls into one of three categories. **STACK-DEPENDENT**: the scenario's verification needs a running local stack - a live worker binary, several replicas, or the Temporal UI - that the delivery plan has not reached, so the behavior is implemented but unverifiable in this delivery's tests. **RECORDED-NOT-IMPLEMENTED**: the specified behavior this delivery deliberately does not implement, recorded as out of scope in `openspec/changes/add-missing-feature-coverage/proposal.md` under "Recorded but not implemented here"; the exemption is deleted when the owning change implements the behavior and its test. **MEASURED-RUN**: the scenario is a statement about what a whole suite run costs - its wall clock, peak memory, or absence of resource failures - which no Go test can assert about a run that contains it; it is verified by the recorded run the change's tasks name, and the exemption states which run and what it measured.
 
 | Capability | Scenario | Reason | What would verify it |
 | --- | --- | --- | --- |
 | temporal-worker | Two replicas share the load | STACK-DEPENDENT: Needs a running local stack: two live worker replicas polling the same task queue while device workflows run, which this delivery's tests cannot start (they are unit and in-process workflow tests only). Backed behavior, deferred verification. | A worker integration test that starts two replicas against a shared Temporal server, exercises device workflows, and asserts every task ran once and the observable device state matches a single-replica run (for example a cmd/worker test running two replicas). |
 | temporal-worker | Replica loss changes nothing observable | STACK-DEPENDENT: Needs a running local stack: several live worker replicas, one of which is stopped while workflows are active, so the surviving replicas' continuation cannot be reproduced in-process. | A worker integration test that starts two replicas, kills one mid-execution, and asserts the remaining replica keeps the device workflows running with no snapshot or state change lost. |
 | temporal-worker | Graceful shutdown | STACK-DEPENDENT: The live-drain half, SIGTERM arriving while tasks execute and in-flight work then finishing inside the shutdown timeout, needs a live worker binary and a running Temporal server; no in-process test can produce the signal against executing tasks. | A worker integration test that starts the worker binary, sends SIGTERM while it executes tasks, and asserts it stops polling, drains in-flight work within the shutdown timeout, and exits without error. |
-| device-search-attributes | Filtering devices in the Temporal UI | STACK-DEPENDENT: Needs a running Temporal stack: the four-condition list query the Temporal UI issues (region, model, firmware version, online) needs a live visibility store. No test performs a ListWorkflow query at all; only the upserts are asserted in-process. | A temporaltest-backed test that starts device workflows in distinct states and asserts a ListWorkflow query combining DeviceRegion, DeviceModel, DeviceFirmware and DeviceOnline returns exactly the matching runs, the query the Temporal UI runs. |
+| repo-scaffold | Stack lifecycle targets | RECORDED-NOT-IMPLEMENTED: Half the scenario is backed — TestStackLifecycleTargetsPointAtDeploy (internal/repolayout/makefile_test.go) asserts make up and make down run kubectl apply/delete -f deploy/ and do not swallow the tooling's exit status. The other half cannot be verified because no manifest exists to bring up: proposal.md's "Explicitly not in this change" excludes "compose/k3d manifests or stack bring-up", so the deploy/ tree holds notes and no stack definition. | The deploy/ manifests landing with the deployment stage, and a test that runs make up against them and asserts the stack's resources exist and make down removes them; the wiring half is already asserted and fails if make up stops naming deploy/ or starts swallowing kubectl's failure. |
 | mongo-data-model | Retention is configurable in one place | RECORDED-NOT-IMPLEMENTED: The behavior is not implemented in this delivery: the TTL index is built from FLEETOPS_TELEMETRY_RETENTION_DAYS in deploy/mongo/init.js while internal/config has no retention field, so the ingestion path does not read the same value. proposal.md § "Recorded but not implemented here" records the telemetry retention not being one named value as out of scope. | A test that changes the one named retention value, re-runs the bootstrap, asserts the index expireAfterSeconds follows it, and asserts the ingestion path reads the same configuration value. |
 | mongo-data-model | Telemetry document content | RECORDED-NOT-IMPLEMENTED: The behavior is not implemented in this delivery: telemetry is a plain MongoDB collection, not the time-series collection the requirement specifies, a deliberate deviation proposal.md § "Recorded but not implemented here" records (the time-series wording divergence) and leaves to the change that owns the capability. | A test asserting the collection is created with time-series options (listCollections type timeseries, timeField ts) and that an ingested heartbeat is retrievable from it by device and time range. |
+| test-execution-profiles | The weak-host profile runs the suite within its budget | MEASURED-RUN: No Go test can assert what a suite run costs: the peak is dominated by container processes outside the test binary, and a test asserting the memory of a workload it constructed itself would prove nothing about the suite. The configuration half is backed — TestWeakProfileFitsTheDocumentedBudget (internal/testexec/narrowing_test.go) asserts the weak profile's fleet size, wait multiplier, startup budgets and container sharing stay within the documented envelope and narrow every knob without touching an assertion. | The recorded weak-host run: `make test-weak` (`FLEETOPS_TEST_PROFILE=weak go test -tags integration -count=1 -timeout 30m ./...`) with its wall clock and peak container memory sampled during the run and recorded in tasks.md § 8.2, on a machine with at most 4 GB of RAM and 4 CPUs, exiting green with no resource-reason failure. |
