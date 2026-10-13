@@ -24,6 +24,7 @@ type scriptedAgentServer struct {
 	mu            sync.Mutex
 	heartbeats    []*agentv1.Heartbeat
 	registrations int
+	registered    []*agentv1.RegisterDeviceRequest
 	killAfter     int // heartbeats after which the first stream dies; 0 never kills
 	received      chan struct{}
 }
@@ -45,6 +46,7 @@ func (s *scriptedAgentServer) Connect(
 		if reg := env.GetRegisterDevice(); reg != nil {
 			s.mu.Lock()
 			s.registrations++
+			s.registered = append(s.registered, reg)
 			s.mu.Unlock()
 			resp := &agentv1.ControlEnvelope{
 				CorrelationId: env.CorrelationId,
@@ -86,6 +88,15 @@ func (s *scriptedAgentServer) registrationCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.registrations
+}
+
+// recordedRegistrations returns a snapshot of every registration request the server received,
+// in arrival order, so a test can tie a heartbeat's device id back to the identity it was
+// registered under.
+func (s *scriptedAgentServer) recordedRegistrations() []*agentv1.RegisterDeviceRequest {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]*agentv1.RegisterDeviceRequest(nil), s.registered...)
 }
 
 // startTestServer serves scripted on an in-memory listener and returns the client conn.
