@@ -19,12 +19,9 @@ import (
 	"github.com/DisMosGit/fleetops/internal/testexec"
 )
 
-// The two selectors the view tests draw from. Each test seeds its own devices in its own
-// database, so the selectors can repeat across tests without one seeing another's pool.
-var (
-	watchedPool = Selector{Region: "eu-west", Model: "oak-view"}
-	otherPool   = Selector{Region: "eu-west", Model: "elk-view"}
-)
+// watchedPool is the selector the view tests draw from. Each test seeds its own devices in its
+// own database, so the selector can repeat across tests without one seeing another's pool.
+var watchedPool = Selector{Region: "eu-west", Model: "oak-view"}
 
 // newView returns a view over the harness's devices collection, discarding the watcher's log: what
 // these tests assert is the view, not what was written about it.
