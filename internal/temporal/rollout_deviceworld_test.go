@@ -30,10 +30,6 @@ type device struct {
 	previousFw string
 	// unreachable reports that the device's workflow refuses every delivery.
 	unreachable bool
-	// refuseAfter, when positive, is how many deliveries the device accepts before its workflow
-	// refuses every later one: the wave's update reaches it, and a restore delivered afterwards
-	// does not.
-	refuseAfter int
 }
 
 // deviceWorld is a scriptable stand-in for the fleet's device entity workflows. It is the device
@@ -139,23 +135,13 @@ func (w *deviceWorld) refuseDelivery(deviceIDs ...string) {
 	}
 }
 
-// refuseAfterDeliveries makes a device accept the given number of deliveries and refuse every one
-// after them: the wave's update reaches the device, while the rollback's restore — delivered later —
-// cannot, so the restore activity exhausts its retries and the step records the device alone as
-// unrestored.
-func (w *deviceWorld) refuseAfterDeliveries(deviceID string, accepted int) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.machine(deviceID).refuseAfter = accepted
-}
-
 // SignalCommandIssued implements DeviceCommander: it accepts one command for one device, which is
 // what makes the device's later deliveries possible.
 func (w *deviceWorld) SignalCommandIssued(_ context.Context, cmd CommandIssuedSignal) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	machine := w.machine(cmd.DeviceID)
-	if machine.unreachable || (machine.refuseAfter > 0 && len(machine.commands) >= machine.refuseAfter) {
+	if machine.unreachable {
 		return fmt.Errorf("deliver %s to device %s: %w", cmd.CommandID, cmd.DeviceID, ErrDeviceUnreachable)
 	}
 	machine.commands = append(machine.commands, cmd)
