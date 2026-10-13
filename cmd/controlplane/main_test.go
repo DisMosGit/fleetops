@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -524,6 +525,39 @@ func TestStartWorker(t *testing.T) {
 		t.Errorf("dispatched commands = %+v, want cmd-1 delivered to dev-1", sent)
 	}
 
+	// Both queues come from configuration and neither is the queue this process polls: a device
+	// run starts on the configured work queue, and the settings it is seeded with name the
+	// configured dispatch queue its commands are later delivered on.
+	runs := &recordingSignalClient{}
+	if err := deviceSignaler(runs, cfg).SignalHeartbeat(context.Background(), devices.Record{
+		ID: "dev-1", Region: "eu-west", Model: "oak-s3",
+	}, &agentv1.Heartbeat{EventId: "evt-1", CurrentFw: "1.0.0"}); err != nil {
+		t.Fatalf("signal a device run through the wired signaler: %v", err)
+	}
+	if len(runs.calls) != 1 {
+		t.Fatalf("signaler started %d device runs, want 1", len(runs.calls))
+	}
+	if got := runs.calls[0].options.TaskQueue; got != cfg.Temporal.TaskQueue {
+		t.Errorf("device run started on %q, want the configured work queue %q",
+			got, cfg.Temporal.TaskQueue)
+	}
+	if got := runs.calls[0].options.TaskQueue; got == cfg.Temporal.DispatchTaskQueue {
+		t.Errorf("device run started on the dispatch queue %q, want it on the work queue", got)
+	}
+	settings, ok := seedSettings(t, runs.calls[0].workflowArg)
+	if !ok {
+		t.Fatalf("device run was seeded with %T, want the device state whose settings the run decides under",
+			runs.calls[0].workflowArg)
+	}
+	if settings.DispatchTaskQueue != cfg.Temporal.DispatchTaskQueue {
+		t.Errorf("device run dispatch queue = %q, want the configured dispatch queue %q",
+			settings.DispatchTaskQueue, cfg.Temporal.DispatchTaskQueue)
+	}
+	if settings.DispatchTaskQueue == cfg.Temporal.TaskQueue {
+		t.Errorf("device run schedules its dispatch on the work queue %q, want the dispatch queue",
+			settings.DispatchTaskQueue)
+	}
+
 	// The registered upload steps are bound to this process's side effects: validation checks the
 	// device registry's models, and a transition writes through the firmware store.
 	validate, ok := built.activities[temporal.ValidateFirmwareModelsActivityName].(func(context.Context, firmware.UploadRequest) error)
@@ -542,7 +576,6 @@ func TestStartWorker(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "walnut-9") {
 		t.Errorf("validate an unknown model: error = %v, want the refused model named", err)
 	}
-
 	upsert, ok := built.activities[temporal.UpsertFirmwareMetadataActivityName].(func(context.Context, firmware.UploadMetadata) (firmware.Record, error))
 	if !ok {
 		t.Fatalf("registered activity has type %T, want the metadata transition step",
@@ -558,6 +591,54 @@ func TestStartWorker(t *testing.T) {
 		t.Errorf("transitions = %+v, want the accepted transition written through the store",
 			store.transitions)
 	}
+}
+
+// recordingSignalClient is a hand-written deviceRunStarter double recording the signal-with-start
+// calls the wired signaler makes, so the queues a device run is started on and seeded with are
+// observable without a Temporal server.
+type recordingSignalClient struct {
+	calls []signalStartCall
+}
+
+// signalStartCall is one recorded signal-with-start.
+type signalStartCall struct {
+	workflowID  string
+	options     temporalclient.StartWorkflowOptions
+	workflowArg any
+}
+
+// seedSettings returns the entity settings a started device run was seeded with. The seed is the
+// workflow's own state type, unexported here, and its JSON shape is the carry-over contract, so
+// the test reads the settings through that contract rather than reaching into the type.
+func seedSettings(t *testing.T, seed any) (temporal.DeviceSettings, bool) {
+	t.Helper()
+
+	raw, err := json.Marshal(seed)
+	if err != nil {
+		t.Fatalf("encode the seeded device state: %v", err)
+	}
+	var decoded struct {
+		Settings temporal.DeviceSettings `json:"settings"`
+	}
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("decode the seeded device state: %v", err)
+	}
+	if decoded.Settings == (temporal.DeviceSettings{}) {
+		return temporal.DeviceSettings{}, false
+	}
+	return decoded.Settings, true
+}
+
+func (c *recordingSignalClient) SignalWithStartWorkflow(
+	_ context.Context, workflowID, _ string, _ any,
+	options temporalclient.StartWorkflowOptions, _ any, args ...any,
+) (temporalclient.WorkflowRun, error) {
+	var seed any
+	if len(args) > 0 {
+		seed = args[0]
+	}
+	c.calls = append(c.calls, signalStartCall{workflowID: workflowID, options: options, workflowArg: seed})
+	return nil, nil
 }
 
 // TestSweepSpool pins the startup sweep: a spool file older than the configured maximum age is

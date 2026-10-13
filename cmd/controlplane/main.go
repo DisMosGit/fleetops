@@ -213,6 +213,29 @@ func deviceSettings(cfg config.Config) temporal.DeviceSettings {
 	}
 }
 
+// deviceRunStarter is the slice of the Temporal client the signaler needs: signal-with-start is
+// the only call it makes. client.Client satisfies it, and a test hand-writes a fake.
+type deviceRunStarter interface {
+	SignalWithStartWorkflow(
+		ctx context.Context,
+		workflowID string,
+		signalName string,
+		signalArg any,
+		options temporalclient.StartWorkflowOptions,
+		workflow any,
+		workflowArgs ...any,
+	) (temporalclient.WorkflowRun, error)
+}
+
+// deviceSignaler returns the signaler that starts and signals the fleet's device workflows: the
+// run chain itself on the configured work queue, and the settings — the dispatch queue among
+// them — its new runs are seeded with. The two queues are read from their own configuration
+// fields, so a device run and the commands it later receives are placed by configuration rather
+// than by whichever queue this process happens to poll.
+func deviceSignaler(tc deviceRunStarter, cfg config.Config) *temporal.Signaler {
+	return temporal.NewSignaler(tc, cfg.Temporal.TaskQueue, deviceSettings(cfg))
+}
+
 // probeServer returns the liveness/readiness listener the configuration names: it serves the
 // probe handler on the configured health address, and nothing else — the deployment's probes are
 // answered where its configuration says, never on a default this process chose.
@@ -455,7 +478,7 @@ func run(ctx context.Context, cfg config.Config, httpAddr string) error {
 	// and dispatch queue; all three are captured at chain start and carried with the entity
 	// state. The signaler starts workflows on the work queue — the dispatch queue is only
 	// where this process later receives their commands.
-	signaler := temporal.NewSignaler(tc, cfg.Temporal.TaskQueue, deviceSettings(cfg))
+	signaler := deviceSignaler(tc, cfg)
 	hub := agentserver.NewHub(events.sink, log)
 	grpcServer := grpc.NewServer(agentserver.ServerOptions(log)...)
 	agentv1.RegisterAgentServiceServer(grpcServer, agentserver.NewServer(hub, registry, signaler, firmwareStore, log))
