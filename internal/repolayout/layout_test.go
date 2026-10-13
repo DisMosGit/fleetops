@@ -94,6 +94,26 @@ func stagePattern(stage string) *regexp.Regexp {
 	return regexp.MustCompile(`(?i)\bstages?[- ]` + regexp.QuoteMeta(strings.TrimPrefix(stage, "stage ")) + `\b`)
 }
 
+// submoduleContentMissing reports whether a sanctioned submodule's content is
+// absent: the directory is not checked out, or it is the empty directory a
+// clone that did not initialize submodules holds. The parent repository is then
+// exactly as committed, and the note lives in the submodule rather than here —
+// the "Usable clone without submodule content" scenario requires that state to
+// keep working. TestFrontendSubmoduleRegistrationIsExplicit and
+// TestWebIsPlaceholderOnly assert the registration and the placeholder instead.
+func submoduleContentMissing(t *testing.T, want layoutDir) bool {
+	t.Helper()
+	if !want.submodule {
+		return false
+	}
+	if _, err := os.Stat(path.Join(repoRoot, want.readme)); err != nil {
+		t.Logf("%s carries no note because the submodule is not initialized; the registration "+
+			"and the placeholder are asserted by the submodule tests", want.dir)
+		return true
+	}
+	return false
+}
+
 // TestFreshCloneExposesTheLayout backs the "Fresh clone exposes the layout"
 // scenario: every directory the capability names exists at the top level and is
 // documented by a note that names the delivery stage responsible for its
@@ -103,9 +123,9 @@ func stagePattern(stage string) *regexp.Regexp {
 // and the notes against the working tree, because "a contributor clones the
 // repository" is a claim about the commit, not about whatever a contributor
 // happens to have checked out. web/ is the one submodule: it is committed as a
-// gitlink, so a clone that does not initialize submodules has no web/ directory
-// at all, and its entry is asserted as committed rather than as a directory the
-// working tree must hold.
+// gitlink, so a clone that does not initialize submodules has an empty web/
+// rather than a documented one, and its note is asserted only once the
+// submodule is checked out.
 func TestFreshCloneExposesTheLayout(t *testing.T) {
 	committed := committedEntries(t)
 	for _, want := range sanctionedLayout {
@@ -113,9 +133,7 @@ func TestFreshCloneExposesTheLayout(t *testing.T) {
 			if !slices.Contains(committed, want.dir) {
 				t.Errorf("%s is not committed at HEAD, so a fresh clone does not expose it", want.dir)
 			}
-			if _, err := os.Stat(path.Join(repoRoot, want.dir)); err != nil && want.submodule {
-				t.Logf("%s is not checked out because the submodule is not initialized; "+
-					"TestFrontendSubmoduleRegistrationIsExplicit and TestWebIsPlaceholderOnly assert it", want.dir)
+			if submoduleContentMissing(t, want) {
 				return
 			}
 			info, err := os.Stat(path.Join(repoRoot, want.dir))
@@ -229,8 +247,7 @@ func TestPlannedPathsAreMarkedNotImplemented(t *testing.T) {
 			continue
 		}
 		t.Run(want.dir, func(t *testing.T) {
-			if _, err := os.Stat(path.Join(repoRoot, want.dir)); err != nil && want.submodule {
-				t.Logf("%s is not checked out because the submodule is not initialized", want.dir)
+			if submoduleContentMissing(t, want) {
 				return
 			}
 			note := strings.ToLower(string(readRepoFile(t, want.readme)))

@@ -61,15 +61,23 @@ func TestFrontendSubmoduleNamesTheStackAndStage(t *testing.T) {
 // case and passes: the submodule is registered in .gitmodules, which the other
 // assertion covers.
 func TestWebIsPlaceholderOnly(t *testing.T) {
+	// "web/ is registered": the guarantee is about a registered submodule, so the
+	// registration is asserted rather than assumed — an untracked empty web/
+	// would otherwise satisfy the placeholder checks on its own.
+	entries := parseGitmodules(t, string(readRepoFile(t, ".gitmodules")))
+	if _, ok := entries["web"]; !ok {
+		t.Errorf(".gitmodules registers no web submodule, so web/ is not a registered placeholder; it declares %v",
+			submoduleNames(entries))
+	}
+
 	// The parent repository must not track anything under web/ except the
 	// submodule itself: a tracked file would arrive in a clone as working
 	// frontend content the stage has not delivered. Reading the git index is
 	// what makes this independent of whether the working tree has the
 	// submodule initialized.
-	for _, file := range gitLsFiles(t, "web") {
-		if file != "web" {
-			t.Errorf("%s is tracked by the parent repository as a real file; web/ must stay a submodule placeholder", file)
-		}
+	tracked := gitLsFiles(t, "web")
+	if len(tracked) != 1 || tracked[0] != "web" {
+		t.Errorf("the parent repository tracks %v under web/, want exactly the submodule gitlink", tracked)
 	}
 
 	if _, err := os.Stat(path.Join(repoRoot, "web")); err != nil {
