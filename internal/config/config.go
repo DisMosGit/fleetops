@@ -12,6 +12,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"slices"
 	"time"
 
 	"go.yaml.in/yaml/v3"
@@ -37,6 +39,8 @@ type Config struct {
 	Alerting Alerting `yaml:"alerting"`
 	// Rollout configures canary wave health gating.
 	Rollout Rollout `yaml:"rollout"`
+	// Firmware configures the firmware upload path.
+	Firmware Firmware `yaml:"firmware"`
 	// Temporal configures the orchestration backend.
 	Temporal Temporal `yaml:"temporal"`
 	// Observability configures metrics, tracing, and probe endpoints.
@@ -51,6 +55,46 @@ type Simulation struct {
 	ApplyDelay Duration `yaml:"apply_delay"`
 	// ApplySuccessRate is the probability a simulated firmware application succeeds, in [0, 1].
 	ApplySuccessRate float64 `yaml:"apply_success_rate"`
+	// Faults configures the emulator's deliberate firmware-download faults and the bounded
+	// retry the update path gives them. An absent section injects no faults.
+	Faults Faults `yaml:"faults"`
+}
+
+// Fault kind names as the configuration file spells them. They mirror the fault kinds the
+// agent emulator's injector draws, which is the set the injector accepts.
+const (
+	faultKindStall    = "stall"
+	faultKindTransfer = "transfer"
+)
+
+// Faults configures the emulator's deliberate firmware-download faults and the bounded retry
+// the update path gives them. A positive Share is what injects faults, so an absent or zero
+// section injects none and leaves the download path exactly as it is without this section. The
+// retry budget applies whether or not faults are injected: it bounds how often any transient
+// download failure is retried.
+type Faults struct {
+	// Share is the probability that one download attempt faults, in [0, 1]; zero injects none.
+	Share float64 `yaml:"share"`
+	// Kinds are the fault kinds a faulted attempt draws from: "stall" and "transfer".
+	Kinds []string `yaml:"kinds"`
+	// StallDuration is how long an injected stall waits before its attempt fails.
+	StallDuration Duration `yaml:"stall_duration"`
+	// Attempts is the total number of download attempts one update command may make; zero or
+	// one makes a single attempt, the behavior without a retry budget.
+	Attempts int `yaml:"attempts"`
+	// BackoffCap is the upper bound on the delay between two download attempts.
+	BackoffCap Duration `yaml:"backoff_cap"`
+}
+
+// Enabled reports whether the configuration injects any fault: an absent or zero share injects
+// none, whatever the other fields hold.
+func (f Faults) Enabled() bool {
+	return f.Share > 0 && len(f.Kinds) > 0
+}
+
+// usesKind reports whether kind is one of the configured fault kinds.
+func (f Faults) usesKind(kind string) bool {
+	return slices.Contains(f.Kinds, kind)
 }
 
 // GRPC configures the agent-facing gRPC transport.
@@ -150,6 +194,23 @@ type Wave struct {
 	RequireApproval bool `yaml:"require_approval"`
 }
 
+// Firmware configures the firmware upload path: where the control plane spools an upload's
+// binary while the workflow that owns the upload runs, how long the endpoint waits for that
+// workflow, and how old an abandoned spool file must be before startup sweeps it.
+type Firmware struct {
+	// SpoolDir is the directory the control plane spools an upload's binary to until the
+	// upload concludes. An activity's input is serialized, so the binary travels to the
+	// storage step as a file path rather than as bytes.
+	SpoolDir string `yaml:"spool_dir"`
+	// WaitTimeout is the longest the upload endpoint waits for the upload's workflow before it
+	// answers that the upload continues and leaves it to the state query.
+	WaitTimeout Duration `yaml:"wait_timeout"`
+	// MaxSpoolAge is the age past which a spool file abandoned by a crash is removed by the
+	// startup sweep. It is an age rather than a presence check because another replica's
+	// in-flight upload is not this replica's to delete.
+	MaxSpoolAge Duration `yaml:"max_spool_age"`
+}
+
 // Temporal configures the orchestration backend.
 type Temporal struct {
 	// Address is the Temporal frontend address, in host:port form.
@@ -183,6 +244,15 @@ func Defaults() Config {
 			FleetSize:        100,
 			ApplyDelay:       Duration{Duration: time.Second},
 			ApplySuccessRate: 1.0,
+			// The fault share stays at zero, so every kind below is a default the emulator
+			// only draws from once an operator configures faults.
+			Faults: Faults{
+				Share:         0,
+				Kinds:         []string{faultKindStall, faultKindTransfer},
+				StallDuration: Duration{Duration: 5 * time.Second},
+				Attempts:      3,
+				BackoffCap:    Duration{Duration: 5 * time.Second},
+			},
 		},
 		GRPC:    GRPC{ListenAddr: ":9090", ControlPlaneAddr: "localhost:9090"},
 		MongoDB: MongoDB{URI: "mongodb://localhost:27017", Database: "fleetops"},
@@ -223,6 +293,13 @@ func Defaults() Config {
 			// window gathered has, by then, given its devices as long to report as it
 			// measured them.
 			ResultTimeout: Duration{Duration: 5 * time.Minute},
+		},
+		Firmware: Firmware{
+			// Under the OS temporary directory, so a control plane needs no writable data
+			// directory configured to run an upload.
+			SpoolDir:    filepath.Join(os.TempDir(), "fleetops-firmware"),
+			WaitTimeout: Duration{Duration: 30 * time.Second},
+			MaxSpoolAge: Duration{Duration: time.Hour},
 		},
 		Temporal: Temporal{
 			Address:           "localhost:7233",

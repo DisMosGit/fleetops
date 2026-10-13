@@ -27,6 +27,7 @@ func (c Config) Validate() error {
 		// The closed-range check rejects NaN along with every out-of-range rate.
 		add("simulation.apply_success_rate", "must be in [0, 1]")
 	}
+	validateFaults(add, "simulation.faults", c.Simulation.Faults)
 	validateHostPort(add, "grpc.listen_addr", c.GRPC.ListenAddr)
 	validateHostPort(add, "grpc.control_plane_addr", c.GRPC.ControlPlaneAddr)
 	validateScheme(add, "mongodb.uri", c.MongoDB.URI, "mongodb", "mongodb+srv")
@@ -88,6 +89,9 @@ func (c Config) Validate() error {
 		c.Rollout.ResultTimeout.Duration > c.Rollout.DecisionTimeout.Duration {
 		add("rollout.result_timeout", "must not exceed rollout.decision_timeout")
 	}
+	validateNonEmpty(add, "firmware.spool_dir", c.Firmware.SpoolDir)
+	validateDuration(add, "firmware.wait_timeout", c.Firmware.WaitTimeout)
+	validateDuration(add, "firmware.max_spool_age", c.Firmware.MaxSpoolAge)
 	validateHostPort(add, "temporal.address", c.Temporal.Address)
 	validateNonEmpty(add, "temporal.namespace", c.Temporal.Namespace)
 	validateNonEmpty(add, "temporal.task_queue", c.Temporal.TaskQueue)
@@ -176,6 +180,52 @@ func validateDuration(add func(field, reason string), field string, value Durati
 	case value.invalid:
 		add(field, "must be a Go duration string")
 	case value.Duration <= 0:
+		add(field, "must be positive")
+	}
+}
+
+// validateFaults reports every violation in the emulator's fault configuration. Its zero value
+// injects nothing and makes a single download attempt, so a field only has to be positive when
+// the configuration actually puts it to use.
+func validateFaults(add func(field, reason string), field string, faults Faults) {
+	if !(faults.Share >= 0 && faults.Share <= 1) {
+		// The closed-range check rejects NaN along with every out-of-range share.
+		add(field+".share", "must be in [0, 1]")
+	}
+	for i, kind := range faults.Kinds {
+		if kind != faultKindStall && kind != faultKindTransfer {
+			add(fmt.Sprintf("%s.kinds[%d]", field, i),
+				"must be "+faultKindStall+" or "+faultKindTransfer)
+		}
+	}
+	// A positive share with no kind to draw would silently inject nothing, so the operator
+	// learns at startup instead.
+	if faults.Share > 0 && len(faults.Kinds) == 0 {
+		add(field+".kinds", "must name at least one kind when share is positive")
+	}
+	if faults.Attempts < 0 {
+		add(field+".attempts", fmt.Sprintf("must not be negative, got %d", faults.Attempts))
+	}
+	validateFaultDuration(add, field+".stall_duration", faults.StallDuration,
+		faults.usesKind(faultKindStall))
+	validateFaultDuration(add, field+".backoff_cap", faults.BackoffCap, faults.Attempts > 1)
+}
+
+// validateFaultDuration reports field unless value is a parsed, non-negative duration that is
+// positive when required. Reasons are fixed strings: an invalid duration never echoes the
+// configured value.
+func validateFaultDuration(
+	add func(field, reason string),
+	field string,
+	value Duration,
+	required bool,
+) {
+	switch {
+	case value.invalid:
+		add(field, "must be a Go duration string")
+	case value.Duration < 0:
+		add(field, "must not be negative")
+	case required && value.Duration == 0:
 		add(field, "must be positive")
 	}
 }

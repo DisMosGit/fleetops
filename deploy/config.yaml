@@ -11,6 +11,21 @@ simulation:
   apply_delay: "1s"
   # Probability a simulated firmware application succeeds, in [0, 1].
   apply_success_rate: 1.0
+  # Deliberate firmware-download faults and the bounded retry the update path gives them. The
+  # default share injects no faults, so the emulator downloads through the real path unchanged;
+  # raise it to make a share of attempts stall or fail before any byte is fetched.
+  faults:
+    # Probability that one download attempt faults, in [0, 1].
+    share: 0.0
+    # Fault kinds an injected attempt draws from: "stall" and "transfer".
+    kinds: ["stall", "transfer"]
+    # How long an injected stall waits before its attempt fails (Go duration string); required
+    # to be positive only while "stall" is one of the kinds.
+    stall_duration: "5s"
+    # Total download attempts one update command may make; 0 or 1 makes a single attempt.
+    attempts: 3
+    # Upper bound on the delay between two download attempts (Go duration string).
+    backoff_cap: "5s"
 
 grpc:
   # Control plane AgentService listen address.
@@ -111,6 +126,19 @@ temporal:
   # host, because Temporal delivers a task to any poller of its queue rather than to one that
   # registered its type.
   dispatch_task_queue: "fleetops-controlplane"
+
+firmware:
+  # Directory the control plane spools an upload's binary to until the upload's workflow
+  # concludes. The binary reaches the storage step as this path rather than as bytes, because an
+  # activity's input is serialized. The default is <os.TempDir()>/fleetops-firmware.
+  # spool_dir: "/tmp/fleetops-firmware"
+  # Longest the upload endpoint waits for the upload's workflow before answering that the upload
+  # continues and leaving it to the state query (Go duration string).
+  wait_timeout: "30s"
+  # Age past which a spool file abandoned by a crash is removed by the control plane's startup
+  # sweep (Go duration string). Age, not presence: a file another replica is still uploading
+  # through is not this replica's to delete.
+  max_spool_age: "1h"
 
 observability:
   # OTLP collector endpoint; empty disables trace export.

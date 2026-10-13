@@ -36,6 +36,65 @@ func TestValidate(t *testing.T) {
 		{name: "negative apply success rate", mutate: func(c *Config) {
 			c.Simulation.ApplySuccessRate = -0.1
 		}, wantErrs: []string{"simulation.apply_success_rate"}},
+		{name: "zero fault section injects nothing", mutate: func(c *Config) {
+			c.Simulation.Faults = Faults{}
+		}},
+		{name: "configured faults are valid", mutate: func(c *Config) {
+			c.Simulation.Faults = Faults{
+				Share:         0.25,
+				Kinds:         []string{faultKindTransfer},
+				StallDuration: Duration{Duration: 2 * time.Second},
+				Attempts:      4,
+				BackoffCap:    Duration{Duration: 10 * time.Second},
+			}
+		}},
+		{name: "a stall kind needs a positive stall duration", mutate: func(c *Config) {
+			c.Simulation.Faults = Faults{Share: 0.5, Kinds: []string{faultKindStall}}
+		}, wantErrs: []string{"simulation.faults.stall_duration"}},
+		{name: "zero retry budget makes a single attempt", mutate: func(c *Config) {
+			c.Simulation.Faults = Faults{
+				Share: 0.5, Kinds: []string{faultKindTransfer}, Attempts: 0,
+			}
+		}},
+		{name: "one attempt needs no backoff cap", mutate: func(c *Config) {
+			c.Simulation.Faults = Faults{
+				Share: 0.5, Kinds: []string{faultKindTransfer}, Attempts: 1,
+			}
+		}},
+		{name: "zero backoff cap with several attempts", mutate: func(c *Config) {
+			c.Simulation.Faults = Faults{
+				Share: 0.5, Kinds: []string{faultKindTransfer}, Attempts: 3,
+			}
+		}, wantErrs: []string{"simulation.faults.backoff_cap"}},
+		{name: "fault share above one", mutate: func(c *Config) {
+			c.Simulation.Faults.Share = 1.5
+		}, wantErrs: []string{"simulation.faults.share"}},
+		{name: "negative fault share", mutate: func(c *Config) {
+			c.Simulation.Faults.Share = -0.1
+		}, wantErrs: []string{"simulation.faults.share"}},
+		{name: "unknown fault kind", mutate: func(c *Config) {
+			c.Simulation.Faults.Share = 0.5
+			c.Simulation.Faults.Kinds = []string{"corrupt"}
+		}, wantErrs: []string{"simulation.faults.kinds[0]"}},
+		{name: "positive share without a kind", mutate: func(c *Config) {
+			c.Simulation.Faults.Share = 0.5
+			c.Simulation.Faults.Kinds = nil
+		}, wantErrs: []string{"simulation.faults.kinds"}},
+		{name: "negative attempt budget", mutate: func(c *Config) {
+			c.Simulation.Faults.Attempts = -1
+		}, wantErrs: []string{"simulation.faults.attempts"}},
+		{name: "unparseable stall duration", mutate: func(c *Config) {
+			c.Simulation.Faults.StallDuration = Duration{invalid: true}
+		}, wantErrs: []string{"simulation.faults.stall_duration"}},
+		{name: "negative stall duration", mutate: func(c *Config) {
+			c.Simulation.Faults.StallDuration = Duration{Duration: -time.Second}
+		}, wantErrs: []string{"simulation.faults.stall_duration"}},
+		{name: "unparseable backoff cap", mutate: func(c *Config) {
+			c.Simulation.Faults.BackoffCap = Duration{invalid: true}
+		}, wantErrs: []string{"simulation.faults.backoff_cap"}},
+		{name: "negative backoff cap", mutate: func(c *Config) {
+			c.Simulation.Faults.BackoffCap = Duration{Duration: -time.Second}
+		}, wantErrs: []string{"simulation.faults.backoff_cap"}},
 		{name: "listen addr without port", mutate: func(c *Config) {
 			c.GRPC.ListenAddr = "localhost"
 		}, wantErrs: []string{"grpc.listen_addr"}},

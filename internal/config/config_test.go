@@ -186,6 +186,62 @@ func TestLoad(t *testing.T) {
 			},
 		},
 		{
+			name: "fault section overrides defaults",
+			file: "simulation:\n" +
+				"  faults:\n" +
+				"    share: 0.25\n" +
+				"    kinds: [stall, transfer]\n" +
+				"    stall_duration: 3s\n" +
+				"    attempts: 5\n" +
+				"    backoff_cap: 30s\n",
+			mutate: func(c *Config) {
+				c.Simulation.Faults = Faults{
+					Share:         0.25,
+					Kinds:         []string{faultKindStall, faultKindTransfer},
+					StallDuration: Duration{Duration: 3 * time.Second},
+					Attempts:      5,
+					BackoffCap:    Duration{Duration: 30 * time.Second},
+				}
+			},
+		},
+		{
+			name: "fault share alone keeps the other fault defaults",
+			file: "simulation:\n  faults:\n    share: 1\n",
+			mutate: func(c *Config) {
+				c.Simulation.Faults.Share = 1
+			},
+		},
+		{
+			name:    "unknown fault kind is rejected by field name",
+			file:    "simulation:\n  faults:\n    share: 0.5\n    kinds: [corrupt]\n",
+			wantErr: "simulation.faults.kinds",
+		},
+		{
+			name:    "a positive fault share without kinds is rejected",
+			file:    "simulation:\n  faults:\n    share: 0.5\n    kinds: []\n",
+			wantErr: "simulation.faults.kinds",
+		},
+		{
+			name:    "fault share above one is rejected by field name",
+			file:    "simulation:\n  faults:\n    share: 1.5\n",
+			wantErr: "simulation.faults.share",
+		},
+		{
+			name:    "zero stall duration with the stall kind is rejected",
+			file:    "simulation:\n  faults:\n    share: 0.5\n    kinds: [stall]\n    stall_duration: 0s\n",
+			wantErr: "simulation.faults.stall_duration",
+		},
+		{
+			name:    "negative fault attempt budget is rejected",
+			file:    "simulation:\n  faults:\n    attempts: -1\n",
+			wantErr: "simulation.faults.attempts",
+		},
+		{
+			name:    "zero backoff cap with several attempts is rejected",
+			file:    "simulation:\n  faults:\n    attempts: 3\n    backoff_cap: 0s\n",
+			wantErr: "simulation.faults.backoff_cap",
+		},
+		{
 			name: "partial file keeps other defaults",
 			file: "temporal:\n  namespace: fleetops-dev\n",
 			mutate: func(c *Config) {
@@ -355,6 +411,42 @@ func TestLoad(t *testing.T) {
 			}
 			if diff := cmp.Diff(want, got); diff != "" {
 				t.Errorf("Load() mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+// TestFaultsEnabled pins what turns fault injection on: only a positive share of a non-empty
+// kind set faults, so an absent or zero section leaves the download path untouched.
+func TestFaultsEnabled(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		faults Faults
+		want   bool
+	}{
+		{name: "zero value injects nothing", faults: Faults{}, want: false},
+		{name: "share without kinds injects nothing", faults: Faults{Share: 0.5}, want: false},
+		{name: "kinds without a share inject nothing", faults: Faults{
+			Kinds: []string{faultKindStall},
+		}, want: false},
+		{name: "zero share with kinds injects nothing", faults: Faults{
+			Share: 0, Kinds: []string{faultKindStall, faultKindTransfer},
+		}, want: false},
+		{name: "a positive share of one kind faults", faults: Faults{
+			Share: 0.1, Kinds: []string{faultKindTransfer},
+		}, want: true},
+		{name: "a full share of both kinds faults", faults: Faults{
+			Share: 1, Kinds: []string{faultKindStall, faultKindTransfer},
+		}, want: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := tc.faults.Enabled(); got != tc.want {
+				t.Errorf("Enabled() = %v, want %v", got, tc.want)
 			}
 		})
 	}
