@@ -63,6 +63,11 @@ construct dependencies, and start the run loop.
   announcement fails after its short retry budget and the rollback continues. The worker declares
   the same broker layout `controlplane` does, including the `fleetops.rollout.notifications`
   queue a rollback's events are enqueued on (see [docs/telemetry.md](../docs/telemetry.md)).
+- `worker` keeps the eligible-device view its wave resolutions read, fed by the `devices` change
+  stream (see [The eligible-device view](#the-eligible-device-view)). The stream is established
+  before the worker polls its first task and lives for the worker's lifetime; a stream that cannot
+  be established fails the startup. Change streams need a replica set, so this is the one
+  environment requirement the worker adds to MongoDB: a standalone cannot run it.
 
 ## Task queues
 
@@ -111,6 +116,38 @@ before this split carries a settings payload without the queue and is refused lo
 running half-understood; on the local dev stack the migration is to reset those chains —
 `temporal workflow terminate --workflow-id device-<device_id>`, after which the device's next
 signal recreates its chain at the current carry version with the dispatch queue in its settings.
+
+## The eligible-device view
+
+A wave's target set is resolved from the eligible pool of its selector — a region and a device
+model. The worker keeps that pool in a view keyed by selector and ordered by device identity, and
+resolves waves against the view instead of querying `devices` on every resolution:
+
+- **One query per selector, once.** A selector's entry is built lazily at its first resolution,
+  with a single ordered read of `devices` filtered by `{region, model}`. The order is device
+  identity, so a pool and a set of shares always resolve to the same target sets.
+- **Kept current by the fleet's own writes.** An entry is refreshed from the `devices` change
+  stream. The stream applies a change in memory and never reads `devices`, so learning what changed
+  costs no query. A burst of changes is coalesced: the events the stream already holds are drained
+  together, and each affected selector's entry is rewritten once for the batch. A device that
+  changes model or region moves between entries, a device that leaves the fleet leaves them, and a
+  change applied twice changes nothing beyond the first application.
+- **The stream's position is kept.** A lost stream is re-established from the position it reached,
+  with capped backoff, so a brief interruption loses nothing. A position the server will not serve
+  — the oplog has rolled past it — drops the whole view, which then rebuilds from `devices` rather
+  than answering from data older than the collection; the stream continues from a fresh position.
+- **Startup fails when the stream cannot be established.** A worker whose view is not being
+  maintained has no freshness guarantee and nothing downstream can tell, so the run stops with the
+  reason instead of degrading silently. The watcher is stopped by the worker's context and releases
+  its cursor.
+
+`devices` stays the only source of truth: the view is derived, holds nothing that cannot be
+recomputed from the collection, and losing it costs one query per selector — never information.
+
+Change streams are served by replica set members only, which is an **environment requirement** the
+worker adds: a standalone MongoDB cannot run the worker. [deploy/README.md](../deploy/README.md)
+documents it for the local stack; `internal/mongotest` starts a single-member replica set with the
+same schema bootstrap for the tests that need a change stream.
 
 ## Rolling back
 

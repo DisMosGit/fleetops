@@ -45,6 +45,24 @@ a requirement on the deployment, not a checked one: validation cannot know the t
 intends, and two names that happen to collide are only a defect when both binaries are pointed at
 them. Setting both to the work queue restores exactly the bouncing this separation removes.
 
+## MongoDB topology
+
+The data model below is served by a **replica set**, not a standalone. `worker` keeps its
+eligible-device view current from a change stream over `devices` and fails its startup when it
+cannot establish one, and MongoDB serves change streams on replica set members only — so every
+environment that runs `worker` needs MongoDB started as a replica set. An environment that runs only
+`controlplane` and `agent` does not: those binaries read and write the collections without a stream.
+
+The schema is the same either way. `mongo/init.js` is applied unchanged to a replica-set member (it
+creates collections, validators, and indexes; it neither knows nor cares about the topology), and
+`internal/mongotest` starts a single-member set for the tests that need a change stream —
+`mongotest.ReplicaSet`, or `ReplicaSetStack` wired into a package's `TestMain` — applying that same
+bootstrap with `?directConnection=true`, because the initiated member advertises the port inside its
+container while a client dials the mapped one. Those tests run in
+`go test -tags integration ./internal/mongotest/` and assert both halves of the requirement: the
+replica-set stack accepts a change stream over `devices`, and the default standalone stack refuses
+one.
+
 ## MongoDB data model contract
 
 Source of truth for requirements: `openspec/specs/mongo-data-model/spec.md`. Database `fleetops`.
