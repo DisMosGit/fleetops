@@ -14,6 +14,7 @@ import (
 
 	"github.com/DisMosGit/fleetops/internal/rollout"
 	"github.com/DisMosGit/fleetops/internal/temporal"
+	"github.com/DisMosGit/fleetops/internal/testexec"
 )
 
 // The world every restart scenario drives: one region of one model running the firmware the smoke
@@ -25,6 +26,10 @@ import (
 type resumptionSampler struct {
 	states  *temporal.RolloutStates
 	rollout string
+	// grace is how long one sample's read is retried for, from the run's configuration.
+	grace time.Duration
+	// attempt bounds one state read, from the run's configuration.
+	attempt time.Duration
 
 	mu      sync.Mutex
 	last    *stateSample
@@ -43,7 +48,13 @@ type stateSample struct {
 // newResumptionSampler returns a sampler over one rollout's state query.
 func newResumptionSampler(t *testing.T, c temporalclient.Client, rolloutID string) *resumptionSampler {
 	t.Helper()
-	return &resumptionSampler{states: temporal.NewRolloutStates(c), rollout: rolloutID}
+	cfg := testexec.Get(t)
+	return &resumptionSampler{
+		states:  temporal.NewRolloutStates(c),
+		rollout: rolloutID,
+		grace:   cfg.Wait(restartQueryGrace),
+		attempt: cfg.Wait(restartQueryAttempt),
+	}
 }
 
 // sample reads the rollout's state and refuses it when it regressed against the sample before it.
@@ -51,12 +62,12 @@ func newResumptionSampler(t *testing.T, c temporalclient.Client, rolloutID strin
 // sample is taken moments after the generation that answered the previous one stopped, and a
 // workflow whose worker is gone answers nothing until one polls again.
 func (s *resumptionSampler) sample(ctx context.Context) error {
-	deadline := time.Now().Add(restartQueryGrace)
+	deadline := time.Now().Add(s.grace)
 	var lastErr error
 	attempts := 0
 	for {
 		attempts++
-		attemptCtx, cancel := context.WithTimeout(ctx, restartQueryAttempt)
+		attemptCtx, cancel := context.WithTimeout(ctx, s.attempt)
 		view, err := s.states.State(attemptCtx, s.rollout)
 		cancel()
 		if err == nil {
@@ -65,7 +76,7 @@ func (s *resumptionSampler) sample(ctx context.Context) error {
 		lastErr = err
 		if !time.Now().Before(deadline) {
 			return fmt.Errorf("read rollout %s state after a restart: %d attempts over %v: %w",
-				s.rollout, attempts, restartQueryGrace, lastErr)
+				s.rollout, attempts, s.grace, lastErr)
 		}
 		time.Sleep(smokePollInterval)
 	}

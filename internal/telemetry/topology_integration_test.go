@@ -13,6 +13,7 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 
 	"github.com/DisMosGit/fleetops/internal/rabbittest"
+	"github.com/DisMosGit/fleetops/internal/testexec"
 )
 
 // TestTopologyAgainstBroker verifies the layout against a real broker: declaration is
@@ -20,9 +21,9 @@ import (
 // the retry path returns a message to its work queue after the backoff, and a rejected delivery
 // reaches the dead-letter queue.
 func TestTopologyAgainstBroker(t *testing.T) {
-	t.Parallel()
-
-	h := rabbittest.Start(t)
+	// Deliberately not parallel: this test consumes the shared work queue and asserts on the
+	// depths its own messages leave behind, and a sequential test never overlaps a parallel one.
+	h := rabbittest.For(t)
 	ctx := context.Background()
 	// One-second first retry with a two-second cap keeps the ladder observable in a test.
 	topology := NewTopology(4, time.Second, 2*time.Second)
@@ -86,6 +87,9 @@ func TestTopologyAgainstBroker(t *testing.T) {
 			t.Fatalf("bind narrow queue: %v", err)
 		}
 		h.Purge(t, ch, HeartbeatQueue)
+		// Nothing consumes from the narrow queue, so it survives and the shared broker keeps what
+		// a previous binding routed into it.
+		h.Purge(t, ch, narrow)
 		h.AwaitDepth(t, ch, narrow, false, 0)
 
 		publish(t, sess, EventsExchange, HeartbeatRoutingKey("us-east", "v3"), "east-event", nil)
@@ -159,7 +163,7 @@ func TestTopologyAgainstBroker(t *testing.T) {
 			if err := d.Nack(false, false); err != nil {
 				t.Fatalf("nack delivery: %v", err)
 			}
-		case <-time.After(10 * time.Second):
+		case <-time.After(testexec.Get(t).Wait(10 * time.Second)):
 			t.Fatal("timed out waiting for the published delivery")
 		}
 		h.AwaitDepth(t, ch, dlq, true, 1)
@@ -172,6 +176,8 @@ func TestTopologyAgainstBroker(t *testing.T) {
 func TestTopologyDeclarationConflictFailsLoudly(t *testing.T) {
 	t.Parallel()
 
+	// This test declares an element that conflicts with the topology on purpose, so it can never
+	// share the package's broker: a broker of its own is what it asserts the conflict against.
 	h := rabbittest.Start(t)
 	ctx := context.Background()
 
@@ -199,9 +205,9 @@ func TestTopologyDeclarationConflictFailsLoudly(t *testing.T) {
 // restart: the session is re-established, the topology is re-declared, and the component keeps
 // running without a process restart.
 func TestSupervisorRecoversFromBrokerRestart(t *testing.T) {
-	t.Parallel()
-
-	h := rabbittest.Start(t)
+	// Deliberately not parallel: restarting the broker is visible to every test that shares it,
+	// and a sequential test never overlaps a parallel one.
+	h := rabbittest.For(t)
 	topology := NewTopology(3, time.Second, 4*time.Second)
 	sup := NewSupervisor(h.URL, topology, slog.New(slog.DiscardHandler))
 
@@ -243,7 +249,7 @@ func TestSupervisorRecoversFromBrokerRestart(t *testing.T) {
 		if err != nil {
 			t.Errorf("Run() error = %v, want nil on shutdown", err)
 		}
-	case <-time.After(10 * time.Second):
+	case <-time.After(testexec.Get(t).Wait(10 * time.Second)):
 		t.Fatal("Run() did not return after ctx was cancelled")
 	}
 }
@@ -254,7 +260,7 @@ func awaitSession(t *testing.T, sessions <-chan Session, what string) Session {
 	select {
 	case sess := <-sessions:
 		return sess
-	case <-time.After(90 * time.Second):
+	case <-time.After(testexec.Get(t).Wait(90 * time.Second)):
 		t.Fatalf("timed out waiting for %s", what)
 		return nil
 	}
@@ -298,7 +304,7 @@ func nextDelivery(t *testing.T, h *rabbittest.Harness, queue string) amqp.Delive
 	select {
 	case d := <-deliveries:
 		return d
-	case <-time.After(10 * time.Second):
+	case <-time.After(testexec.Get(t).Wait(10 * time.Second)):
 		t.Fatalf("timed out waiting for a delivery from %s", queue)
 		return amqp.Delivery{}
 	}

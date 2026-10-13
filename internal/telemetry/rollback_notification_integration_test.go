@@ -12,6 +12,7 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 
 	"github.com/DisMosGit/fleetops/internal/rabbittest"
+	"github.com/DisMosGit/fleetops/internal/testexec"
 )
 
 // TestRollbackNotificationsAgainstBroker verifies the notification family against a real broker:
@@ -20,9 +21,9 @@ import (
 // alone, the queue has the retry and dead-letter paths every work queue gets, and a broker restart
 // leaves the layout and its waiting events intact.
 func TestRollbackNotificationsAgainstBroker(t *testing.T) {
-	t.Parallel()
-
-	h := rabbittest.Start(t)
+	// Deliberately not parallel: restarting the broker is visible to every test that shares it,
+	// and a sequential test never overlaps a parallel one.
+	h := rabbittest.For(t)
 	ctx := context.Background()
 	topology := NewTopology(3, time.Second, time.Minute)
 	notifier := NewNotifier(h.URL, topology, slog.New(slog.DiscardHandler))
@@ -38,7 +39,16 @@ func TestRollbackNotificationsAgainstBroker(t *testing.T) {
 
 	t.Run("the queue is declared and bound before a consumer exists", func(t *testing.T) {
 		ch := h.Channel(t)
-		h.Purge(t, ch, RolloutNotificationQueue)
+		// The shared broker keeps what an earlier test left behind, and this subtest asserts on
+		// what it holds, so every queue it measures is emptied first.
+		for _, queue := range []string{
+			RolloutNotificationQueue,
+			topology.RetryQueue(RolloutNotificationQueue, 1),
+			topology.RetryQueue(RolloutNotificationQueue, 2),
+			topology.DeadLetterQueue(RolloutNotificationQueue),
+		} {
+			h.Purge(t, ch, queue)
+		}
 		// Depth 0 on a passive declaration proves the queue exists: an undeclared queue is
 		// refused by the broker.
 		if got := h.Depth(t, ch, RolloutNotificationQueue, true); got != 0 {
@@ -119,6 +129,7 @@ func TestRollbackNotificationsAgainstBroker(t *testing.T) {
 			t.Fatalf("bind the test queue: %v", err)
 		}
 		t.Cleanup(func() { h.Purge(t, ch, narrow) })
+		h.Purge(t, ch, RolloutNotificationQueue)
 
 		publish(t, session, EventsExchange, RollbackRoutingKey(RollbackStarted), "rollback-event", nil)
 		h.AwaitDepth(t, ch, narrow, false, 1)
@@ -185,7 +196,7 @@ func nextDeliveries(t *testing.T, h *rabbittest.Harness, queue string, n int) []
 		select {
 		case d := <-deliveries:
 			out = append(out, d)
-		case <-time.After(10 * time.Second):
+		case <-time.After(testexec.Get(t).Wait(10 * time.Second)):
 			t.Fatalf("timed out after %d of %d deliveries from %s", len(out), n, queue)
 		}
 	}
@@ -197,9 +208,9 @@ func nextDeliveries(t *testing.T, h *rabbittest.Harness, queue string, n int) []
 // notification queue, and the notifier reconnects after a broker restart without a process
 // restart.
 func TestNotifierAgainstBroker(t *testing.T) {
-	t.Parallel()
-
-	h := rabbittest.Start(t)
+	// Deliberately not parallel: restarting the broker is visible to every test that shares it,
+	// and a sequential test never overlaps a parallel one.
+	h := rabbittest.For(t)
 	topology := NewTopology(3, time.Second, time.Minute)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -246,7 +257,7 @@ func TestNotifierAgainstBroker(t *testing.T) {
 	// than purged against a stale channel.
 	h.Restart(t)
 	completed := rollbackAnnouncement(RollbackCompleted)
-	awaitCondition(t, "the notifier to publish after the broker restart", func() bool {
+	awaitConditionWithin(t, restartReconnectBudget, "the notifier to publish after the broker restart", func() bool {
 		return notifier.Announce(ctx, completed) == nil
 	})
 

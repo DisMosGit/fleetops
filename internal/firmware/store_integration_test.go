@@ -43,7 +43,7 @@ func (f failingMetadata) versionExists(ctx context.Context, version string) (boo
 func TestStore(t *testing.T) {
 	t.Parallel()
 
-	harness := mongotest.Start(t)
+	harness := mongotest.For(t)
 	store := NewStore(harness.DB)
 	ctx := context.Background()
 	files := harness.DB.Collection("fs.files")

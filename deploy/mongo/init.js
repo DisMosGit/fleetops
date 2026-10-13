@@ -19,7 +19,10 @@ const TELEMETRY_RETENTION_SECONDS = TELEMETRY_RETENTION_DAYS * 24 * 60 * 60;
 const PROCESSED_EVENTS_RETENTION_DAYS = Number(process.env.FLEETOPS_PROCESSED_EVENTS_RETENTION_DAYS || 7);
 const PROCESSED_EVENTS_RETENTION_SECONDS = PROCESSED_EVENTS_RETENTION_DAYS * 24 * 60 * 60;
 
-const fleet = db.getSiblingDB("fleetops");
+// FLEETOPS_DB names the database the fleet schema is created in. The local stack runs this file
+// with the variable unset and gets the default; a test harness that gives each test its own
+// database names it, so every test writes through the same validators and indexes.
+const fleet = db.getSiblingDB(process.env.FLEETOPS_DB || "fleetops");
 
 function ensureCollection(name, options) {
   if (fleet.getCollectionInfos({ name: name }).length > 0) {

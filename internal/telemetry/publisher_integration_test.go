@@ -14,16 +14,31 @@ import (
 
 	"github.com/DisMosGit/fleetops/internal/devices"
 	"github.com/DisMosGit/fleetops/internal/rabbittest"
+	"github.com/DisMosGit/fleetops/internal/testexec"
 )
 
 // TestPublisherAgainstBroker verifies publication end to end: an accepted heartbeat yields one
 // persistent event on the heartbeat work queue with the expected envelope, properties, and
 // routing key, and events keep flowing after the broker restarts.
 func TestPublisherAgainstBroker(t *testing.T) {
-	t.Parallel()
-
-	h := rabbittest.Start(t)
+	// Deliberately not parallel: restarting the broker is visible to every test that shares it,
+	// and a sequential test never overlaps a parallel one.
+	h := rabbittest.For(t)
 	topology := NewTopology(3, time.Second, time.Minute)
+	// The shared broker's queues outlive a test, so the queue this test reads is emptied first;
+	// declaring the topology is what creates it before the publisher's own goroutine does.
+	declared, err := NewSupervisor(h.URL, topology, slog.New(slog.DiscardHandler)).dial(context.Background())
+	if err != nil {
+		t.Fatalf("dial and declare: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := declared.Close(); err != nil {
+			t.Logf("close declaring session: %v", err)
+		}
+	})
+	purged := h.Channel(t)
+	h.Purge(t, purged, HeartbeatQueue)
+
 	registry := prometheus.NewRegistry()
 	metrics := NewMetrics(registry)
 	publisher := NewPublisher(h.URL, topology, 16, metrics, slog.New(slog.DiscardHandler))
@@ -38,7 +53,7 @@ func TestPublisherAgainstBroker(t *testing.T) {
 			if err != nil {
 				t.Errorf("publisher Run() error = %v, want nil on shutdown", err)
 			}
-		case <-time.After(30 * time.Second):
+		case <-time.After(testexec.Get(t).Wait(30 * time.Second)):
 			t.Error("publisher Run() did not return after shutdown")
 		}
 	})
@@ -89,7 +104,9 @@ func TestPublisherAgainstBroker(t *testing.T) {
 	// keeps publishing.
 	h.Restart(t)
 	publisher.Handle(ctx, heartbeat("ev-after-restart", rec.ID, occurred), rec)
-	awaitCondition(t, "publication to resume after the broker restart", func() bool {
+	// The reconnect backoff is capped at maxReconnectBackoff, so this wait must outlast the cap
+	// rather than the default probe budget.
+	awaitConditionWithin(t, restartReconnectBudget, "publication to resume after the broker restart", func() bool {
 		return testutil.ToFloat64(metrics.Published.WithLabelValues(HeartbeatEventType)) > published+1
 	})
 	delivery := nextDelivery(t, h, HeartbeatQueue)
@@ -104,7 +121,7 @@ func TestPublisherAgainstBroker(t *testing.T) {
 func TestUnroutablePublishIsReturnedAndCountable(t *testing.T) {
 	t.Parallel()
 
-	h := rabbittest.Start(t)
+	h := rabbittest.For(t)
 	topology := NewTopology(3, time.Second, time.Minute)
 	session, err := NewSupervisor(h.URL, topology, slog.New(slog.DiscardHandler)).dial(context.Background())
 	if err != nil {

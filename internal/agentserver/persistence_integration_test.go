@@ -19,6 +19,7 @@ import (
 	"github.com/DisMosGit/fleetops/internal/devices"
 	"github.com/DisMosGit/fleetops/internal/mongotest"
 	"github.com/DisMosGit/fleetops/internal/telemetry"
+	"github.com/DisMosGit/fleetops/internal/testexec"
 )
 
 // TestPersistencePathEndToEnd spans the whole change against the real schema: a stream
@@ -28,7 +29,7 @@ import (
 func TestPersistencePathEndToEnd(t *testing.T) {
 	t.Parallel()
 
-	harness := mongotest.Start(t)
+	harness := mongotest.For(t)
 	log := slog.New(slog.DiscardHandler)
 	store := devices.NewStore(harness.DB)
 	// One flush per full batch and never on a timer: the stored events must arrive as a
@@ -122,7 +123,7 @@ func TestPersistencePathEndToEnd(t *testing.T) {
 	}
 
 	telemetryDocs := harness.DB.Collection("telemetry")
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(testexec.Get(t).Wait(5 * time.Second))
 	for {
 		count, err := telemetryDocs.CountDocuments(ctx, map[string]any{"meta.device_id": "dev-e2e"})
 		if err != nil {
@@ -167,7 +168,7 @@ func TestPersistencePathEndToEnd(t *testing.T) {
 	sweepDone := make(chan error, 1)
 	go func() { sweepDone <- sweeper.Run(sweepCtx) }()
 
-	deadline = time.Now().Add(5 * time.Second)
+	deadline = time.Now().Add(testexec.Get(t).Wait(5 * time.Second))
 	for {
 		var doc struct {
 			Status string `bson:"status"`

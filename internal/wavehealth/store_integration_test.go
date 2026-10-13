@@ -89,7 +89,7 @@ func insertSample(t *testing.T, db *mongo.Database, eventID, deviceID string, at
 func TestStore(t *testing.T) {
 	t.Parallel()
 
-	harness := mongotest.Start(t)
+	harness := mongotest.For(t)
 	store := wavehealth.NewStore(harness.DB)
 	db := harness.DB
 	ctx := context.Background()

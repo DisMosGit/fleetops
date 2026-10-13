@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"log/slog"
+	"os"
 	"testing"
 	"time"
 
@@ -13,7 +14,21 @@ import (
 
 	"github.com/DisMosGit/fleetops/internal/devices"
 	"github.com/DisMosGit/fleetops/internal/mongotest"
+	"github.com/DisMosGit/fleetops/internal/rabbittest"
+	"github.com/DisMosGit/fleetops/internal/temporaltest"
+	"github.com/DisMosGit/fleetops/internal/testexec"
 )
+
+// TestMain starts this package's container stacks once, before the first test body, and releases
+// them when the run ends: the control plane's integration tests all need the fleet database, the
+// pipeline test drives a real broker, and the rollout-to-agent join drives a real Temporal server.
+func TestMain(m *testing.M) {
+	os.Exit(testexec.Main(m,
+		mongotest.SharedStack(),
+		rabbittest.SharedStack(),
+		temporaltest.SharedStack(),
+	))
+}
 
 // TestSweepMarksSilentDevicesOfflineAndCounts runs the wired liveness path against the real
 // schema: a device silent past the threshold flips to offline and its transition is counted
@@ -21,7 +36,7 @@ import (
 func TestSweepMarksSilentDevicesOfflineAndCounts(t *testing.T) {
 	t.Parallel()
 
-	harness := mongotest.Start(t)
+	harness := mongotest.For(t)
 	store := devices.NewStore(harness.DB)
 	_, counter := newMetrics()
 	sweeper := devices.NewSweeper(

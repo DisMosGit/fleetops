@@ -30,6 +30,7 @@ import (
 	"github.com/DisMosGit/fleetops/internal/devices"
 	"github.com/DisMosGit/fleetops/internal/firmware"
 	"github.com/DisMosGit/fleetops/internal/mongotest"
+	"github.com/DisMosGit/fleetops/internal/testexec"
 )
 
 // recordingSignaler is a hand-written agentserver.DeviceSignaler double recording the update
@@ -85,7 +86,7 @@ func (nopSink) Handle(context.Context, *agentv1.Heartbeat, devices.Record) error
 func TestFirmwarePipeline(t *testing.T) {
 	t.Parallel()
 
-	harness := mongotest.Start(t)
+	harness := mongotest.For(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	log := slog.New(slog.DiscardHandler)
@@ -289,7 +290,7 @@ func uploadFirmware(
 // (registration, dispatch, reporting) that complete in their own goroutines.
 func waitFor(t *testing.T, what string, ok func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(30 * time.Second)
+	deadline := time.Now().Add(testexec.Get(t).Wait(30 * time.Second))
 	for time.Now().Before(deadline) {
 		if ok() {
 			return

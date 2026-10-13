@@ -25,7 +25,7 @@ type deviceDoc struct {
 func TestStore(t *testing.T) {
 	t.Parallel()
 
-	harness := mongotest.Start(t)
+	harness := mongotest.For(t)
 	store := NewStore(harness.DB)
 	ctx := context.Background()
 	devices := harness.DB.Collection("devices")

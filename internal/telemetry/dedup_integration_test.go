@@ -18,7 +18,7 @@ import (
 func TestLedgerClaimAndComplete(t *testing.T) {
 	t.Parallel()
 
-	harness := mongotest.Start(t)
+	harness := mongotest.For(t)
 	ledger := NewLedger(harness.DB.Collection("processed_events"))
 	claims := harness.DB.Collection("processed_events")
 	ctx := context.Background()

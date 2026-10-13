@@ -19,6 +19,7 @@ import (
 
 	"github.com/DisMosGit/fleetops/internal/mongotest"
 	"github.com/DisMosGit/fleetops/internal/rabbittest"
+	"github.com/DisMosGit/fleetops/internal/testexec"
 )
 
 // scriptedHandler records when each event was applied and fails the calls a test scripts.
@@ -54,13 +55,6 @@ func (h *scriptedHandler) callCount(eventID string) int {
 	return len(h.calls[eventID])
 }
 
-// attempts returns the times an event was applied, oldest first.
-func (h *scriptedHandler) attempts(eventID string) []time.Time {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return append([]time.Time(nil), h.calls[eventID]...)
-}
-
 // consumerFixture is a running consumer with the real broker, store, and metrics behind it.
 type consumerFixture struct {
 	rabbit    *rabbittest.Harness
@@ -77,7 +71,10 @@ type consumerFixture struct {
 func startConsumer(t *testing.T, maxAttempts int, retryBase, retryMax time.Duration, handler Handler) *consumerFixture {
 	t.Helper()
 
-	store := mongotest.Start(t)
+	store := mongotest.For(t)
+	// The ladder this test declares — a 200ms first backoff — is a different retry-queue
+	// declaration from the rest of the package's, and a queue's TTL is part of its declaration,
+	// so this test needs a broker of its own rather than the package's shared one.
 	rabbit := rabbittest.Start(t)
 	topology := NewTopology(maxAttempts, retryBase, retryMax)
 	work, err := topology.WorkQueue(HeartbeatQueue)
@@ -107,7 +104,7 @@ func startConsumer(t *testing.T, maxAttempts int, retryBase, retryMax time.Durat
 			if err != nil {
 				t.Errorf("consumer Run() error = %v, want nil on shutdown", err)
 			}
-		case <-time.After(30 * time.Second):
+		case <-time.After(testexec.Get(t).Wait(30 * time.Second)):
 			t.Error("consumer Run() did not return after shutdown")
 		}
 	})
@@ -120,6 +117,19 @@ func startConsumer(t *testing.T, maxAttempts int, retryBase, retryMax time.Durat
 		consumer:  consumer,
 		ledger:    ledger,
 		publisher: newBrokerPublisher(t, rabbit, topology),
+	}
+}
+
+// purgeMeasuredQueues empties the heartbeat work queue, its retry queues, and its dead-letter
+// queue before a test publishes, so what it consumes and counts is its own case and not what the
+// shared broker still holds from another test.
+func purgeMeasuredQueues(t *testing.T, f *consumerFixture) {
+	t.Helper()
+	for _, queue := range f.topology.Queues() {
+		if queue.Kind == QueueKindWork && queue.Name != HeartbeatQueue {
+			continue
+		}
+		f.rabbit.Purge(t, f.publisher.ch, queue.Name)
 	}
 }
 
@@ -184,14 +194,26 @@ func (p *brokerPublisher) assertRouted(t *testing.T, eventID string) {
 	select {
 	case returned := <-p.returns:
 		t.Fatalf("event %s was unroutable under %s", eventID, returned.RoutingKey)
-	case <-time.After(100 * time.Millisecond):
+	case <-time.After(testexec.Get(t).Wait(100 * time.Millisecond)):
 	}
 }
+
+// restartReconnectBudget outlasts the supervisor's reconnect backoff, which is capped at
+// maxReconnectBackoff: a broker that stays down long enough to reach the cap reconnects on the
+// far side of it, so a post-restart wait shorter than the cap reads as a failure of a healthy
+// component.
+const restartReconnectBudget = 3 * maxReconnectBackoff
 
 // awaitCondition waits until check holds, failing the test with what when it never does.
 func awaitCondition(t *testing.T, what string, check func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(20 * time.Second)
+	awaitConditionWithin(t, 20*time.Second, what, check)
+}
+
+// awaitConditionWithin waits until check holds within the given budget.
+func awaitConditionWithin(t *testing.T, within time.Duration, what string, check func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(testexec.Get(t).Wait(within))
 	for {
 		if check() {
 			return
@@ -214,7 +236,7 @@ func awaitOutcome(t *testing.T, f *consumerFixture, outcome string, want float64
 // awaitDepth waits until a queue of the topology holds want messages.
 func awaitDepth(t *testing.T, f *consumerFixture, ch *amqp.Channel, queue string, want int) {
 	t.Helper()
-	deadline := time.Now().Add(20 * time.Second)
+	deadline := time.Now().Add(testexec.Get(t).Wait(20 * time.Second))
 	var got int
 	for {
 		got = f.rabbit.Depth(t, ch, queue, true)
@@ -282,10 +304,10 @@ func heartbeatEvent(eventID, deviceID string, health float64, observedAt time.Ti
 // redelivery changes nothing and is counted as a duplicate, and a healthy heartbeat writes no
 // alert.
 func TestConsumerProcessesDeduplicatesAndAlerts(t *testing.T) {
-	t.Parallel()
-
-	store := mongotest.Start(t)
-	rabbit := rabbittest.Start(t)
+	// Deliberately not parallel: this test owns the shared work queue's only consumer while it
+	// asserts what its own events did, and a sequential test never overlaps a parallel one.
+	store := mongotest.For(t)
+	rabbit := rabbittest.For(t)
 	topology := NewTopology(2, time.Second, 2*time.Second)
 	work, err := topology.WorkQueue(HeartbeatQueue)
 	if err != nil {
@@ -312,7 +334,7 @@ func TestConsumerProcessesDeduplicatesAndAlerts(t *testing.T) {
 			if err != nil {
 				t.Errorf("consumer Run() error = %v, want nil on shutdown", err)
 			}
-		case <-time.After(30 * time.Second):
+		case <-time.After(testexec.Get(t).Wait(30 * time.Second)):
 			t.Error("consumer Run() did not return after shutdown")
 		}
 	})
@@ -328,6 +350,7 @@ func TestConsumerProcessesDeduplicatesAndAlerts(t *testing.T) {
 	observedAt := time.Now().UTC().Add(-time.Minute).Truncate(time.Millisecond)
 	degraded := heartbeatEvent("ev-degraded", "dev-degraded", 0.3, observedAt)
 
+	purgeMeasuredQueues(t, fixture)
 	fixture.publisher.publish(t, degraded, 1)
 	awaitOutcome(t, fixture, outcomeProcessed, 1)
 
@@ -395,6 +418,7 @@ func TestConsumerRetriesThenDeadLetters(t *testing.T) {
 	dlq := fixture.topology.DeadLetterQueue(HeartbeatQueue)
 	observedAt := time.Now().UTC().Add(-time.Minute).Truncate(time.Millisecond)
 
+	purgeMeasuredQueues(t, fixture)
 	start := time.Now()
 	fixture.publisher.publish(t, heartbeatEvent("ev-flaky", "dev-flaky", 0.3, observedAt), 1)
 	awaitCondition(t, "the flaky event to be applied three times", func() bool {

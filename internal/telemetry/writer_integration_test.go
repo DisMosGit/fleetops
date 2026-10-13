@@ -14,12 +14,13 @@ import (
 
 	"github.com/DisMosGit/fleetops/internal/devices"
 	"github.com/DisMosGit/fleetops/internal/mongotest"
+	"github.com/DisMosGit/fleetops/internal/testexec"
 )
 
 func TestWriterIngest(t *testing.T) {
 	t.Parallel()
 
-	harness := mongotest.Start(t)
+	harness := mongotest.For(t)
 	db := harness.DB
 	store := devices.NewStore(db)
 	telemetry := db.Collection("telemetry")
@@ -39,7 +40,7 @@ func TestWriterIngest(t *testing.T) {
 	// waitEvents waits until one device has want stored events.
 	waitEvents := func(t *testing.T, deviceID string, want int64) {
 		t.Helper()
-		deadline := time.Now().Add(5 * time.Second)
+		deadline := time.Now().Add(testexec.Get(t).Wait(5 * time.Second))
 		for {
 			got := countEvents(t, deviceID)
 			if got == want {

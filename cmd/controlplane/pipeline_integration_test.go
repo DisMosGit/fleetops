@@ -27,6 +27,7 @@ import (
 	"github.com/DisMosGit/fleetops/internal/mongotest"
 	"github.com/DisMosGit/fleetops/internal/rabbittest"
 	"github.com/DisMosGit/fleetops/internal/telemetry"
+	"github.com/DisMosGit/fleetops/internal/testexec"
 )
 
 // nopSignaler is a hand-written DeviceSignaler double that swallows signals: this test drives the
@@ -68,13 +69,16 @@ func (nopCommandHandler) Handle(context.Context, *agentv1.Command) error { retur
 // metrics reflect the pipeline, and a broker outage only raises the drop counter while heartbeats
 // keep being persisted.
 func TestEventPipelineEndToEnd(t *testing.T) {
-	t.Parallel()
+	// Deliberately not parallel: the test stops the broker to observe an outage, and that is
+	// visible to every test sharing it. A sequential test never overlaps a parallel one.
 
-	store := mongotest.Start(t)
-	broker := rabbittest.Start(t)
+	store := mongotest.For(t)
+	broker := rabbittest.For(t)
 
 	cfg := config.Defaults()
-	cfg.MongoDB.Database = "fleetops"
+	// The pipeline writes where this test reads, which is the database the shared stack handed
+	// out rather than the default one.
+	cfg.MongoDB.Database = store.Database
 	cfg.RabbitMQ.URL = broker.URL
 	cfg.RabbitMQ.PublishBuffer = 256
 	cfg.RabbitMQ.QueueDepthInterval = config.Duration{Duration: 200 * time.Millisecond}
@@ -260,13 +264,14 @@ func TestEventPipelineEndToEnd(t *testing.T) {
 // awaitCondition waits until check holds, failing the test with what when it never does.
 func awaitCondition(t *testing.T, what string, check func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(90 * time.Second)
+	grace := testexec.Get(t).Wait(90 * time.Second)
+	deadline := time.Now().Add(grace)
 	for {
 		if check() {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for %s", what)
+			t.Fatalf("timed out waiting for %s within %v", what, grace)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}

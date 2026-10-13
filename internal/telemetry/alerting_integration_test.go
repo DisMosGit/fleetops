@@ -29,7 +29,7 @@ type alertDocument struct {
 func TestAlertingAgainstStore(t *testing.T) {
 	t.Parallel()
 
-	harness := mongotest.Start(t)
+	harness := mongotest.For(t)
 	alerts := harness.DB.Collection("device_alerts")
 	handler := NewAlerting(alerts, 0.6)
 	ctx := context.Background()

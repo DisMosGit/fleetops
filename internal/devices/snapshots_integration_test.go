@@ -36,7 +36,7 @@ type snapshotConfigDoc struct {
 func TestSnapshotStore(t *testing.T) {
 	t.Parallel()
 
-	harness := mongotest.Start(t)
+	harness := mongotest.For(t)
 	store := NewSnapshotStore(harness.DB)
 	ctx := context.Background()
 	coll := harness.DB.Collection("device_state_snapshots")

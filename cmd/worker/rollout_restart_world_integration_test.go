@@ -20,6 +20,7 @@ import (
 	"github.com/DisMosGit/fleetops/internal/telemetry"
 	"github.com/DisMosGit/fleetops/internal/temporal"
 	"github.com/DisMosGit/fleetops/internal/temporaltest"
+	"github.com/DisMosGit/fleetops/internal/testexec"
 )
 
 // The world every restart scenario drives: one region of one model running the firmware the smoke
@@ -101,9 +102,9 @@ func newRestartWorld(t *testing.T, opts worldOptions) *restartWorld {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 
-	db := mongotest.Start(t).DB
-	broker := rabbittest.Start(t)
-	server := temporaltest.Start(t)
+	db := mongotest.For(t).DB
+	broker := rabbittest.For(t)
+	server := temporaltest.For(t)
 
 	cfg := config.Defaults()
 	cfg.Temporal.Address = server.Address
@@ -142,6 +143,12 @@ func newRestartWorld(t *testing.T, opts worldOptions) *restartWorld {
 	notifierRun, notifierReady := startNotifier(notifier, ctx)
 	go func() { _ = notifierRun() }()
 	<-notifierReady
+
+	// The notifier declares the notification queue, so it exists by now. Drain it before the
+	// scenario starts: the announcement depth a scenario asserts has to measure that scenario,
+	// and the scenarios share one broker.
+	notifications := broker.Channel(t)
+	broker.Purge(t, notifications, telemetry.RolloutNotificationQueue)
 
 	ledger := &attemptLedger{}
 	gate := newActivityGate(opts.plan, ledger)
@@ -281,14 +288,15 @@ func (w *restartWorld) breakFleet() {
 // awaitFleetSamples waits until the fleet has reported more than after samples.
 func (w *restartWorld) awaitFleetSamples(after int64) {
 	w.t.Helper()
-	deadline := time.Now().Add(restartFleetReportGrace)
+	grace := testexec.Get(w.t).Wait(restartFleetReportGrace)
+	deadline := time.Now().Add(grace)
 	for time.Now().Before(deadline) {
 		if w.fleetSamples() > after {
 			return
 		}
 		time.Sleep(smokePollInterval)
 	}
-	w.t.Fatalf("the fleet reported no sample beyond %d within %v", after, restartFleetReportGrace)
+	w.t.Fatalf("the fleet reported no sample beyond %d within %v", after, grace)
 }
 
 // startRollout starts the scenario's rollout with the world's wave sequence, through the same

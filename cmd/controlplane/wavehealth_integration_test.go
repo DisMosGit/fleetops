@@ -91,7 +91,7 @@ func insertHeartbeat(t *testing.T, db *mongo.Database, eventID, deviceID string,
 func TestGetWaveHealthServesAHandInsertedWave(t *testing.T) {
 	t.Parallel()
 
-	db := mongotest.Start(t).DB
+	db := mongotest.For(t).DB
 	log := slog.New(slog.DiscardHandler)
 
 	cfg := config.Defaults()
@@ -186,7 +186,7 @@ func TestGetWaveHealthServesAHandInsertedWave(t *testing.T) {
 func TestNewWaveHealthServiceRefusesAnUnknownRollout(t *testing.T) {
 	t.Parallel()
 
-	db := mongotest.Start(t).DB
+	db := mongotest.For(t).DB
 	cfg := config.Defaults()
 	service := newWaveHealthService(cfg, db, slog.New(slog.DiscardHandler))
 
