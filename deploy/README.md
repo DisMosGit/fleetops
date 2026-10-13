@@ -108,11 +108,25 @@ Indexes: `_id_` (unique, device identity), `idx_region_model {region, model}`, `
 | `size` | number | size of the stored binary in bytes (required) |
 | `created_at` | date | time the upload was recorded (required) |
 | `gridfs_id` | string | reference to the binary in GridFS (required) |
+| `state` | string | the upload's state: `accepted`, `storing`, `available`, or `failed` |
+| `upload_workflow_id` | string | id of the workflow execution owning the upload (`firmware-upload-<version>`) |
+| `failure_reason` | string | operator-safe reason the upload concluded failed |
 
 Metadata never holds the payload itself — binaries live in GridFS and persist exactly as long as
 a metadata document references them. A metadata document whose `gridfs_id` does not resolve to a
-GridFS object must be rejected by the write path (enforced when the firmware workflow lands;
-the schema validator enforces the required fields and types).
+GridFS object must be rejected by the write path: the upload's storage step writes the binary
+before the record that references it, and an upload whose record cannot be completed removes both,
+so no record outlives its binary (the schema validator enforces the required fields and types).
+
+The document is owned by the firmware upload's workflow, which runs in the control plane: it
+creates the record as `accepted` when it claims the version, moves it to `storing` before the
+binary streams into GridFS, and concludes it as `available` with the binary's facts or as `failed`
+with a reason. A record in `accepted` or `storing` is an upload still in progress, so its
+`checksum`, `size`, and `gridfs_id` are empty until it becomes available; a reader that needs a
+deployable firmware reads the state, and only an `available` record is one. The state field is
+additive — the validator declares `properties` without `additionalProperties: false`, so a document
+written before uploads carried a state stays valid, and a reader treats the missing state as
+unknown rather than as a failure.
 
 Indexes: `_id_` (unique), `idx_version {version}` (unique). No TTL.
 

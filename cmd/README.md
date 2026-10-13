@@ -24,7 +24,18 @@ construct dependencies, and start the run loop.
   the operator's HTTP gateway: the firmware upload API and the rollout API, each under its own
   path prefix (see [The operator HTTP API](#the-operator-http-api)). The gateway's SSE routes
   join the same listener at stage 5. It polls `temporal.dispatch_task_queue` and registers
-  `dispatch-command` there — see [Task queues](#task-queues).
+  `dispatch-command` there, together with the firmware upload's workflow and activities — see
+  [Task queues](#task-queues) and [Uploading a firmware](#uploading-a-firmware).
+- `controlplane` also owns firmware uploads. `POST /api/firmwares` spools the request's binary to
+  `firmware.spool_dir` and starts (or attaches to) `firmware-workflow` under the version's
+  identity `firmware-upload-<version>`; the workflow drives `validate-firmware-models`,
+  `store-firmware-binary`, `upsert-firmware-metadata`, and — when an upload stored a binary it
+  cannot record — `discard-firmware-upload` as activities, all on `temporal.dispatch_task_queue`,
+  and the endpoint answers with the upload's outcome. The spool file is removed once the upload
+  concludes, except when the upload outlives `firmware.wait_timeout` and keeps streaming; files a
+  crash abandoned are swept at startup once they are older than `firmware.max_spool_age`. The
+  worker registers none of it: the binary arrives in this process and the store binding the
+  upload's steps write through is here.
 - `worker` hosts the device entity and the canary rollout on `temporal.task_queue`. For the
   entity it registers `DeviceWorkflow` and the `snapshot-device-state` activity (the projection of
   device state into `device_state_snapshots`); for a rollout it registers `rollout-workflow` and
@@ -60,16 +71,16 @@ The two binaries poll two different Temporal task queues, and neither polls the 
 | Queue | Configured by | Polled by | Task types that run on it |
 |---|---|---|---|
 | `temporal.task_queue` (`fleetops`) | `-config` | `worker` replicas only | `device-workflow`, `snapshot-device-state`, `rollout-workflow`, and the nine rollout activities |
-| `temporal.dispatch_task_queue` (`fleetops-controlplane`) | `-config` | `controlplane` only | `dispatch-command` |
+| `temporal.dispatch_task_queue` (`fleetops-controlplane`) | `-config` | `controlplane` only | `dispatch-command`, `firmware-workflow`, `validate-firmware-models`, `store-firmware-binary`, `upsert-firmware-metadata`, `discard-firmware-upload` |
 
 The split is not cosmetic. Temporal delivers a task to **any** poller of its queue, not to a poller
 that registered that task type — a process handed a type it does not host fails it as unknown and
 the task is redelivered with retry backoff until a process that hosts it picks it up. So the rule
 each binary follows is: poll a queue only if you register every task type that queue can deliver.
 `worker` registers the whole work queue and polls only it; `controlplane` registers
-`dispatch-command` and polls only the queue that carries it. A workflow or activity added to the
-work queue later is therefore delivered to the workers by construction, with nothing to remember in
-the control plane.
+`dispatch-command` and the firmware upload's workflow and activities, and polls only the queue that
+carries them. A workflow or activity added to the work queue later is therefore delivered to the
+workers by construction, with nothing to remember in the control plane.
 
 Where a task runs is decided by where its **side effect** lives, not by tidiness:
 
@@ -77,6 +88,13 @@ Where a task runs is decided by where its **side effect** lives, not by tidiness
   `agentserver.Hub` inside the control-plane process — so the activity is scheduled on the
   control-plane queue and executed there. A device workflow schedules it explicitly, on the queue
   carried in its entity settings, rather than on the queue the workflow itself runs on.
+- The firmware upload's workflow and activities run in `controlplane` for the same rule in the
+  other direction: the binary arrives there as an HTTP request body, so the storage step's side
+  effect — the stream from the spooled file into GridFS — is there, and the store binding its
+  metadata write needs is there. The workflow runs on the control-plane queue too, so its
+  activities inherit it and no upload task can be delivered to a worker that hosts none of them.
+  The worker registers neither, and the upload's document is the only trace of it the worker's
+  rollout reads.
 - Every rollout activity, including `announce-rollback`, runs in `worker`, because the publisher a
   rollback's announcement goes through is hosted by the process that runs the rollback.
 
@@ -230,6 +248,8 @@ failure rather than holding an operator's request open behind a query nothing is
 
 | Route | Purpose |
 |---|---|
+| `POST /api/firmwares` | upload one firmware binary with its metadata |
+| `GET /api/firmwares/{version}` | read the state of one version's upload |
 | `POST /api/rollouts` | start a rollout |
 | `GET /api/rollouts/{id}` | read a rollout's current state |
 | `POST /api/rollouts/{id}/approve` | authorize the next approval-gated wave |
@@ -239,6 +259,64 @@ failure rather than holding an operator's request open behind a query nothing is
 A rollout that has entered rollback ignores `approve`, `pause`, and `resume`: its compensations are
 not interruptible, and the call is still answered `202` because the rollout is not concluded (see
 [Rolling back](#rolling-back)).
+
+### Uploading a firmware
+
+```sh
+curl -sS -X POST localhost:8080/api/firmwares \
+  -F version=2.0.0 -F models=oak-s3,birch-x1 -F binary=@firmware-2.0.0.bin
+```
+
+```json
+{"id":"fw-1a2b3c","version":"2.0.0","models":["oak-s3","birch-x1"],"checksum":"9f2c…","size":1048576}
+```
+
+**The version is the upload's identity.** `POST /api/firmwares` spools the request's binary under
+`firmware.spool_dir` and starts the workflow `firmware-workflow` under the id
+`firmware-upload-<version>` on `temporal.dispatch_task_queue` (see [Task queues](#task-queues)).
+The workflow owns the upload from acceptance to its outcome — it validates the target models
+(`validate-firmware-models`), claims the version's firmware document, streams the spooled binary
+into GridFS as its checksum is computed (`store-firmware-binary`), and records each state
+transition on the document (`upsert-firmware-metadata`) — and the endpoint waits for that outcome
+within `firmware.wait_timeout`. A second upload of the same version reaches the existing execution
+instead of starting a second one, so a retried upload never stores a version twice: it is either
+answered the conflict (another upload of that version is in flight, or one already concluded) or
+the outcome the existing execution recorded.
+
+An upload's state is a `state` field on its firmware document: `accepted`, `storing`, `available`,
+or `failed`, with the owning workflow execution and, for a failure, an operator-safe reason. Read
+it with the state query; it answers while the upload runs, so a caller whose request timed out —
+or one that was refused because another upload holds the version — learns the outcome without
+starting anything new:
+
+```sh
+curl -sS localhost:8080/api/firmwares/2.0.0
+```
+
+```json
+{"version":"2.0.0","state":"available","concluded":true,"firmware_id":"fw-1a2b3c",
+ "models":["oak-s3","birch-x1"],"checksum":"9f2c…","size":1048576}
+```
+
+The state query answers `200` with the state above while the upload runs or after it concluded,
+`404` for a version with no upload at all — including one refused before it claimed a record — and
+`500` when the state cannot be read.
+
+| Status | Meaning |
+|---|---|
+| `201 Created` | the upload became available; the body is the stored firmware record |
+| `400 Bad Request` | the request carries no `binary` part, no `version`, or no `models` field |
+| `409 Conflict` | that version already has an upload: one is in flight, or one already concluded |
+| `422 Unprocessable Entity` | a target model no registered device runs; nothing is stored |
+| `504 Gateway Timeout` | the upload outlived `firmware.wait_timeout`; it continues durably, and `GET /api/firmwares/{version}` reports it |
+| `500 Internal Server Error` | the backend could not be reached, or the upload failed for another reason |
+| `405 Method Not Allowed` | the route exists under another method |
+
+The upload's spooled binary lives in `firmware.spool_dir` (default `<os.TempDir()>/fleetops-firmware`)
+only until its upload concludes; a control plane that dies mid-upload leaves the file behind, and
+the next startup removes the files older than `firmware.max_spool_age` (default `1h`). Age is the
+criterion, not presence: a spool file another replica is still uploading through is not this
+replica's to delete.
 
 ### Starting a rollout
 
@@ -378,3 +456,39 @@ than by a version it never had.
   periodic heartbeats (event id, firmware, status, cpu/mem/health) over one multiplexed
   `AgentService.Connect` stream that re-registers and reconnects with capped exponential
   backoff, and stops cleanly on SIGINT/SIGTERM.
+
+## Agent emulator faults and download retry
+
+`agent` downloads each dispatched firmware through the real downloader and retries a transient
+download failure — a transfer fault or a stall — up to `simulation.faults.attempts` attempts in
+total. The wait between attempts starts at 100 ms and doubles, never past
+`simulation.faults.backoff_cap`. A failure a retry cannot clear — a checksum mismatch between the
+transfer and the command, or a malformed transfer — fails the attempt at once without spending
+the rest of the budget. Retrying wraps the download only: each attempt announces the downloading
+phase again, and the command still produces exactly one terminal result.
+
+A positive `simulation.faults.share` also puts the seeded fault injector in front of the
+downloader, so the configured share of download attempts stalls or fails before any byte is
+fetched. Decisions are drawn per device from the emulator's seed, so the same seed replays the
+same faults and one device's faults never depend on another device's draws. The settings:
+
+```yaml
+simulation:
+  faults:
+    # Probability that one download attempt faults, in [0, 1]; the default injects none.
+    share: 0.0
+    # Fault kinds an injected attempt draws from: a stall, or an immediate transfer failure.
+    kinds: ["stall", "transfer"]
+    # How long an injected stall waits before its attempt fails (Go duration string), and
+    # required only while "stall" is one of the kinds.
+    stall_duration: "5s"
+    # Total download attempts one update command may make; 0 or 1 makes a single attempt.
+    attempts: 3
+    # Upper bound on the wait between two download attempts (Go duration string).
+    backoff_cap: "5s"
+```
+
+With the default `share: 0.0` the injector is not installed at all: every download takes the
+real path, unchanged, under the retry budget above. Raise the share to make the configured
+portion of the fleet's downloads stall or fail, which is what exercises the retry and the
+failed-report path end to end.
