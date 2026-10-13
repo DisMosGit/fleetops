@@ -156,7 +156,10 @@ type fakeBinaries struct {
 	openErr   error
 	removeErr error
 	puts      int
-	removed   []string
+	// opens counts the reads of stored binaries, which is what a test asserting that a lookup
+	// never touches the payload observes.
+	opens   int
+	removed []string
 }
 
 // newFakeBinaries returns an empty fake binary store.
@@ -180,8 +183,9 @@ func (f *fakeBinaries) put(_ context.Context, ref, name string, r io.Reader) (in
 	return int64(len(data)), nil
 }
 
-// open returns a reader over the stored bytes.
+// open returns a reader over the stored bytes, counting the read.
 func (f *fakeBinaries) open(_ context.Context, ref string) (io.ReadCloser, error) {
+	f.opens++
 	if f.openErr != nil {
 		return nil, f.openErr
 	}
@@ -480,6 +484,42 @@ func TestMetadataByVersion(t *testing.T) {
 		_, err := store.MetadataByVersion(context.Background(), "9.9.9")
 		if !errors.Is(err, ErrNotFound) {
 			t.Fatalf("MetadataByVersion() error = %v, want ErrNotFound", err)
+		}
+	})
+
+	// The scenario "Resolving a version reads metadata, not payloads" is what this case backs: a
+	// resolution returns the metadata record and reads no stored binary. Its own store is used so
+	// the read count is this case's own, and it fails if the lookup is ever rerouted through the
+	// binary seam — for instance by resolving through Open.
+	t.Run("resolving a version reads no stored binary", func(t *testing.T) {
+		t.Parallel()
+
+		meta := newFakeMetadata()
+		bins := newFakeBinaries()
+		store := &Store{meta: meta, binaries: bins}
+		stored, err := store.Save(context.Background(), "1.0.0", []string{"oak-s3"},
+			strings.NewReader("binary"))
+		if err != nil {
+			t.Fatalf("Save() error = %v", err)
+		}
+		reads := bins.opens
+
+		got, err := store.MetadataByVersion(context.Background(), "1.0.0")
+		if err != nil {
+			t.Fatalf("MetadataByVersion() error = %v", err)
+		}
+		if diff := cmp.Diff(stored, got); diff != "" {
+			t.Errorf("MetadataByVersion() mismatch (-want +got):\n%s", diff)
+		}
+		if bins.opens != reads {
+			t.Errorf("MetadataByVersion() opened the stored binary %d times, want metadata only",
+				bins.opens-reads)
+		}
+		if len(bins.removed) != 0 {
+			t.Errorf("MetadataByVersion() removed %v, want the binary left in storage", bins.removed)
+		}
+		if _, ok := bins.stored[stored.GridFSID]; !ok {
+			t.Errorf("the binary at %s is gone, want it left in GridFS", stored.GridFSID)
 		}
 	})
 
