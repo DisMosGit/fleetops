@@ -115,6 +115,75 @@ func TestPublisherAgainstBroker(t *testing.T) {
 	}
 }
 
+// TestPublisherRepublishesRedeliveredHeartbeatsWithTheirIdentity backs the scenario "Redelivered
+// heartbeats are published with their original identity" (heartbeat-event-publication): a
+// heartbeat an agent resends with its original event id after a stream reconnect is published
+// again, carrying that same id, so a consumer recognises it as an event it already processed.
+func TestPublisherRepublishesRedeliveredHeartbeatsWithTheirIdentity(t *testing.T) {
+	// Deliberately not parallel: it reads the package's shared heartbeat work queue.
+	h := rabbittest.For(t)
+	topology := NewTopology(3, time.Second, time.Minute)
+	// Declaration is what creates the queue this test reads, so the topology is declared before
+	// the publisher's own goroutine could be the one to do it.
+	declared, err := NewSupervisor(h.URL, topology, slog.New(slog.DiscardHandler)).dial(context.Background())
+	if err != nil {
+		t.Fatalf("dial and declare: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := declared.Close(); err != nil {
+			t.Logf("close declaring session: %v", err)
+		}
+	})
+	purged := h.Channel(t)
+	h.Purge(t, purged, HeartbeatQueue)
+
+	registry := prometheus.NewRegistry()
+	metrics := NewMetrics(registry)
+	publisher := NewPublisher(h.URL, topology, 16, metrics, slog.New(slog.DiscardHandler))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- publisher.Run(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("publisher Run() error = %v, want nil on shutdown", err)
+			}
+		case <-time.After(testexec.Get(t).Wait(30 * time.Second)):
+			t.Error("publisher Run() did not return after shutdown")
+		}
+	})
+
+	rec := devices.Record{ID: "dev-redelivered", Region: "eu-west", Model: "v3"}
+	occurred := time.Now().UTC().Add(-time.Second).Truncate(time.Millisecond)
+	// One heartbeat, handled twice: the second handle is the agent's resend of the event it never
+	// saw accepted, after its stream reconnected.
+	hb := heartbeat("ev-redelivered", rec.ID, occurred)
+
+	published := testutil.ToFloat64(metrics.Published.WithLabelValues(HeartbeatEventType))
+	for _, send := range []string{"the first publication", "the resend"} {
+		want := published + 1
+		publisher.Handle(ctx, hb, rec)
+		awaitCondition(t, "the published event of "+send, func() bool {
+			return testutil.ToFloat64(metrics.Published.WithLabelValues(HeartbeatEventType)) == want
+		})
+		delivery := nextDelivery(t, h, HeartbeatQueue)
+		if got := delivery.MessageId; got != "ev-redelivered" {
+			t.Errorf("%s: message id = %q, want the original event id ev-redelivered", send, got)
+		}
+		event := mustDecode(t, delivery.Body)
+		if event.EventID != "ev-redelivered" {
+			t.Errorf("%s: envelope event id = %q, want the original ev-redelivered", send, event.EventID)
+		}
+		if !event.OccurredAt.Equal(occurred) {
+			t.Errorf("%s: envelope occurred_at = %v, want the measurement time %v", send, event.OccurredAt, occurred)
+		}
+		published = want
+	}
+}
+
 // TestUnroutablePublishIsReturnedAndCountable verifies the mandatory-publish contract against a
 // real broker: an event no binding matches comes back instead of vanishing, so the publisher can
 // count it as a failure and name the key in a log line.

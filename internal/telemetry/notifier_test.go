@@ -302,6 +302,102 @@ func TestNotifierReportsWhatTheBrokerDidWithTheEvent(t *testing.T) {
 	}
 }
 
+// TestNotifierRetriesARejectedPublication backs the scenario "A rejected publication is retried"
+// (rollback-notification): a publication the broker rejects, cannot route, or loses with its
+// connection is reported as a failure — the announcing step is never recorded as complete on the
+// strength of the failed attempt — and the retried announcement is published, carrying the event's
+// own identity rather than a second event's.
+func TestNotifierRetriesARejectedPublication(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		verdict verdict
+		want    string
+	}{
+		{
+			name:    "a rejected publication",
+			verdict: verdict{ack: false},
+			want:    "broker rejected rollback announcement",
+		},
+		{
+			name:    "a publication no queue is bound to",
+			verdict: verdict{ack: true, returned: true},
+			want:    "no queue is bound to " + RollbackRoutingKey(RollbackStarted),
+		},
+		{
+			name:    "a publication lost with its connection",
+			verdict: verdict{err: errors.New("connection reset")},
+			want:    "connection reset",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			// The first session answers the first attempt the way the broker answered it; the
+			// second is the session a reconnect opens for the retry.
+			first := newFakeSession().script(tc.verdict)
+			second := newFakeSession().script(verdict{ack: true})
+			sessions := []*fakeSession{first, second}
+			notifier := newTestNotifier()
+			var opened int
+			notifier.supervisor.open = func(context.Context) (Session, error) {
+				session := sessions[min(opened, len(sessions)-1)]
+				opened++
+				return session, nil
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			done := make(chan error, 1)
+			go func() { done <- notifier.Run(ctx) }()
+
+			event := rollbackAnnouncement(RollbackStarted)
+			err := notifier.Announce(ctx, event)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Announce() error = %v, want the failed attempt reported as %q", err, tc.want)
+			}
+			// The refused publication is retried, and the retry succeeds.
+			if err := notifier.Announce(ctx, event); err != nil {
+				t.Fatalf("Announce() on the retry error = %v, want the retry to publish", err)
+			}
+
+			publishes := append(first.publishes(), second.publishes()...)
+			if len(publishes) != 2 {
+				t.Fatalf("publishes = %d, want the failed attempt and its retry", len(publishes))
+			}
+			wantKey := RollbackRoutingKey(RollbackStarted)
+			for i, sent := range publishes {
+				if sent.exchange != EventsExchange || sent.key != wantKey {
+					t.Errorf("publish %d went to %s under %q, want %s under %q",
+						i+1, sent.exchange, sent.key, EventsExchange, wantKey)
+				}
+				if sent.msg.MessageId != event.EventID {
+					t.Errorf("publish %d message id = %q, want the announcement's identity %q",
+						i+1, sent.msg.MessageId, event.EventID)
+				}
+			}
+			attempt, err := DecodeRollbackEvent(publishes[0].msg.Body)
+			if err != nil {
+				t.Fatalf("decode the failed attempt: %v", err)
+			}
+			retried, err := DecodeRollbackEvent(publishes[1].msg.Body)
+			if err != nil {
+				t.Fatalf("decode the retry: %v", err)
+			}
+			if diff := cmp.Diff(attempt, retried); diff != "" {
+				t.Errorf("the retry published a different event (-attempt +retry):\n%s", diff)
+			}
+
+			cancel()
+			if err := <-done; err != nil {
+				t.Errorf("Run() error = %v, want nil on shutdown", err)
+			}
+		})
+	}
+}
+
 // TestNotifierRefusesAnEventItCannotPublish pins that an event the notifier cannot represent never
 // reaches the broker: nothing is published and the caller is told why.
 func TestNotifierRefusesAnEventItCannotPublish(t *testing.T) {
