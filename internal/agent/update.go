@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"time"
 
 	agentv1 "github.com/DisMosGit/fleetops/api/proto/agent/v1"
 )
@@ -30,21 +31,50 @@ type FirmwareAdopter interface {
 	SetFirmware(deviceID, version string) error
 }
 
+// RetryInitial is the wait before the first firmware-download retry; the wait doubles from
+// there, capped by the retry policy's Max.
+const RetryInitial = 100 * time.Millisecond
+
+// defaultRetryAttempts and defaultRetryMax bound the retries of a handler built without an
+// explicit policy.
+const (
+	defaultRetryAttempts = 3
+	defaultRetryMax      = 5 * time.Second
+)
+
+// FetchRetry bounds the retry of a failed firmware fetch: how many attempts one command may
+// make in total, and the cap on the wait between them. Its zero value makes a single attempt,
+// so a handler left at the zero value never retries.
+type FetchRetry struct {
+	// Attempts is the total number of fetch attempts one command may make; below one means one.
+	Attempts int
+	// Max caps the wait between two attempts; zero makes the wait immediate.
+	Max time.Duration
+}
+
+// defaultFetchRetry returns the retry policy of a handler built without an explicit one.
+func defaultFetchRetry() FetchRetry {
+	return FetchRetry{Attempts: defaultRetryAttempts, Max: defaultRetryMax}
+}
+
 // UpdateHandler executes the commands the control plane dispatches to the devices behind one
 // agent. A StartUpdate is one command with one terminal result: it downloads the firmware,
-// verifies it, applies it through the apply step, adopts the new version on success, and
-// reports every phase — downloading, applying, completed or failed — plus exactly one
-// terminal result, whichever step concludes it.
+// retrying a transient download failure within its attempt budget, verifies it, applies it
+// through the apply step, adopts the new version on success, and reports every phase —
+// downloading, applying, completed or failed — plus exactly one terminal result, whichever
+// step concludes it.
 type UpdateHandler struct {
 	fetcher  FirmwareFetcher
 	applier  FirmwareApply
 	adopt    FirmwareAdopter
 	reporter *UpdateReporter
+	retry    FetchRetry
 	log      *slog.Logger
+	sleep    func(ctx context.Context, d time.Duration) error
 }
 
 // NewUpdateHandler returns the command handler driving one update cycle per StartUpdate,
-// reporting through reporter.
+// reporting through reporter and retrying a failed fetch under the package's default budget.
 func NewUpdateHandler(
 	fetcher FirmwareFetcher,
 	applier FirmwareApply,
@@ -52,7 +82,28 @@ func NewUpdateHandler(
 	reporter *UpdateReporter,
 	log *slog.Logger,
 ) *UpdateHandler {
-	return &UpdateHandler{fetcher: fetcher, applier: applier, adopt: adopt, reporter: reporter, log: log}
+	return NewUpdateHandlerWithRetry(fetcher, applier, adopt, reporter, defaultFetchRetry(), log)
+}
+
+// NewUpdateHandlerWithRetry returns the command handler driving one update cycle per
+// StartUpdate, reporting through reporter and retrying a failed fetch under retry.
+func NewUpdateHandlerWithRetry(
+	fetcher FirmwareFetcher,
+	applier FirmwareApply,
+	adopt FirmwareAdopter,
+	reporter *UpdateReporter,
+	retry FetchRetry,
+	log *slog.Logger,
+) *UpdateHandler {
+	return &UpdateHandler{
+		fetcher:  fetcher,
+		applier:  applier,
+		adopt:    adopt,
+		reporter: reporter,
+		retry:    retry,
+		log:      log,
+		sleep:    sleepCtx,
+	}
 }
 
 // Handle executes one dispatched command. A failed update is an outcome, not a handler fault:
@@ -104,7 +155,7 @@ func (h *UpdateHandler) handleUpdate(
 		agentv1.UpdatePhase_UPDATE_PHASE_DOWNLOADING, 0, ""); err != nil {
 		return err
 	}
-	path, err := h.fetcher.Fetch(ctx, deviceID, firmwareID, start.GetChecksum(), func(percent int32) {
+	path, err := h.fetchWithRetry(ctx, deviceID, firmwareID, start.GetChecksum(), func(percent int32) {
 		// Progress is frequent and fine-grained: a report the control plane misses is
 		// logged and superseded by the next one, never allowed to fail the update.
 		if err := h.reporter.Status(ctx, deviceID, firmwareID,
@@ -138,6 +189,51 @@ func (h *UpdateHandler) handleUpdate(
 	return h.reporter.Conclude(ctx, cmd, agentv1.CommandOutcome_COMMAND_OUTCOME_SUCCEEDED, "")
 }
 
+// fetchWithRetry fetches one firmware binary under the handler's attempt budget. A retry
+// announces itself with the downloading phase again — the control plane saw the failed attempt
+// — after waiting a growing capped delay, retries only a failure a retry can clear, and returns
+// the context's error the moment the command's context ends. The failed phase and the terminal
+// result stay in the caller, so a retried download still produces exactly one of each.
+func (h *UpdateHandler) fetchWithRetry(
+	ctx context.Context,
+	deviceID, firmwareID, checksum string,
+	onProgress func(int32),
+) (string, error) {
+	attempts := h.retry.Attempts
+	if attempts < 1 {
+		attempts = 1
+	}
+	// The delays are deterministic: an update retry needs no jitter, so the capped-backoff
+	// sequence runs without a random source.
+	delays := newBackoff(RetryInitial, h.retry.Max, 0, nil)
+
+	var last error
+	for attempt := range attempts {
+		if attempt > 0 {
+			delay := delays.Delay()
+			h.log.Warn("retrying firmware download",
+				"device_id", deviceID, "firmware_id", firmwareID,
+				"attempt", attempt+1, "delay", delay, "err", last)
+			if err := h.sleep(ctx, delay); err != nil {
+				return "", err
+			}
+			if err := h.reporter.Status(ctx, deviceID, firmwareID,
+				agentv1.UpdatePhase_UPDATE_PHASE_DOWNLOADING, 0, ""); err != nil {
+				return "", err
+			}
+		}
+		path, err := h.fetcher.Fetch(ctx, deviceID, firmwareID, checksum, onProgress)
+		if err == nil {
+			return path, nil
+		}
+		last = err
+		if !retryableFetchError(err) {
+			break
+		}
+	}
+	return "", last
+}
+
 // downloadDetail maps a download failure onto its operator-safe report detail: the failure
 // class names the reason, and anything else reports as the generic download failure.
 func downloadDetail(err error) string {
@@ -146,6 +242,8 @@ func downloadDetail(err error) string {
 		return ErrChecksumMismatch.Error()
 	case errors.Is(err, ErrTruncatedTransfer):
 		return ErrTruncatedTransfer.Error()
+	case errors.Is(err, ErrStall):
+		return ErrStall.Error()
 	default:
 		return "download failed"
 	}
