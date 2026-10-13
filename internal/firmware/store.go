@@ -15,22 +15,33 @@ import (
 )
 
 // Record is one firmware document: the metadata of one uploaded firmware. The binary itself
-// lives in GridFS and is referenced by GridFSID — the document never carries payload bytes.
+// lives in GridFS and is referenced by GridFSID — the document never carries payload bytes. The
+// record is also where its upload's state is recorded, so a reader can tell an upload still in
+// progress from one that concluded without asking the workflow.
 type Record struct {
 	// ID is the firmware identity; the _id of the firmware document.
-	ID string `bson:"_id"`
+	ID string `bson:"_id" json:"id"`
 	// Version is the firmware version, unique across the registry.
-	Version string `bson:"version"`
+	Version string `bson:"version" json:"version"`
 	// Models are the device models the firmware targets, as declared at upload.
-	Models []string `bson:"models"`
-	// Checksum is the lowercase hexadecimal SHA-256 digest of the complete binary.
-	Checksum string `bson:"checksum"`
-	// Size is the stored binary's size in bytes.
-	Size int64 `bson:"size"`
+	Models []string `bson:"models" json:"models"`
+	// Checksum is the lowercase hexadecimal SHA-256 digest of the complete binary. It is empty
+	// until the upload's binary has been stored.
+	Checksum string `bson:"checksum" json:"checksum"`
+	// Size is the stored binary's size in bytes; zero until the binary has been stored.
+	Size int64 `bson:"size" json:"size"`
 	// CreatedAt is the time the upload was recorded.
-	CreatedAt time.Time `bson:"created_at"`
-	// GridFSID references the binary stored in GridFS.
-	GridFSID string `bson:"gridfs_id"`
+	CreatedAt time.Time `bson:"created_at" json:"created_at"`
+	// GridFSID references the binary stored in GridFS; empty until the binary has been stored.
+	GridFSID string `bson:"gridfs_id" json:"gridfs_id"`
+	// State is the state the upload that wrote this record has reached. A record written before
+	// uploads carried a state has none, which a reader reports as UploadUnknown rather than as
+	// a failure.
+	State string `bson:"state,omitempty" json:"state,omitempty"`
+	// UploadWorkflowID is the id of the workflow execution that owns the upload.
+	UploadWorkflowID string `bson:"upload_workflow_id,omitempty" json:"upload_workflow_id,omitempty"`
+	// FailureReason is the operator-safe reason the upload concluded failed; empty otherwise.
+	FailureReason string `bson:"failure_reason,omitempty" json:"failure_reason,omitempty"`
 }
 
 // metadata is the firmware metadata collection the store records into. The Mongo-backed
@@ -48,13 +59,35 @@ type metadata interface {
 	versionExists(ctx context.Context, version string) (bool, error)
 }
 
+// metadataTransitions is the part of the metadata seam that carries an upload's record through
+// its states: creating it on the upload's first transition, advancing it on later ones, and
+// removing it when an upload cannot complete what it stored. It is a seam of its own rather than
+// part of metadata, so a metadata implementation that only supports the registry's plain writes
+// stays a valid seam — and a store whose metadata cannot record transitions fails loudly instead
+// of dropping an upload's state. The Mongo-backed implementation supports both.
+type metadataTransitions interface {
+	// upsert writes one transition of an upload's record: it creates the record on the
+	// upload's first transition and advances it on a later one, leaving the stored record
+	// unchanged when the transition has already been recorded or when a later state has been.
+	// A record the upload does not own — another upload's, or one written before uploads
+	// carried a state — fails with ErrVersionConflict.
+	upsert(ctx context.Context, rec Record) (Record, error)
+	// removeClaim deletes the record an upload owns, so an upload that stored nothing usable
+	// leaves no record behind. A record that is not this upload's is left alone.
+	removeClaim(ctx context.Context, version, workflowID string) error
+}
+
 // binaries is the binary storage the store keeps firmware payloads in. put consumes r in
 // bounded pieces without buffering it whole and returns the reference of the stored object;
 // open streams exactly the stored bytes back; remove deletes the object, succeeding on one
 // that is already gone so cleanup stays idempotent.
 type binaries interface {
-	put(ctx context.Context, name string, r io.Reader) (ref string, size int64, err error)
+	// put streams r into the object addressed by ref, replacing whatever that address holds,
+	// and returns the number of bytes stored.
+	put(ctx context.Context, ref, name string, r io.Reader) (int64, error)
+	// open returns a reader over the object addressed by ref.
 	open(ctx context.Context, ref string) (io.ReadCloser, error)
+	// remove deletes the object addressed by ref, succeeding on one that is already gone.
 	remove(ctx context.Context, ref string) error
 }
 
@@ -95,8 +128,12 @@ func (s *Store) Save(ctx context.Context, version string, models []string, binar
 	if err != nil {
 		return Record{}, fmt.Errorf("firmware id: %w", err)
 	}
+	ref, err := newID("fwbin")
+	if err != nil {
+		return Record{}, fmt.Errorf("firmware binary reference: %w", err)
+	}
 	hash := sha256.New()
-	ref, size, err := s.binaries.put(ctx, id, io.TeeReader(binary, hash))
+	size, err := s.binaries.put(ctx, ref, id, io.TeeReader(binary, hash))
 	if err != nil {
 		return Record{}, fmt.Errorf("store firmware binary %s: %w", version, err)
 	}
@@ -222,35 +259,100 @@ func (m *mongoMetadata) versionExists(ctx context.Context, version string) (bool
 	}
 }
 
+// upsert writes one transition of an upload's record. The version is unique, so the first
+// transition of an upload inserts and every later one updates: a record that already stands at
+// the transitioned state (or beyond it) is returned unchanged, which is what makes a retried
+// write a no-op, and a record another upload owns is refused rather than overwritten.
+func (m *mongoMetadata) upsert(ctx context.Context, rec Record) (Record, error) {
+	current, err := m.findByVersion(ctx, rec.Version)
+	switch {
+	case errors.Is(err, ErrNotFound):
+		if err := m.insert(ctx, rec); err != nil {
+			return Record{}, err
+		}
+		return rec, nil
+	case err != nil:
+		return Record{}, err
+	case current.UploadWorkflowID != rec.UploadWorkflowID:
+		return Record{}, fmt.Errorf("upsert firmware %s: %w: %s",
+			rec.Version, ErrVersionConflict, rec.Version)
+	case stateRank(current.State) >= stateRank(rec.State):
+		return current, nil
+	}
+
+	update := bson.D{{Key: "$set", Value: bson.D{
+		{Key: "models", Value: rec.Models},
+		{Key: "checksum", Value: rec.Checksum},
+		{Key: "size", Value: rec.Size},
+		{Key: "gridfs_id", Value: rec.GridFSID},
+		{Key: "state", Value: rec.State},
+		{Key: "upload_workflow_id", Value: rec.UploadWorkflowID},
+		{Key: "failure_reason", Value: rec.FailureReason},
+	}}}
+	filter := bson.D{
+		{Key: "version", Value: rec.Version},
+		{Key: "upload_workflow_id", Value: rec.UploadWorkflowID},
+	}
+	if _, err := m.coll.UpdateOne(ctx, filter, update); err != nil {
+		return Record{}, fmt.Errorf("advance firmware %s: %w", rec.Version, err)
+	}
+	// The record's id and creation time are the upload's from its first transition, so the
+	// updated document is the current one with the transitioned fields applied.
+	updated := current
+	updated.Models = rec.Models
+	updated.Checksum = rec.Checksum
+	updated.Size = rec.Size
+	updated.GridFSID = rec.GridFSID
+	updated.State = rec.State
+	updated.FailureReason = rec.FailureReason
+	return updated, nil
+}
+
+// removeClaim deletes the record one upload owns. The filter matches the version and the owning
+// workflow, so a record another upload wrote — including one that already became available — is
+// never removed by an upload that stored nothing usable.
+func (m *mongoMetadata) removeClaim(ctx context.Context, version, workflowID string) error {
+	filter := bson.D{
+		{Key: "version", Value: version},
+		{Key: "upload_workflow_id", Value: workflowID},
+		{Key: "state", Value: bson.D{{Key: "$in", Value: []string{UploadAccepted, UploadStoring}}}},
+	}
+	if _, err := m.coll.DeleteOne(ctx, filter); err != nil {
+		return fmt.Errorf("remove upload %s: %w", version, err)
+	}
+	return nil
+}
+
 // gridfsBinaries keeps firmware binaries in the fleet database's GridFS bucket.
 type gridfsBinaries struct {
 	bucket *mongo.GridFSBucket
 }
 
-// put streams r into one GridFS object under a fresh reference, returning the reference and
-// the number of bytes stored. A transfer that breaks aborts the upload, leaving no object.
-func (g *gridfsBinaries) put(ctx context.Context, name string, r io.Reader) (string, int64, error) {
-	ref, err := newID("fwbin")
-	if err != nil {
-		return "", 0, err
+// put streams r into the GridFS object addressed by ref, returning the number of bytes stored.
+// An object already stored at that address is replaced, so a retried storage step converges on
+// one object rather than accumulating copies. A transfer that breaks aborts the upload, leaving
+// the address holding whatever it held before.
+func (g *gridfsBinaries) put(ctx context.Context, ref, name string, r io.Reader) (int64, error) {
+	if err := g.remove(ctx, ref); err != nil {
+		return 0, fmt.Errorf("replace stored binary %s: %w", ref, err)
 	}
 	stream, err := g.bucket.OpenUploadStreamWithID(ctx, ref, name)
 	if err != nil {
-		return "", 0, fmt.Errorf("open upload stream: %w", err)
+		return 0, fmt.Errorf("open upload stream: %w", err)
 	}
 	size, err := io.Copy(stream, r)
 	if err != nil {
 		if abortErr := stream.Abort(); abortErr != nil {
-			return "", 0, errors.Join(
+			return 0, errors.Join(
 				fmt.Errorf("write upload stream: %w", err),
 				fmt.Errorf("abort upload stream: %w", abortErr))
 		}
-		return "", 0, fmt.Errorf("write upload stream: %w", err)
+		return 0, fmt.Errorf("write upload stream: %w", err)
 	}
 	if err := stream.Close(); err != nil {
-		return "", 0, fmt.Errorf("finalize upload stream: %w", err)
+		return 0, fmt.Errorf("finalize upload stream: %w", err)
 	}
-	return ref, size, nil
+	return size, nil
 }
 
 // open returns a reader over one stored binary.
@@ -259,9 +361,11 @@ func (g *gridfsBinaries) open(ctx context.Context, ref string) (io.ReadCloser, e
 }
 
 // remove deletes one stored binary; an object that is already gone is not an error, so a
-// retried cleanup converges instead of failing.
+// retried cleanup — and the replace a retried storage step performs — converges instead of
+// failing on an address that holds nothing yet.
 func (g *gridfsBinaries) remove(ctx context.Context, ref string) error {
-	if err := g.bucket.Delete(ctx, ref); err != nil && !errors.Is(err, mongo.ErrNoDocuments) {
+	err := g.bucket.Delete(ctx, ref)
+	if err != nil && !errors.Is(err, mongo.ErrNoDocuments) && !errors.Is(err, mongo.ErrFileNotFound) {
 		return err
 	}
 	return nil

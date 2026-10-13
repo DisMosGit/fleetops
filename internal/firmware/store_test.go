@@ -9,13 +9,17 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
 )
 
-// fakeMetadata is an in-memory metadata seam with scriptable insert and lookup failures.
+// fakeMetadata is an in-memory metadata seam with scriptable insert and lookup failures. Its
+// version key stands in for the unique index of the real collection, so a test may call it from
+// several goroutines to exercise a version claim.
 type fakeMetadata struct {
+	mu        sync.Mutex
 	docs      map[string]Record
 	byVersion map[string]string
 	insertErr error
@@ -33,6 +37,13 @@ func newFakeMetadata() *fakeMetadata {
 
 // insert writes one record, refusing a version the fake already holds.
 func (f *fakeMetadata) insert(_ context.Context, rec Record) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.insertLocked(rec)
+}
+
+// insertLocked writes one record with the fake's lock held.
+func (f *fakeMetadata) insertLocked(rec Record) error {
 	if f.insertErr != nil {
 		return f.insertErr
 	}
@@ -46,6 +57,8 @@ func (f *fakeMetadata) insert(_ context.Context, rec Record) error {
 
 // find returns the record with the given id.
 func (f *fakeMetadata) find(_ context.Context, id string) (Record, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	rec, ok := f.docs[id]
 	if !ok {
 		return Record{}, fmt.Errorf("find firmware %s: %w", id, ErrNotFound)
@@ -55,6 +68,8 @@ func (f *fakeMetadata) find(_ context.Context, id string) (Record, error) {
 
 // versionExists reports whether the fake already holds version.
 func (f *fakeMetadata) versionExists(_ context.Context, version string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.lookupErr != nil {
 		return false, f.lookupErr
 	}
@@ -64,6 +79,13 @@ func (f *fakeMetadata) versionExists(_ context.Context, version string) (bool, e
 
 // findByVersion returns the record carrying version.
 func (f *fakeMetadata) findByVersion(_ context.Context, version string) (Record, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.findByVersionLocked(version)
+}
+
+// findByVersionLocked returns the record carrying version with the fake's lock held.
+func (f *fakeMetadata) findByVersionLocked(version string) (Record, error) {
 	if f.lookupErr != nil {
 		return Record{}, f.lookupErr
 	}
@@ -74,9 +96,62 @@ func (f *fakeMetadata) findByVersion(_ context.Context, version string) (Record,
 	return f.docs[id], nil
 }
 
+// upsert writes one transition of an upload's record with the same rules as the Mongo-backed
+// implementation: create on the upload's first transition, advance on a later one, leave a
+// transition already recorded alone, and refuse a record another upload owns.
+func (f *fakeMetadata) upsert(_ context.Context, rec Record) (Record, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.insertErr != nil {
+		return Record{}, f.insertErr
+	}
+	current, err := f.findByVersionLocked(rec.Version)
+	switch {
+	case errors.Is(err, ErrNotFound):
+		if err := f.insertLocked(rec); err != nil {
+			return Record{}, err
+		}
+		return rec, nil
+	case err != nil:
+		return Record{}, err
+	case current.UploadWorkflowID != rec.UploadWorkflowID:
+		return Record{}, fmt.Errorf("upsert firmware %s: %w", rec.Version, ErrVersionConflict)
+	case stateRank(current.State) >= stateRank(rec.State):
+		return current, nil
+	}
+	updated := current
+	updated.Models = rec.Models
+	updated.Checksum = rec.Checksum
+	updated.Size = rec.Size
+	updated.GridFSID = rec.GridFSID
+	updated.State = rec.State
+	updated.FailureReason = rec.FailureReason
+	f.docs[updated.ID] = updated
+	return updated, nil
+}
+
+// removeClaim deletes the record one upload owns, leaving another upload's record alone.
+func (f *fakeMetadata) removeClaim(_ context.Context, version, workflowID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	id, ok := f.byVersion[version]
+	if !ok {
+		return nil
+	}
+	rec := f.docs[id]
+	if rec.UploadWorkflowID != workflowID ||
+		(rec.State != UploadAccepted && rec.State != UploadStoring) {
+		return nil
+	}
+	delete(f.docs, id)
+	delete(f.byVersion, version)
+	return nil
+}
+
 // fakeBinaries is an in-memory binaries seam with scriptable failures.
 type fakeBinaries struct {
 	stored    map[string][]byte
+	names     []string
 	putErr    error
 	openErr   error
 	removeErr error
@@ -89,19 +164,20 @@ func newFakeBinaries() *fakeBinaries {
 	return &fakeBinaries{stored: make(map[string][]byte)}
 }
 
-// put stores the reader's bytes whole under a fresh reference.
-func (f *fakeBinaries) put(_ context.Context, name string, r io.Reader) (string, int64, error) {
+// put stores the reader's bytes whole at the reference it is given, replacing whatever that
+// reference held, and records the names objects were stored under.
+func (f *fakeBinaries) put(_ context.Context, ref, name string, r io.Reader) (int64, error) {
 	f.puts++
+	f.names = append(f.names, name)
 	if f.putErr != nil {
-		return "", 0, f.putErr
+		return 0, f.putErr
 	}
 	data, err := io.ReadAll(r)
 	if err != nil {
-		return "", 0, err
+		return 0, err
 	}
-	ref := fmt.Sprintf("ref-%d", f.puts)
 	f.stored[ref] = data
-	return ref, int64(len(data)), nil
+	return int64(len(data)), nil
 }
 
 // open returns a reader over the stored bytes.

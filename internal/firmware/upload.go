@@ -11,26 +11,41 @@ import (
 	"strings"
 )
 
-// Registry is the firmware registry the upload endpoint records into. *Store satisfies it.
+// Registry is the firmware registry the upload endpoint records into. *Store satisfies it
+// directly; the control plane wires a workflow-backed uploader, which spools the request's body
+// to the configured directory and drives the upload's steps as activities of the workflow that
+// owns the version.
 type Registry interface {
-	// Save stores one firmware binary and its metadata record.
+	// Save stores one firmware binary and its metadata record, failure wrapping the sentinel
+	// the endpoint maps onto its status codes.
 	Save(ctx context.Context, version string, models []string, binary io.Reader) (Record, error)
+	// UploadState reports the state of the upload that owns version, an unknown version
+	// wrapping ErrNotFound.
+	UploadState(ctx context.Context, version string) (UploadState, error)
 }
 
-// Handler serves the firmware upload API: one multipart POST per firmware, validated before
-// anything is stored and answered with the recorded firmware record.
+// Handler serves the firmware API: one multipart POST per firmware, validated before anything is
+// stored and answered with the recorded firmware record, and one GET per version answering the
+// state its upload reached.
 type Handler struct {
 	registry Registry
 	catalog  ModelCatalog
 	log      *slog.Logger
 }
 
-// NewHandler returns the firmware upload API on POST /api/firmwares, recording uploads in
-// registry and validating their target models against catalog.
+// NewHandler returns the firmware API recording uploads in registry and validating their target
+// models against catalog, serving:
+//
+//	POST /api/firmwares            upload one firmware
+//	GET  /api/firmwares/{version}  read the state of one version's upload
+//
+// The routes are method-scoped patterns, so the mux answers a mismatched method with 405 and an
+// unregistered path with 404 without this package spelling either case out.
 func NewHandler(registry Registry, catalog ModelCatalog, log *slog.Logger) http.Handler {
 	h := &Handler{registry: registry, catalog: catalog, log: log}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/firmwares", h.handleUpload)
+	mux.HandleFunc("GET /api/firmwares/{version}", h.handleState)
 	return mux
 }
 
@@ -94,10 +109,29 @@ func (h *Handler) upload(r *http.Request) (Record, error) {
 		return Record{}, fmt.Errorf("%w: models field required", ErrInvalidMetadata)
 	}
 	models := ParseModels(values)
+	// The endpoint refuses an upload the device registry cannot serve before it spools a body or
+	// starts a workflow, and the upload's own validation step checks the same models again: a
+	// workflow started directly for a refused model stores nothing either.
 	if err := ValidateUpload(r.Context(), h.catalog, version, models); err != nil {
 		return Record{}, err
 	}
 	return h.registry.Save(r.Context(), version, models, binary)
+}
+
+// handleState serves the state of one version's upload, so a caller whose upload outlived its
+// request — a timed-out wait, or a conflict with an upload already in flight — learns the
+// outcome the upload reached without starting a second upload.
+func (h *Handler) handleState(w http.ResponseWriter, r *http.Request) {
+	state, err := h.registry.UploadState(r.Context(), r.PathValue("version"))
+	switch {
+	case errors.Is(err, ErrNotFound):
+		writeJSON(w, http.StatusNotFound, errorResponse{Error: "no upload recorded for that version"})
+	case err != nil:
+		h.log.Error("read firmware upload state", "err", err)
+		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "internal error"})
+	default:
+		writeJSON(w, http.StatusOK, state)
+	}
 }
 
 // reject answers a rejected upload: sentinel failures carry their operator-safe reason, and a
@@ -112,6 +146,10 @@ func (h *Handler) reject(w http.ResponseWriter, err error) {
 		code, msg = http.StatusUnprocessableEntity, err.Error()
 	case errors.Is(err, ErrVersionConflict):
 		code, msg = http.StatusConflict, err.Error()
+	case errors.Is(err, ErrUploadContinues):
+		// The upload outlived the wait and is still running: nothing is lost, and the state
+		// query reports what it has reached.
+		code, msg = http.StatusGatewayTimeout, err.Error()
 	default:
 		h.log.Error("store firmware upload", "err", err)
 	}

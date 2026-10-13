@@ -21,6 +21,10 @@ var (
 	ErrVersionConflict = errors.New("firmware version already registered")
 	// ErrNotFound reports a firmware id with no firmware record.
 	ErrNotFound = errors.New("firmware not found")
+	// ErrUploadContinues reports an upload that outlived the endpoint's wait and is still
+	// running. Nothing was lost: the execution continues durably and the state query reports
+	// what it has reached.
+	ErrUploadContinues = errors.New("firmware upload still running")
 )
 
 // ModelCatalog reports the device models the device registry knows — the models at least one

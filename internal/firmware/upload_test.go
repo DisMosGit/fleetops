@@ -19,12 +19,14 @@ import (
 
 // fakeRegistry records Save calls and returns a queued error first.
 type fakeRegistry struct {
-	calls   int
-	saved   []byte
-	version string
-	models  []string
-	rec     Record
-	err     error
+	calls    int
+	saved    []byte
+	version  string
+	models   []string
+	rec      Record
+	err      error
+	state    UploadState
+	stateErr error
 }
 
 // Save records the call and returns the queued outcome.
@@ -43,6 +45,16 @@ func (f *fakeRegistry) Save(_ context.Context, version string, models []string, 
 	rec.Version = version
 	rec.Models = models
 	return rec, nil
+}
+
+// UploadState returns the state the fake was scripted to report.
+func (f *fakeRegistry) UploadState(_ context.Context, version string) (UploadState, error) {
+	if f.stateErr != nil {
+		return UploadState{}, f.stateErr
+	}
+	state := f.state
+	state.Version = version
+	return state, nil
 }
 
 // uploadRequest builds one multipart upload request for the handler under test.
@@ -84,6 +96,71 @@ func serve(t *testing.T, handler http.Handler, req *http.Request) (*httptest.Res
 		t.Fatalf("decode response %q: %v", rec.Body.String(), err)
 	}
 	return rec, body
+}
+
+// TestUploadStateRoute pins the state query the endpoint serves for a version: the upload's own
+// state view, an unknown version as not found, and a backend failure as the endpoint's bounded
+// internal error rather than backend detail.
+func TestUploadStateRoute(t *testing.T) {
+	t.Parallel()
+
+	logger := slog.New(slog.DiscardHandler)
+	available := UploadState{
+		Version: "2.0.0", State: UploadAvailable, Concluded: true,
+		FirmwareID: "fw-1", Models: []string{"oak-s3"}, Checksum: "sum", Size: 3,
+	}
+
+	t.Run("a recorded upload reports its state", func(t *testing.T) {
+		t.Parallel()
+
+		handler := NewHandler(&fakeRegistry{state: available}, fakeCatalog{}, logger)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/firmwares/2.0.0", nil))
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d (body %s)", rec.Code, http.StatusOK, rec.Body)
+		}
+		var body UploadState
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode response %q: %v", rec.Body, err)
+		}
+		if diff := cmp.Diff(available, body); diff != "" {
+			t.Errorf("state mismatch (-want +got):\n%s", diff)
+		}
+	})
+
+	t.Run("an unknown version is not found", func(t *testing.T) {
+		t.Parallel()
+
+		handler := NewHandler(
+			&fakeRegistry{stateErr: fmt.Errorf("read firmware version 9.9.9: %w", ErrNotFound)},
+			fakeCatalog{}, logger)
+		rec, body := serve(t, handler, httptest.NewRequest(http.MethodGet, "/api/firmwares/9.9.9", nil))
+
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusNotFound)
+		}
+		if got, _ := body["error"].(string); !strings.Contains(got, "no upload") {
+			t.Errorf("error = %q, want it to name the missing upload", got)
+		}
+	})
+
+	t.Run("a backend failure hides its detail", func(t *testing.T) {
+		t.Parallel()
+
+		handler := NewHandler(
+			&fakeRegistry{stateErr: errors.New("mongo: connection refused at 10.0.0.5")},
+			fakeCatalog{}, logger)
+		rec, body := serve(t, handler, httptest.NewRequest(http.MethodGet, "/api/firmwares/2.0.0", nil))
+
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusInternalServerError)
+		}
+		got, _ := body["error"].(string)
+		if got != "internal error" {
+			t.Errorf("error = %q, want the bounded internal error", got)
+		}
+	})
 }
 
 func TestUpload(t *testing.T) {
@@ -211,6 +288,15 @@ func TestUpload(t *testing.T) {
 			registryErr: fmt.Errorf("save firmware: %w: 2.0.0", ErrVersionConflict),
 			wantStatus:  http.StatusConflict,
 			wantDetail:  "2.0.0",
+		},
+		{
+			name:       "an upload that outlived the wait",
+			fields:     fields,
+			withBinary: true,
+			registryErr: fmt.Errorf("%w: wait for upload 2.0.0: %w",
+				ErrUploadContinues, context.DeadlineExceeded),
+			wantStatus: http.StatusGatewayTimeout,
+			wantDetail: "still running",
 		},
 		{
 			name:        "store failure hides its detail",
