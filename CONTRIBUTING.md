@@ -20,12 +20,12 @@ Required today:
 
 - **Go toolchain** matching the version in `go.mod`
 - `goimports` and `golangci-lint` (used by the [Definition of Done](AGENTS.md#definition-of-done))
+- **Docker** — for the integration tests, which boot real MongoDB, RabbitMQ, PostgreSQL, and
+  Temporal containers rather than fakes
 
 Not needed yet — required when the stage that needs them lands:
 
-- **Docker** — **planned**, stage 1
-- **k3d / kubectl** — **planned**, stage 1
-- **Temporal CLI / UI** — **planned**, stage 2
+- **k3d / kubectl** — **planned**, stage 1 (the local stack)
 - **Node.js + npm** — **planned**, stage 5 (only for `web/`)
 
 ## Development setup
@@ -63,6 +63,57 @@ short, before a PR is ready:
 - [ ] New or changed logic is covered by tests ([AGENTS.md § Testing](AGENTS.md#testing))
 - [ ] Dependencies changed → `go mod tidy` ([AGENTS.md § Dependencies](AGENTS.md#dependencies))
 - [ ] Generated output regenerated, never hand-edited ([AGENTS.md § What NOT to do](AGENTS.md#what-not-to-do))
+
+## Running the tests
+
+Unit tests need nothing but the Go toolchain:
+
+```sh
+go test -race -count=1 ./...
+```
+
+Integration tests are behind the `integration` build tag and need a Docker daemon, because they
+boot real MongoDB, RabbitMQ, PostgreSQL, and Temporal containers:
+
+```sh
+make test-integration   # the suite as a capable machine runs it
+make test-weak          # the same suite configured for a 4 GB / 4 CPU machine
+```
+
+A package's integration tests share one container stack — one MongoDB, one RabbitMQ, and one
+Temporal server per package — and isolate themselves from each other by database name, by purging
+the broker queues they use, and by namespace. That is what keeps a package's peak memory from
+growing with its test count, and it is why a test that stops or restarts a shared service must not
+call `t.Parallel()`: it would be pulling the service out from under a test running beside it.
+
+### Configuring a test run
+
+A run's configuration comes from these variables and from nothing else. The suite never inspects
+the host's memory, CPU count, or load, so the same environment runs the same assertions on every
+machine and a failure stays reproducible somewhere else.
+
+| Variable | Values | Default | What it sets |
+|---|---|---|---|
+| `FLEETOPS_TEST_PROFILE` | `default`, `weak` | `default` | the profile; a variable below overrides it |
+| `FLEETOPS_TEST_FLEET_SIZE` | positive integer | `1000` | the largest simulated fleet a test may run |
+| `FLEETOPS_TEST_WAIT_MULTIPLIER` | number greater than zero | `1` | scales the wait budgets a test documents for itself |
+| `FLEETOPS_TEST_CONTAINER_STARTUP` | positive duration | each harness's own (`60s` MongoDB, `90s` RabbitMQ, `3m` Temporal) | overrides every container-startup budget |
+| `FLEETOPS_TEST_CONTAINER_USE` | `shared`, `per-test` | `shared` | one stack per package, or one per test |
+
+The weak-host profile targets a machine with at most 4 GB of RAM and 4 CPUs: it narrows the
+simulated fleet to 100 devices, halves the wait budgets, leaves a container 45s to start, and
+shares one stack per package. Narrowing is by workload and budget only — a test under the weak
+profile asserts exactly what it asserts under the default — and a test the profile cannot afford
+is skipped with a message naming the variable that would allow it, never run with weaker
+assertions.
+
+A value that cannot be used fails the run before any test body, naming the variable and the value
+it rejected:
+
+```sh
+FLEETOPS_TEST_PROFILE=tiny go test -tags integration ./internal/mongotest/
+# test configuration: FLEETOPS_TEST_PROFILE: undefined test profile "tiny" (defined: default, weak)
+```
 
 ## License
 
