@@ -3,17 +3,14 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"os/exec"
 	"slices"
 	"strings"
 	"sync"
@@ -36,6 +33,8 @@ import (
 	"github.com/DisMosGit/fleetops/internal/rolloutapi"
 	"github.com/DisMosGit/fleetops/internal/telemetry"
 	"github.com/DisMosGit/fleetops/internal/temporal"
+	"github.com/DisMosGit/fleetops/internal/temporaltest"
+	"github.com/DisMosGit/fleetops/internal/testexec"
 )
 
 // The smoke's timings are deliberately tiny: the health window is two seconds, so a rollout of
@@ -236,14 +235,25 @@ func (r *commandRecorder) recorded() []temporal.CommandIssuedSignal {
 // wave that requires approval until an operator signals, and end a rollout as rolled back when a
 // wave's health falls below the boundary.
 func TestRolloutSmoke(t *testing.T) {
-	db := mongotest.Start(t).DB
-	address := startTemporalDevServer(t)
+	server := temporaltest.For(t)
+	db := mongotest.For(t).DB
 	// The rollback's announcements are published for real: the worker hosts the publisher the
 	// announcements go through, and the notification queue they land on is the broker's.
-	broker := rabbittest.Start(t)
+	broker := rabbittest.For(t)
+
+	// Every heartbeat stream gets a generation of its own, so a fleet whose health is flipped
+	// reports samples of its own instead of upserting the ones the stream before it wrote: a
+	// stream whose ids restart at one would let a failing fleet keep reporting healthy until its
+	// counter passed the samples already stored.
+	streams := 0
+	startStream := func(fleets map[string][]string, health float64) func() {
+		streams++
+		return startHeartbeats(t, db, streams, fleets, health)
+	}
 
 	cfg := config.Defaults()
-	cfg.Temporal.Address = address
+	cfg.Temporal.Address = server.Address
+	cfg.Temporal.Namespace = server.Namespace
 	cfg.RabbitMQ.URL = broker.URL
 	cfg.Rollout.HealthWindow = config.Duration{Duration: smokeHealthWindow}
 	cfg.Rollout.DecisionTimeout = config.Duration{Duration: 30 * time.Second}
@@ -279,11 +289,11 @@ func TestRolloutSmoke(t *testing.T) {
 	brokenFleet := seedFleet(t, db, "ap-south", 2)
 	seedFirmware(t, db)
 
-	stopHealthy := startHeartbeats(t, db, map[string][]string{
+	stopHealthy := startStream(map[string][]string{
 		"eu-west": canaryFleet,
 		"us-east": gatedFleet,
 	}, 0.95)
-	stopBroken := startHeartbeats(t, db, map[string][]string{"ap-south": brokenFleet}, 0.1)
+	stopBroken := startStream(map[string][]string{"ap-south": brokenFleet}, 0.1)
 	t.Cleanup(stopHealthy)
 	t.Cleanup(stopBroken)
 
@@ -379,7 +389,7 @@ func TestRolloutSmoke(t *testing.T) {
 	// 4. Every target device is commanded, and the wave records how each of them ended: one
 	// succeeded, one reported a failure, and one never reported before the result timeout.
 	outcomesFleet := seedFleet(t, db, "sa-east", 3)
-	stopOutcomes := startHeartbeats(t, db, map[string][]string{"sa-east": outcomesFleet}, 0.95)
+	stopOutcomes := startStream(map[string][]string{"sa-east": outcomesFleet}, 0.95)
 	t.Cleanup(stopOutcomes)
 	scripts := dispatcher.script()
 	scripts.fail[outcomesFleet[1]] = "flash write failed"
@@ -492,9 +502,15 @@ func TestRolloutSmoke(t *testing.T) {
 	// The first wave is promoted on a healthy fleet; the second is judged on a fleet that has
 	// gone bad, which is what rolls the rollout back. The devices still take the update — their
 	// outcomes are scripted independently of the heartbeats the gate measures.
-	stopRollbackHealthy := startHeartbeats(t, db, map[string][]string{"eu-north": rollbackFleet}, 0.95)
+	stopRollbackHealthy := startStream(map[string][]string{"eu-north": rollbackFleet}, 0.95)
 	scripts.failRestore[rollbackFleet[1]] = "flash write failed"
 	scripts.neverRestore[rollbackFleet[2]] = true
+
+	// The rollout of case 3 rolled back too, and its two announcements are still waiting on the
+	// notification queue. Drain them here, before this case's rollback publishes, so the depth
+	// this case asserts measures this case rather than the sum of both.
+	notifications := broker.Channel(t)
+	broker.Purge(t, notifications, telemetry.RolloutNotificationQueue)
 
 	rolling := temporal.RolloutRequest{
 		RolloutID: "ro-smoke-rollback", FirmwareID: "fw-smoke", Region: "eu-north", Model: "oak-s3",
@@ -506,19 +522,26 @@ func TestRolloutSmoke(t *testing.T) {
 		t.Fatalf("start rollback rollout: %v", err)
 	}
 	firstWaveID := rollout.WaveID(rolling.RolloutID, 0, 50)
-	if wave := waitForWave(t, waves, firstWaveID); wave.Status != rollout.WaveHealthy {
-		t.Fatalf("first wave status = %q, want the promoted wave", wave.Status)
+	firstWave := waitForWave(t, waves, firstWaveID)
+	if firstWave.Status != rollout.WaveHealthy {
+		t.Fatalf("first wave status = %q, want the promoted wave", firstWave.Status)
 	}
 	// The fleet goes bad under the rollout's feet: the next wave's window measures a regressing
 	// fleet and the rollout rolls back.
 	stopRollbackHealthy()
-	stopRollbackBroken := startHeartbeats(t, db, map[string][]string{"eu-north": rollbackFleet}, 0.1)
+	stopRollbackBroken := startStream(map[string][]string{"eu-north": rollbackFleet}, 0.1)
 	t.Cleanup(stopRollbackBroken)
 
 	rollingRecord := waitForRolloutStatus(t, rollouts, rolling.RolloutID, rollout.RolloutRolledBack)
 	secondWave := waitForWave(t, waves, rollout.WaveID(rolling.RolloutID, 1, 100))
 	if secondWave.Status != rollout.WaveUnhealthy {
 		t.Errorf("regressing wave status = %q, want unhealthy", secondWave.Status)
+	}
+	// The flipped fleet's samples are what the gate measured: a wave judged on the health the
+	// fleet reported before the flip would carry the healthy ratio and this would say so.
+	if secondWave.SuccessRate >= cfg.Rollout.MinSuccessRatio {
+		t.Errorf("regressing wave success rate = %v, want the failing fleet's measured ratio below %v",
+			secondWave.SuccessRate, cfg.Rollout.MinSuccessRatio)
 	}
 	if rollingRecord.Rollback == nil {
 		t.Fatal("the rollout document carries no rollback record")
@@ -580,10 +603,13 @@ func TestRolloutSmoke(t *testing.T) {
 				i, cmd.Kind, cmd.Version)
 		}
 	}
-	secondWaveFirst := commandPosition(t, restores, secondWave.DeviceIDs[0])
-	firstWaveOnly := commandPosition(t, restores, firstWaveID)
-	if secondWaveFirst < 0 || firstWaveOnly < 0 || secondWaveFirst > firstWaveOnly {
-		t.Errorf("restore order = %v, want the second wave's devices before the first wave's",
+	// Both positions are read from device ids, which is what the restore commands carry. The
+	// property is a saga's: every restore of the wave that failed is delivered before the first
+	// restore of the wave it was promoted over.
+	secondWaveLast := lastCommandPosition(t, restores, secondWave.DeviceIDs...)
+	firstWaveFirst := commandPosition(t, restores, firstWave.DeviceIDs...)
+	if secondWaveLast < 0 || firstWaveFirst < 0 || secondWaveLast > firstWaveFirst {
+		t.Errorf("restore order = %v, want every restore of the second wave before the first wave's",
 			restores)
 	}
 
@@ -651,6 +677,18 @@ func commandPosition(t *testing.T, restores []temporal.CommandIssuedSignal, devi
 	return -1
 }
 
+// lastCommandPosition returns the delivery position of the last restore command for any of
+// devices, or -1 when none was delivered.
+func lastCommandPosition(t *testing.T, restores []temporal.CommandIssuedSignal, devices ...string) int {
+	t.Helper()
+	for i := len(restores) - 1; i >= 0; i-- {
+		if slices.Contains(devices, restores[i].DeviceID) {
+			return i
+		}
+	}
+	return -1
+}
+
 // awaitAnnouncements consumes n rollback announcements from the notification queue, so the smoke
 // reads what a dashboard or an alerting consumer would.
 func awaitAnnouncements(
@@ -690,7 +728,7 @@ func awaitAnnouncements(
 				t.Fatalf("decode announcement %d: %v", len(events)+1, err)
 			}
 			events = append(events, event)
-		case <-time.After(smokePollTimeout):
+		case <-time.After(testexec.Get(t).Wait(smokePollTimeout)):
 			t.Fatalf("timed out after %d of %d announcements", len(events), n)
 		}
 	}
@@ -726,13 +764,13 @@ func smokeLogger() *slog.Logger {
 // handler answers 5xx.
 //
 // The 5xx the surface has is a backend the handler could not reach in time, and the smoke's backend
-// is the Temporal dev server's single-node storage, which stalls under this fleet's load and on its
+// is the containerized Temporal server, whose storage can stall under this fleet's load and on its
 // own system workflows. A stalled read is not an answer about the operator surface, so the request
 // is repeated rather than reported as one; a backend that is truly down exhausts the window and the
 // last status is returned, which fails the assertion that follows.
 func doRequest(t *testing.T, handler http.Handler, method, path string) (int, string) {
 	t.Helper()
-	deadline := time.Now().Add(smokeBackendGrace)
+	deadline := time.Now().Add(testexec.Get(t).Wait(smokeBackendGrace))
 	var status int
 	var body string
 	for {
@@ -747,87 +785,6 @@ func doRequest(t *testing.T, handler http.Handler, method, path string) (int, st
 	}
 }
 
-// startTemporalDevServer starts a Temporal dev server on a free port and returns its address. The
-// test is skipped when the Temporal CLI is not installed: the smoke needs a real frontend, and
-// there is no in-process substitute for one.
-func startTemporalDevServer(t *testing.T) string {
-	t.Helper()
-	binary, err := exec.LookPath("temporal")
-	if err != nil {
-		t.Skip("temporal CLI not installed: skipping the local-stack smoke")
-	}
-	address := freeAddress(t)
-
-	cmd := exec.Command(binary, "server", "start-dev",
-		"--headless",
-		"--ip", "127.0.0.1",
-		"--port", portOf(t, address),
-		"--db-filename", t.TempDir()+"/temporal.db",
-		"--log-level", "error",
-	)
-	// The server's own log is where a frontend complaint shows up, so a failing smoke reports
-	// its tail.
-	var serverLog bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &serverLog, &serverLog
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("start temporal dev server: %v", err)
-	}
-	t.Cleanup(func() {
-		if t.Failed() {
-			t.Logf("temporal dev server log:\n%s", serverLog.String())
-		}
-		if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
-			t.Logf("kill temporal dev server: %v", err)
-		}
-		if err := cmd.Wait(); err != nil {
-			t.Logf("temporal dev server exited: %v", err)
-		}
-	})
-
-	deadline := time.Now().Add(smokeTemporalStart)
-	for time.Now().Before(deadline) {
-		conn, err := net.DialTimeout("tcp", address, time.Second)
-		if err == nil {
-			if closeErr := conn.Close(); closeErr != nil {
-				t.Logf("close probe connection: %v", closeErr)
-			}
-			return address
-		}
-		time.Sleep(smokePollInterval)
-	}
-	t.Fatalf("temporal dev server did not accept connections on %s within %v", address, smokeTemporalStart)
-	return ""
-}
-
-// freeAddress reserves an ephemeral port and returns it as a dialable address. The reservation is
-// released immediately, which is what keeps the test hermetic: nothing else binds that port.
-func freeAddress(t *testing.T) string {
-	t.Helper()
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("reserve a port: %v", err)
-	}
-	address := listener.Addr().String()
-	if err := listener.Close(); err != nil {
-		t.Fatalf("release the reserved port: %v", err)
-	}
-	return address
-}
-
-// portOf returns the port of a host:port address.
-func portOf(t *testing.T, address string) string {
-	t.Helper()
-	_, port, err := net.SplitHostPort(address)
-	if err != nil {
-		t.Fatalf("split %s: %v", address, err)
-	}
-	return port
-}
-
-// startSmokeWorker registers and runs the worker's own rollout registrations against the dev
-// server, over the real fleet database and the configured policy. It returns a connected Temporal
-// client and waits until the frontend answers, so a rollout started afterwards cannot race the
-// server's own startup.
 // smokeRolloutSettings builds the canary policy the smoke drives from the same configuration the
 // control plane maps, so what the smoke exercises is what a real start path hands the workflow.
 // The waves are replaced per scenario by the caller; this supplies the configured timing.
@@ -857,6 +814,10 @@ func smokeWaves(waves []config.Wave) []temporal.RolloutWave {
 	return mapped
 }
 
+// startSmokeWorker registers and runs the worker's own rollout registrations against the
+// containerized server, over the real fleet database and the configured policy. It returns a
+// connected Temporal client and waits until the frontend answers, so a rollout started afterwards
+// cannot race the server's own startup.
 func startSmokeWorker(
 	t *testing.T,
 	cfg config.Config,
@@ -876,14 +837,15 @@ func startSmokeWorker(
 	}
 	t.Cleanup(tc.Close)
 
-	deadline := time.Now().Add(smokeTemporalStart)
+	grace := testexec.Get(t).Wait(smokeTemporalStart)
+	deadline := time.Now().Add(grace)
 	for {
 		_, err := tc.WorkflowService().GetSystemInfo(ctx, &workflowservice.GetSystemInfoRequest{})
 		if err == nil {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("temporal frontend did not answer within %v: %v", smokeTemporalStart, err)
+			t.Fatalf("temporal frontend did not answer within %v: %v", grace, err)
 		}
 		time.Sleep(smokePollInterval)
 	}
@@ -966,6 +928,7 @@ func seedFirmware(t *testing.T, db *mongo.Database) {
 func startHeartbeats(
 	t *testing.T,
 	db *mongo.Database,
+	generation int,
 	fleets map[string][]string,
 	health float64,
 ) func() {
@@ -987,7 +950,7 @@ func startHeartbeats(
 				now := time.Now().UTC()
 				for region, ids := range fleets {
 					for _, id := range ids {
-						eventID := fmt.Sprintf("smoke-%s-%d", id, written)
+						eventID := fmt.Sprintf("smoke-%s-%d-%d", id, generation, written)
 						_, err := db.Collection("telemetry").UpdateOne(ctx,
 							bson.D{{Key: "_id", Value: eventID}},
 							bson.D{{Key: "$setOnInsert", Value: bson.D{
@@ -1027,7 +990,8 @@ func waitForRolloutStatus(
 	status rollout.RolloutStatus,
 ) rollout.RolloutRecord {
 	t.Helper()
-	deadline := time.Now().Add(smokePollTimeout)
+	grace := testexec.Get(t).Wait(smokePollTimeout)
+	deadline := time.Now().Add(grace)
 	var last rollout.RolloutRecord
 	for time.Now().Before(deadline) {
 		var rec rollout.RolloutRecord
@@ -1045,14 +1009,15 @@ func waitForRolloutStatus(
 		}
 		time.Sleep(smokePollInterval)
 	}
-	t.Fatalf("rollout %s reached %q, want %q within %v", id, last.Status, status, smokePollTimeout)
+	t.Fatalf("rollout %s reached %q, want %q within %v", id, last.Status, status, grace)
 	return rollout.RolloutRecord{}
 }
 
 // waitForWave polls until the wave document is written and decided, returning it.
 func waitForWave(t *testing.T, coll *mongo.Collection, id string) rollout.WaveRecord {
 	t.Helper()
-	deadline := time.Now().Add(smokePollTimeout)
+	grace := testexec.Get(t).Wait(smokePollTimeout)
+	deadline := time.Now().Add(grace)
 	for time.Now().Before(deadline) {
 		var rec rollout.WaveRecord
 		err := coll.FindOne(context.Background(), bson.D{{Key: "_id", Value: id}}).Decode(&rec)
@@ -1068,7 +1033,7 @@ func waitForWave(t *testing.T, coll *mongo.Collection, id string) rollout.WaveRe
 		}
 		time.Sleep(smokePollInterval)
 	}
-	t.Fatalf("wave %s was not decided within %v", id, smokePollTimeout)
+	t.Fatalf("wave %s was not decided within %v", id, grace)
 	return rollout.WaveRecord{}
 }
 
