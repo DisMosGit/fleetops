@@ -15,7 +15,7 @@ import (
 func TestHarnessRoundTrip(t *testing.T) {
 	t.Parallel()
 
-	h := Start(t)
+	h := For(t)
 	ctx := context.Background()
 	const queue = "rabbittest.round-trip"
 

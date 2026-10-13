@@ -4,6 +4,11 @@
 // pipeline runs against: every Start returns a ready connection URL whose host port survives a
 // container restart, so integration tests can verify the topology, the retry ladder, the
 // dead-letter path, and reconnection against RabbitMQ itself rather than a fake.
+//
+// A package's integration tests normally share one broker through Shared — wired into
+// testexec.Main as SharedStack, so it is started once before the package's first test body — and
+// isolate themselves by purging the queues they use. Start remains for a test that needs a broker
+// of its own, and For picks between the two from the run's configuration.
 package rabbittest
 
 import (
@@ -20,6 +25,8 @@ import (
 
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/network"
+
+	"github.com/DisMosGit/fleetops/internal/testexec"
 )
 
 const (
@@ -43,20 +50,48 @@ type Harness struct {
 	URL string
 
 	container testcontainers.Container
+	// budget is how long the broker is given to accept a connection, from the run's
+	// configuration.
+	budget time.Duration
+	// settle is how long a queue is given to reach an expected depth, from the run's
+	// configuration.
+	settle time.Duration
 }
 
-// Start boots a RabbitMQ container and returns the harness once its AMQP port accepts a
-// connection. The container is torn down when t ends.
+// Start boots a RabbitMQ container of its own and returns the harness once its AMQP port accepts a
+// connection. The container is torn down when t ends. A test that does not need a broker of its own
+// should call For, which shares the package's broker instead.
 //
 // The broker's host port is reserved by the harness instead of being allocated by Docker: a
 // container that is stopped and started again keeps an explicit host port, which is what lets a
 // test observe a supervised connection reconnecting to the same address.
 func Start(t *testing.T) *Harness {
 	t.Helper()
-	ctx := context.Background()
-	hostPort := reservePort(t)
+	return bootFor(t)
+}
 
-	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+// bootFor starts a broker for one test, torn down when that test ends.
+func bootFor(t *testing.T) *Harness {
+	t.Helper()
+	ctx := context.Background()
+	port := reservePort(t)
+
+	h, err := boot(ctx, port, testexec.Get(t))
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+	t.Cleanup(func() {
+		if err := h.container.Terminate(context.Background()); err != nil {
+			t.Logf("terminate rabbitmq container: %v", err)
+		}
+	})
+	return h
+}
+
+// boot starts a broker container publishing AMQP on hostPort and returns it once it accepts a
+// connection.
+func boot(ctx context.Context, hostPort int, cfg testexec.Config) (*Harness, error) {
+	rabbit, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
 		ContainerRequest: testcontainers.ContainerRequest{
 			Image:        image,
 			ExposedPorts: []string{amqpPort},
@@ -65,60 +100,98 @@ func Start(t *testing.T) *Harness {
 					network.MustParsePort(amqpPort): {{HostPort: strconv.Itoa(hostPort)}},
 				}
 			},
-			WaitingFor: wait.ForListeningPort(amqpPort).WithStartupTimeout(startupTimeout),
+			WaitingFor: wait.ForListeningPort(amqpPort).
+				WithStartupTimeout(cfg.Startup(startupTimeout)),
 		},
 		Started: true,
 	})
 	if err != nil {
-		t.Fatalf("start rabbitmq container: %v", err)
+		return nil, fmt.Errorf("start rabbitmq container: %w", err)
 	}
-	t.Cleanup(func() {
-		if err := container.Terminate(context.Background()); err != nil {
-			t.Logf("terminate rabbitmq container: %v", err)
+	h, err := newHarness(ctx, rabbit, cfg)
+	if err != nil {
+		if termErr := rabbit.Terminate(ctx); termErr != nil {
+			return nil, fmt.Errorf("%w (terminate broker: %v)", err, termErr)
 		}
-	})
-
-	h := &Harness{container: container}
-	h.URL = h.url(t)
-	h.WaitReady(t)
-	return h
+		return nil, err
+	}
+	return h, nil
 }
 
-// url resolves the broker's AMQP URL from its mapped host port.
-func (h *Harness) url(t *testing.T) string {
-	t.Helper()
-	ctx := context.Background()
+// newHarness resolves a booted broker's URL and waits for it to accept a connection.
+func newHarness(
+	ctx context.Context,
+	rabbit testcontainers.Container,
+	cfg testexec.Config,
+) (*Harness, error) {
+	h := &Harness{
+		container: rabbit,
+		budget:    cfg.Startup(startupTimeout),
+		settle:    cfg.Wait(settleTimeout),
+	}
+	url, err := h.resolveURL(ctx)
+	if err != nil {
+		return nil, err
+	}
+	h.URL = url
+	if err := h.waitReady(ctx); err != nil {
+		return nil, err
+	}
+	return h, nil
+}
+
+// resolveURL derives the broker's AMQP URL from its mapped host port.
+func (h *Harness) resolveURL(ctx context.Context) (string, error) {
 	host, err := h.container.Host(ctx)
 	if err != nil {
-		t.Fatalf("rabbitmq container host: %v", err)
+		return "", fmt.Errorf("rabbitmq container host: %w", err)
 	}
 	port, err := h.container.MappedPort(ctx, amqpPort)
 	if err != nil {
-		t.Fatalf("rabbitmq container port: %v", err)
+		return "", fmt.Errorf("rabbitmq container port: %w", err)
 	}
-	return fmt.Sprintf("amqp://guest:guest@%s:%s/", host, port.Port())
+	return fmt.Sprintf("amqp://guest:guest@%s:%s/", host, port.Port()), nil
 }
 
 // WaitReady blocks until the broker accepts an AMQP connection, so a test never races the
 // broker's own startup beyond the container's listening port.
 func (h *Harness) WaitReady(t *testing.T) {
 	t.Helper()
-	deadline := time.Now().Add(startupTimeout)
+	if err := h.waitReady(context.Background()); err != nil {
+		t.Fatalf("%v", err)
+	}
+}
+
+// waitReady polls the broker until it accepts a connection or the run's budget is spent.
+func (h *Harness) waitReady(ctx context.Context) error {
+	deadline := time.Now().Add(h.budget)
 	var lastErr error
 	for {
-		conn, err := amqp.Dial(h.URL)
-		if err == nil {
-			if closeErr := conn.Close(); closeErr != nil {
-				t.Logf("close readiness connection: %v", closeErr)
-			}
-			return
+		lastErr = dialReady(h.URL)
+		if lastErr == nil {
+			return nil
 		}
-		lastErr = err
 		if time.Now().After(deadline) {
-			t.Fatalf("rabbitmq at %s never became ready: %v", h.URL, lastErr)
+			return fmt.Errorf("rabbitmq at %s never became ready: %w", h.URL, lastErr)
 		}
-		time.Sleep(dialRetryPause)
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("rabbitmq at %s: %w", h.URL, ctx.Err())
+		case <-time.After(dialRetryPause):
+		}
 	}
+}
+
+// dialReady reports whether the broker at url accepts an AMQP connection.
+func dialReady(url string) error {
+	conn, err := amqp.Dial(url)
+	if err != nil {
+		return err
+	}
+	if err := conn.Close(); err != nil {
+		return fmt.Errorf("close readiness connection: %w", err)
+	}
+	return nil
 }
 
 // Channel opens a channel on a connection of its own, both closed when t ends. Passing the test
@@ -183,7 +256,7 @@ func (h *Harness) Depth(t *testing.T, ch *amqp.Channel, queue string, durable bo
 // instead of sleeping.
 func (h *Harness) AwaitDepth(t *testing.T, ch *amqp.Channel, queue string, durable bool, want int) {
 	t.Helper()
-	deadline := time.Now().Add(settleTimeout)
+	deadline := time.Now().Add(h.settle)
 	var got int
 	for {
 		got = h.Depth(t, ch, queue, durable)
@@ -197,7 +270,8 @@ func (h *Harness) AwaitDepth(t *testing.T, ch *amqp.Channel, queue string, durab
 	}
 }
 
-// Purge removes every message waiting on a queue, so one subtest cannot see another's.
+// Purge removes every message waiting on a queue, so one test cannot see another's. A test on the
+// shared broker purges the queues it is about to assert on before it publishes to them.
 func (h *Harness) Purge(t *testing.T, ch *amqp.Channel, queue string) {
 	t.Helper()
 	if _, err := ch.QueuePurge(queue, false); err != nil {
@@ -209,13 +283,23 @@ func (h *Harness) Purge(t *testing.T, ch *amqp.Channel, queue string) {
 // publish its AMQP port on.
 func reservePort(t *testing.T) int {
 	t.Helper()
+	port, err := reserveHostPort()
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+	return port
+}
+
+// reserveHostPort is reservePort without a test to fail, for the shared broker started before any
+// test body exists.
+func reserveHostPort() (int, error) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("reserve a host port: %v", err)
+		return 0, fmt.Errorf("reserve a host port: %w", err)
 	}
 	port := listener.Addr().(*net.TCPAddr).Port
 	if err := listener.Close(); err != nil {
-		t.Fatalf("release the reserved host port: %v", err)
+		return 0, fmt.Errorf("release the reserved host port: %w", err)
 	}
-	return port
+	return port, nil
 }
