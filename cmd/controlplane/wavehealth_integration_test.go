@@ -6,6 +6,7 @@ import (
 	"context"
 	"log/slog"
 	"net"
+	"strconv"
 	"testing"
 	"time"
 
@@ -88,6 +89,12 @@ func insertHeartbeat(t *testing.T, db *mongo.Database, eventID, deviceID string,
 // served on a real gRPC listener, and a hand-written wave answers through a generated client. Wave
 // membership and start time have no producer until the rollout workflow lands, so hand-inserting
 // them is exactly how the first query reaches this path.
+//
+// The configuration is deliberately not the default one: a two-minute window and a minimum of 25
+// samples are what the served verdict has to follow. The wave carries failing samples older than
+// the window, so a window wider than the configured one — or a hardcoded one — would evaluate a
+// different ratio and answer unhealthy instead of healthy, and a second wave below the sample
+// minimum proves the undecided verdict is the served one rather than a constant.
 func TestGetWaveHealthServesAHandInsertedWave(t *testing.T) {
 	t.Parallel()
 
@@ -95,20 +102,42 @@ func TestGetWaveHealthServesAHandInsertedWave(t *testing.T) {
 	log := slog.New(slog.DiscardHandler)
 
 	cfg := config.Defaults()
-	cfg.Rollout.HealthWindow = config.Duration{Duration: 5 * time.Minute}
+	cfg.Rollout.HealthWindow = config.Duration{Duration: 2 * time.Minute}
 	cfg.Rollout.SampleHealthThreshold = 0.6
 	cfg.Rollout.MinSuccessRatio = 0.9
-	cfg.Rollout.MinSamples = 5
+	cfg.Rollout.MinSamples = 25
+	if cfg.Rollout.HealthWindow == config.Defaults().Rollout.HealthWindow ||
+		cfg.Rollout.MinSamples == config.Defaults().Rollout.MinSamples {
+		t.Fatal("the test's configuration equals the defaults, so a hardcoded window or minimum would pass")
+	}
 
 	now := time.Now()
 	insertRolloutDoc(t, db, "roll-hand")
 	insertWaveDoc(t, db, "wave-hand", "roll-hand", []string{"dev-a", "dev-b"}, now.Add(-time.Hour))
-	// Nine successful samples and one failing one: the ratio lands exactly on the configured
-	// minimum, which is healthy.
-	for i := 0; i < 9; i++ {
-		insertHeartbeat(t, db, "hand-ok-"+string(rune('0'+i)), "dev-a", now.Add(-time.Duration(i)*time.Second), 0.95)
+	// Twenty-three successful samples and two failing ones inside the window: the ratio is 0.92,
+	// above the configured minimum, so the wave is healthy.
+	for i := 0; i < 23; i++ {
+		insertHeartbeat(t, db, "hand-ok-"+strconv.Itoa(i), "dev-a",
+			now.Add(-time.Duration(i)*time.Second), 0.95)
 	}
-	insertHeartbeat(t, db, "hand-bad-0", "dev-b", now.Add(-time.Minute), 0.1)
+	for i := 0; i < 2; i++ {
+		insertHeartbeat(t, db, "hand-bad-"+strconv.Itoa(i), "dev-b",
+			now.Add(-time.Duration(i)*time.Second), 0.1)
+	}
+	// Ten failing samples older than the configured window. A five-minute window would count
+	// them (23 of 35 = 0.66, unhealthy); the configured two-minute window must not.
+	for i := 0; i < 10; i++ {
+		insertHeartbeat(t, db, "hand-old-"+strconv.Itoa(i), "dev-b",
+			now.Add(-3*time.Minute-time.Duration(i)*time.Second), 0.1)
+	}
+	// A second wave one sample short of the configured minimum: its verdict is undecided. Its
+	// devices are its own, so the samples above cannot count for it — the evaluation counts the
+	// wave's target devices, not the devices of the rollout.
+	insertWaveDoc(t, db, "wave-few", "roll-hand", []string{"dev-few"}, now.Add(-time.Hour))
+	for i := 0; i < cfg.Rollout.MinSamples-1; i++ {
+		insertHeartbeat(t, db, "hand-few-"+strconv.Itoa(i), "dev-few",
+			now.Add(-time.Duration(i)*time.Second), 0.95)
+	}
 	// A wave of another rollout, and a device that is in no wave here.
 	insertRolloutDoc(t, db, "roll-other")
 	insertWaveDoc(t, db, "wave-other", "roll-other", []string{"dev-c"}, now.Add(-time.Hour))
@@ -142,12 +171,13 @@ func TestGetWaveHealthServesAHandInsertedWave(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetWaveHealth() error = %v", err)
 	}
-	if resp.GetSuccessRatio() != 0.9 || resp.GetSampleSize() != 10 {
-		t.Errorf("GetWaveHealth() = ratio %v over %d samples, want 0.9 over 10",
+	if resp.GetSuccessRatio() != 0.92 || resp.GetSampleSize() != 25 {
+		t.Errorf("GetWaveHealth() = ratio %v over %d samples, want 0.92 over the window's 25: "+
+			"the failing samples older than the configured window were counted",
 			resp.GetSuccessRatio(), resp.GetSampleSize())
 	}
 	if resp.GetVerdict() != rolloutv1.WaveHealthVerdict_WAVE_HEALTH_VERDICT_HEALTHY {
-		t.Errorf("GetWaveHealth() verdict = %v, want healthy at the configured boundary", resp.GetVerdict())
+		t.Errorf("GetWaveHealth() verdict = %v, want healthy above the configured ratio", resp.GetVerdict())
 	}
 	if resp.GetRolloutId() != "roll-hand" || resp.GetWaveId() != "wave-hand" {
 		t.Errorf("GetWaveHealth() ids = %q/%q, want the requested pair", resp.GetRolloutId(), resp.GetWaveId())
@@ -165,6 +195,24 @@ func TestGetWaveHealthServesAHandInsertedWave(t *testing.T) {
 	}
 	if delta := time.Since(end); delta < 0 || delta > time.Minute {
 		t.Errorf("GetWaveHealth() window end = %v, want the moment the call was served", end)
+	}
+
+	// The sample minimum is the served one: a wave below it is undecided rather than healthy,
+	// even though every sample it has is a success.
+	few, err := client.GetWaveHealth(ctx, &rolloutv1.GetWaveHealthRequest{
+		RolloutId: "roll-hand",
+		WaveId:    "wave-few",
+	})
+	if err != nil {
+		t.Fatalf("GetWaveHealth(below the sample minimum) error = %v", err)
+	}
+	if few.GetSampleSize() != int64(cfg.Rollout.MinSamples-1) {
+		t.Errorf("GetWaveHealth(below the minimum) sample size = %d, want %d",
+			few.GetSampleSize(), cfg.Rollout.MinSamples-1)
+	}
+	if few.GetVerdict() != rolloutv1.WaveHealthVerdict_WAVE_HEALTH_VERDICT_UNDECIDED {
+		t.Errorf("GetWaveHealth(below the minimum) verdict = %v, want undecided below the configured %d samples",
+			few.GetVerdict(), cfg.Rollout.MinSamples)
 	}
 
 	// The failure contract survives the wire: a miss is NOT_FOUND and a malformed request is

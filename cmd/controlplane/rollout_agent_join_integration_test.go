@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
@@ -268,6 +269,29 @@ func TestRolloutReachesARealAgent(t *testing.T) {
 		t.Errorf("wave status = %q, want %q", wave.Status, rollout.WaveHealthy)
 	}
 	awaitJoinRollout(t, db, rolloutID, rollout.RolloutCompleted)
+
+	// 4. The same report again, under the same idempotency key: the server accepts it and the
+	// device's state changes exactly once. The report is re-sent through the same RPC the agent
+	// used, so the dedup is observed at the workflow rather than at the server seam.
+	if err := handler.reporter.Conclude(ctx, command, handler.outcome, handler.detail); err != nil {
+		t.Fatalf("re-report the command's result: %v", err)
+	}
+	// The device workflow keeps its one concluded command: a second application would append
+	// another outcome or move the recorded detail.
+	replayed := awaitJoinState(t, tc, device.ID, func(s temporal.State) bool {
+		return s.LastCommand != nil && s.LastCommand.Command.CommandID == command.GetCommandId()
+	})
+	if diff := cmp.Diff(state.LastCommand, replayed.LastCommand); diff != "" {
+		t.Errorf("device workflow state changed on the repeated report (-once +twice):\n%s", diff)
+	}
+	// And the wave's record is the one outcome, not two.
+	rerun := awaitJoinWave(t, db, rollout.WaveID(rolloutID, 0, 100))
+	if diff := cmp.Diff(wave.FailedDeviceIDs, rerun.FailedDeviceIDs); diff != "" {
+		t.Errorf("wave failed devices changed on the repeated report (-once +twice):\n%s", diff)
+	}
+	if len(rerun.DeviceIDs) != 1 {
+		t.Errorf("wave membership = %v, want the one targeted device", rerun.DeviceIDs)
+	}
 
 	cancel()
 	if err := <-clientDone; err != nil {
