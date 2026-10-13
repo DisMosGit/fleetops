@@ -402,16 +402,38 @@ func awaitPrimary(ctx context.Context, container testcontainers.Container) error
 // reports why it could not, because a stack is also bootstrapped before any test body exists to
 // fail.
 func applyBootstrap(ctx context.Context, container testcontainers.Container, name string) error {
+	return applyBootstrapWithEnv(ctx, container, name, nil)
+}
+
+// applyBootstrapWithEnv is applyBootstrap with assignments prepended to the bootstrap's
+// environment, which is how a test changes one of the single named retention values and runs the
+// bootstrap again against a database of its own. Each assignment must be a plain NAME=value pair,
+// so a test cannot smuggle shell syntax into the command the bootstrap runs as.
+func applyBootstrapWithEnv(
+	ctx context.Context,
+	container testcontainers.Container,
+	name string,
+	env []string,
+) error {
 	if _, err := os.Stat(initPath); err != nil {
 		return fmt.Errorf("locate schema bootstrap %s: %w", initPath, err)
+	}
+	for _, assignment := range env {
+		if !validEnvAssignment(assignment) {
+			return fmt.Errorf("bootstrap environment %q is not a plain NAME=value assignment", assignment)
+		}
 	}
 	if err := container.CopyFileToContainer(ctx, initPath, "/tmp/init.js", initMode); err != nil {
 		return fmt.Errorf("copy schema bootstrap: %w", err)
 	}
 	// The database is named through the environment rather than the command line, because the
-	// bootstrap is a file: the shell prefix is what mongosh reads the variable from.
+	// bootstrap is a file: the shell prefix is what mongosh reads the variables from.
+	prefix := databaseEnv + "=" + name
+	if len(env) > 0 {
+		prefix = strings.Join(env, " ") + " " + prefix
+	}
 	code, out, err := execOutput(ctx, container, []string{
-		"sh", "-c", fmt.Sprintf("%s=%s mongosh --quiet --file /tmp/init.js", databaseEnv, name),
+		"sh", "-c", fmt.Sprintf("%s mongosh --quiet --file /tmp/init.js", prefix),
 	})
 	if err != nil {
 		return fmt.Errorf("run schema bootstrap on %s: %w", name, err)
@@ -420,6 +442,23 @@ func applyBootstrap(ctx context.Context, container testcontainers.Container, nam
 		return fmt.Errorf("schema bootstrap on %s exited %d: %s", name, code, strings.TrimSpace(out))
 	}
 	return nil
+}
+
+// validEnvAssignment reports whether s is a NAME=value pair safe to prefix a shell command with.
+func validEnvAssignment(s string) bool {
+	name, value, ok := strings.Cut(s, "=")
+	if !ok || name == "" || value == "" {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '_', r == '=', r == '.', r == '-', r == '/':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // bootstrap runs the schema bootstrap against name, failing t when it cannot: Start has a test to
