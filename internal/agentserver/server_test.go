@@ -11,11 +11,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
+	"google.golang.org/protobuf/testing/protocmp"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	agentv1 "github.com/DisMosGit/fleetops/api/proto/agent/v1"
@@ -336,9 +338,12 @@ func TestHeartbeatRoutedUnchanged(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("sink received %d heartbeats, want 1", len(got))
 	}
-	if got[0].hb.GetEventId() != want.GetEventId() || got[0].hb.GetHealth() != want.GetHealth() ||
-		got[0].hb.GetCurrentFw() != want.GetCurrentFw() {
-		t.Errorf("routed heartbeat = %+v, want %+v", got[0].hb, want)
+	// The sink receives the heartbeat whole: every field the device sent — its identity, the
+	// firmware version, the status, the timestamp, and the metric samples — arrives intact, so a
+	// hop that dropped one of them fails here instead of passing on the fields that happen to be
+	// compared.
+	if diff := cmp.Diff(want, got[0].hb, protocmp.Transform()); diff != "" {
+		t.Errorf("routed heartbeat mismatch (-sent +received):\n%s", diff)
 	}
 	if got[0].rec.ID != "device-0" || got[0].rec.Model != "oak-s3" || got[0].rec.Region != "eu-west" {
 		t.Errorf("routed identity = %+v, want the registered identity of device-0", got[0].rec)
