@@ -4,14 +4,25 @@ package temporaltest
 
 import (
 	"context"
+	"errors"
 	"net"
+	"os"
 	"strings"
 	"testing"
 	"time"
 
+	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/api/workflowservice/v1"
 	temporalclient "go.temporal.io/sdk/client"
+
+	"github.com/DisMosGit/fleetops/internal/testexec"
 )
+
+// TestMain starts this package's Temporal server once, before the first test body, and releases it
+// when the run ends.
+func TestMain(m *testing.M) {
+	os.Exit(testexec.Main(m, SharedStack()))
+}
 
 // TestHarnessServesTheNamespace boots the harness twice, in sequence: the first boot proves the
 // harness hands out a frontend that answers in the namespace its client is bound to, and the
@@ -118,4 +129,56 @@ func closedAddress(t *testing.T) string {
 		t.Fatalf("release the reserved port: %v", err)
 	}
 	return address
+}
+
+// TestSharedNamespaceIsolation asserts what a namespace per test is for: each test gets a
+// namespace of its own on the shared server, and an execution started in one test's namespace is
+// not found from another's.
+func TestSharedNamespaceIsolation(t *testing.T) {
+	t.Parallel()
+	const workflowID = "shared-namespace-isolation"
+
+	var firstNamespace string
+	t.Run("the first test starts an execution in a namespace of its own", func(t *testing.T) {
+		h := Shared(t)
+		firstNamespace = h.Namespace
+		if h.Namespace == Namespace {
+			t.Errorf("shared namespace = %q, want a namespace of this test's own", h.Namespace)
+		}
+		startProbe(t, h, workflowID)
+		if _, err := h.Client.DescribeWorkflowExecution(context.Background(), workflowID, ""); err != nil {
+			t.Fatalf("describe the workflow in namespace %s: %v", h.Namespace, err)
+		}
+	})
+
+	t.Run("another test neither shares the namespace nor finds the execution", func(t *testing.T) {
+		h := Shared(t)
+		if h.Namespace == firstNamespace {
+			t.Fatalf("both tests ran in namespace %q, want one namespace per test", h.Namespace)
+		}
+		_, err := h.Client.DescribeWorkflowExecution(context.Background(), workflowID, "")
+		var notFound *serviceerror.NotFound
+		if !errors.As(err, &notFound) {
+			t.Errorf("describing another namespace's execution: %v, want a not-found error", err)
+		}
+		// This namespace is usable in its own right, so the not-found above is isolation rather
+		// than a client that cannot reach the server.
+		startProbe(t, h, workflowID)
+		if _, err := h.Client.DescribeWorkflowExecution(context.Background(), workflowID, ""); err != nil {
+			t.Fatalf("describe this namespace's own workflow: %v", err)
+		}
+	})
+}
+
+// startProbe starts a workflow execution that no worker has to run: the point is that the execution
+// exists in this namespace under id, which is what the isolation assertions compare.
+func startProbe(t *testing.T, h *Harness, id string) {
+	t.Helper()
+	_, err := h.Client.ExecuteWorkflow(context.Background(), temporalclient.StartWorkflowOptions{
+		ID:        id,
+		TaskQueue: "namespace-isolation-probe",
+	}, "NamespaceIsolationProbe")
+	if err != nil {
+		t.Fatalf("start the isolation probe %s in namespace %s: %v", id, h.Namespace, err)
+	}
 }
