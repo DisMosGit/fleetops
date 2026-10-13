@@ -5,8 +5,12 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -20,10 +24,12 @@ import (
 	temporalclient "go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/converter"
 	"go.temporal.io/sdk/worker"
+	"go.temporal.io/sdk/workflow"
 
 	agentv1 "github.com/DisMosGit/fleetops/api/proto/agent/v1"
 	"github.com/DisMosGit/fleetops/internal/config"
 	"github.com/DisMosGit/fleetops/internal/devices"
+	"github.com/DisMosGit/fleetops/internal/firmware"
 	"github.com/DisMosGit/fleetops/internal/telemetry"
 	"github.com/DisMosGit/fleetops/internal/temporal"
 )
@@ -320,11 +326,16 @@ func TestRolloutSettings(t *testing.T) {
 	})
 }
 
-// fakeWorker records the activities registered on it. The embedded worker.Worker supplies the
-// rest of the interface — it is nil, and no test calls through it.
+// fakeWorker records the workflows and activities registered on it. The embedded worker.Worker
+// supplies the rest of the interface — it is nil, and no test calls through it.
 type fakeWorker struct {
 	worker.Worker
+	workflows  map[string]any
 	activities map[string]any
+}
+
+func (w *fakeWorker) RegisterWorkflowWithOptions(fn any, options workflow.RegisterOptions) {
+	w.workflows[options.Name] = fn
 }
 
 func (w *fakeWorker) RegisterActivityWithOptions(a any, options activity.RegisterOptions) {
@@ -374,6 +385,64 @@ func workQueueTaskTypes() []string {
 	}
 }
 
+// firmwareUploadTaskTypes are the workflow and activity names the control plane registers for the
+// firmware upload, on the control-plane queue beside dispatch-command: the workflow that owns an
+// upload and the steps that validate its target models, store its spooled binary, record each
+// metadata transition, and discard an upload that cannot complete its record.
+func firmwareUploadTaskTypes() []string {
+	return []string{
+		temporal.FirmwareWorkflowName,
+		temporal.ValidateFirmwareModelsActivityName,
+		temporal.StoreFirmwareBinaryActivityName,
+		temporal.UpsertFirmwareMetadataActivityName,
+		temporal.DiscardFirmwareUploadActivityName,
+	}
+}
+
+// fakeModelCatalog is a hand-written temporal.FirmwareModelCatalog double reporting the device
+// registry's models.
+type fakeModelCatalog struct {
+	models []string
+}
+
+// DeviceModels returns the configured models.
+func (f fakeModelCatalog) DeviceModels(context.Context) ([]string, error) {
+	return f.models, nil
+}
+
+// fakeFirmwareStore is a hand-written temporal.FirmwareUploadStore double recording what the
+// upload's steps were asked to do.
+type fakeFirmwareStore struct {
+	mu          sync.Mutex
+	binaries    []string
+	transitions []firmware.UploadMetadata
+	discards    []string
+}
+
+// StoreBinary records the version and path it was asked to store.
+func (f *fakeFirmwareStore) StoreBinary(_ context.Context, version, path string) (firmware.StoredBinary, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.binaries = append(f.binaries, version+"|"+path)
+	return firmware.StoredBinary{Ref: "fwbin-1", Checksum: "sum", Size: 3}, nil
+}
+
+// UpsertMetadata records one transition and answers with the record it wrote.
+func (f *fakeFirmwareStore) UpsertMetadata(_ context.Context, md firmware.UploadMetadata) (firmware.Record, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.transitions = append(f.transitions, md)
+	return firmware.Record{ID: "fw-1", Version: md.Version, State: md.State}, nil
+}
+
+// DiscardUpload records the discarded version.
+func (f *fakeFirmwareStore) DiscardUpload(_ context.Context, version, _ string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.discards = append(f.discards, version)
+	return nil
+}
+
 // TestStartWorker pins the control plane's Temporal topology: the queue it polls and what it
 // registers there. The polled queue is captured from the worker factory, so what is asserted is
 // the queue string this process hands to worker.New, and the registration set is read back off the
@@ -389,7 +458,8 @@ func TestStartWorker(t *testing.T) {
 	cfg.Temporal.DispatchTaskQueue = "dispatch"
 
 	hub := &fakeDispatcher{}
-	built := &fakeWorker{activities: map[string]any{}}
+	store := &fakeFirmwareStore{}
+	built := &fakeWorker{workflows: map[string]any{}, activities: map[string]any{}}
 	var polled string
 	build := func(_ temporalclient.Client, queue string, options worker.Options) worker.Worker {
 		polled = queue
@@ -400,7 +470,9 @@ func TestStartWorker(t *testing.T) {
 		return built
 	}
 
-	startWorker(build, nil, cfg, hub)
+	startWorker(build, nil, cfg, hub, firmwareDeps{
+		catalog: fakeModelCatalog{models: []string{"oak-s3"}}, store: store,
+	})
 
 	if polled != cfg.Temporal.DispatchTaskQueue {
 		t.Errorf("polled queue = %q, want the configured control-plane queue %q",
@@ -410,19 +482,27 @@ func TestStartWorker(t *testing.T) {
 		t.Errorf("polled queue = work queue %q, want the control plane off it", polled)
 	}
 
-	// The registration set is exactly one activity: dispatch-command, under its explicit name
-	// rather than a function-reflection name.
-	if _, ok := built.activities[temporal.DispatchActivityName]; !ok {
-		t.Errorf("activity %q is not registered", temporal.DispatchActivityName)
+	// The registration set is exactly the control-plane queue's task types: dispatch-command and
+	// the firmware upload's workflow and steps, each under its explicit name rather than a
+	// function-reflection name.
+	wantWorkflows := []string{temporal.FirmwareWorkflowName}
+	if diff := cmp.Diff(wantWorkflows, slices.Sorted(maps.Keys(built.workflows))); diff != "" {
+		t.Errorf("registered workflows mismatch (-want +got):\n%s", diff)
 	}
-	if len(built.activities) != 1 {
-		t.Errorf("registered activities = %d, want only %q",
-			len(built.activities), temporal.DispatchActivityName)
+	wantActivities := append([]string{temporal.DispatchActivityName}, firmwareUploadTaskTypes()[1:]...)
+	slices.Sort(wantActivities)
+	if diff := cmp.Diff(wantActivities, slices.Sorted(maps.Keys(built.activities))); diff != "" {
+		t.Errorf("registered activities mismatch (-want +got):\n%s", diff)
 	}
 	for _, name := range workQueueTaskTypes() {
 		if _, ok := built.activities[name]; ok {
 			t.Errorf("work-queue type %q is registered in the control plane, want it left to the workers",
 				name)
+		}
+	}
+	for _, name := range firmwareUploadTaskTypes() {
+		if _, ok := built.activities[name]; ok && name == temporal.FirmwareWorkflowName {
+			t.Errorf("%q is registered as an activity, want it as a workflow", name)
 		}
 	}
 
@@ -442,6 +522,76 @@ func TestStartWorker(t *testing.T) {
 	sent := hub.sent()
 	if len(sent) != 1 || sent[0].GetCommandId() != "cmd-1" || sent[0].GetDeviceId() != "dev-1" {
 		t.Errorf("dispatched commands = %+v, want cmd-1 delivered to dev-1", sent)
+	}
+
+	// The registered upload steps are bound to this process's side effects: validation checks the
+	// device registry's models, and a transition writes through the firmware store.
+	validate, ok := built.activities[temporal.ValidateFirmwareModelsActivityName].(func(context.Context, firmware.UploadRequest) error)
+	if !ok {
+		t.Fatalf("registered activity has type %T, want the model validation step",
+			built.activities[temporal.ValidateFirmwareModelsActivityName])
+	}
+	if err := validate(context.Background(), firmware.UploadRequest{
+		Version: "2.0.0", Models: []string{"oak-s3"},
+	}); err != nil {
+		t.Errorf("validate a known model: %v", err)
+	}
+	err := validate(context.Background(), firmware.UploadRequest{
+		Version: "2.0.0", Models: []string{"walnut-9"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "walnut-9") {
+		t.Errorf("validate an unknown model: error = %v, want the refused model named", err)
+	}
+
+	upsert, ok := built.activities[temporal.UpsertFirmwareMetadataActivityName].(func(context.Context, firmware.UploadMetadata) (firmware.Record, error))
+	if !ok {
+		t.Fatalf("registered activity has type %T, want the metadata transition step",
+			built.activities[temporal.UpsertFirmwareMetadataActivityName])
+	}
+	if _, err := upsert(context.Background(), firmware.UploadMetadata{
+		Version: "2.0.0", Models: []string{"oak-s3"},
+		WorkflowID: "firmware-upload-2.0.0", State: firmware.UploadAccepted,
+	}); err != nil {
+		t.Fatalf("write a transition through the registered store: %v", err)
+	}
+	if len(store.transitions) != 1 || store.transitions[0].State != firmware.UploadAccepted {
+		t.Errorf("transitions = %+v, want the accepted transition written through the store",
+			store.transitions)
+	}
+}
+
+// TestSweepSpool pins the startup sweep: a spool file older than the configured maximum age is
+// removed before the process serves anything, a fresh one is left for the upload that is still
+// writing through it, and a file the spool did not write is never touched.
+func TestSweepSpool(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	spool := firmware.NewSpool(dir)
+	log := slog.New(slog.DiscardHandler)
+
+	abandoned := filepath.Join(dir, "upload-abandoned")
+	fresh := filepath.Join(dir, "upload-fresh")
+	foreign := filepath.Join(dir, "unrelated.txt")
+	for _, path := range []string{abandoned, fresh, foreign} {
+		if err := os.WriteFile(path, []byte("bytes"), 0o600); err != nil {
+			t.Fatalf("write %s: %v", path, err)
+		}
+	}
+	if err := os.Chtimes(abandoned, time.Now().Add(-2*time.Hour), time.Now().Add(-2*time.Hour)); err != nil {
+		t.Fatalf("age the abandoned spool file: %v", err)
+	}
+
+	if err := sweepSpool(spool, time.Hour, log); err != nil {
+		t.Fatalf("sweepSpool() error = %v", err)
+	}
+	if _, err := os.Stat(abandoned); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("abandoned spool file = %v, want it swept", err)
+	}
+	for _, kept := range []string{fresh, foreign} {
+		if _, err := os.Stat(kept); err != nil {
+			t.Errorf("%s = %v, want it left in place", filepath.Base(kept), err)
+		}
 	}
 }
 

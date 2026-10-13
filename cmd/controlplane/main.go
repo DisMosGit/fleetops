@@ -22,6 +22,7 @@ import (
 	temporalclient "go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/converter"
 	"go.temporal.io/sdk/worker"
+	"go.temporal.io/sdk/workflow"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 
@@ -296,18 +297,57 @@ func newWaveHealthService(cfg config.Config, db *mongo.Database, log *slog.Logge
 }
 
 // registry is the slice of the Temporal worker registry the wire-up needs — worker.Worker
-// satisfies it, and tests hand-write a fake. It is deliberately activity-only: the control plane
-// hosts no workflow, and a seam that could not register one says so.
+// satisfies it, and tests hand-write a fake. The control plane hosts both the dispatch activity
+// and the firmware upload's workflow and activities, so the seam registers workflows too.
 type registry interface {
+	// RegisterWorkflowWithOptions registers a workflow function under an explicit name.
+	RegisterWorkflowWithOptions(w any, options workflow.RegisterOptions)
 	// RegisterActivityWithOptions registers an activity function under an explicit name.
 	RegisterActivityWithOptions(a any, options activity.RegisterOptions)
 }
 
-// registerDispatch registers the command-dispatch activity under its explicit name. It is this
-// process's only registration, and that is the point: Temporal delivers a task to whichever poller
-// of its queue is available rather than to one that registered its type, so the control plane
-// polls a queue of its own and hosts exactly what that queue carries. Every task type belonging
-// to the work queue stays with the workers, which register all of them.
+// firmwareDeps are the side effects the firmware upload's steps own in this process: the device
+// registry the validation step checks target models against, and the firmware store the storage,
+// metadata, and discard steps write through. The binary arrives as an HTTP request body here, so
+// the store binding lives here rather than in the workers.
+type firmwareDeps struct {
+	catalog temporal.FirmwareModelCatalog
+	store   temporal.FirmwareUploadStore
+}
+
+// registerFirmware registers the firmware upload's workflow and its steps under their explicit
+// names: validation of the target models, storage of the spooled binary, the metadata transition
+// write, and the discard that compensates an upload which cannot record what it stored. They run
+// in this process because the binary arrives here as a request body and the store binding is
+// here, and they are polled on the control-plane queue for the same reason dispatch-command is.
+func registerFirmware(w registry, deps firmwareDeps) {
+	w.RegisterWorkflowWithOptions(temporal.FirmwareWorkflow, workflow.RegisterOptions{
+		Name: temporal.FirmwareWorkflowName,
+	})
+	activities := []struct {
+		name string
+		fn   any
+	}{
+		{temporal.ValidateFirmwareModelsActivityName,
+			temporal.NewValidateFirmwareModelsActivity(deps.catalog)},
+		{temporal.StoreFirmwareBinaryActivityName,
+			temporal.NewStoreFirmwareBinaryActivity(deps.store)},
+		{temporal.UpsertFirmwareMetadataActivityName,
+			temporal.NewUpsertFirmwareMetadataActivity(deps.store)},
+		{temporal.DiscardFirmwareUploadActivityName,
+			temporal.NewDiscardFirmwareUploadActivity(deps.store)},
+	}
+	for _, a := range activities {
+		w.RegisterActivityWithOptions(a.fn, activity.RegisterOptions{Name: a.name})
+	}
+}
+
+// registerDispatch registers the command-dispatch activity under its explicit name. With the
+// firmware upload's workflow and activities it is the whole of this process's registration, and
+// that is the point: Temporal delivers a task to whichever poller of its queue is available
+// rather than to one that registered its type, so the control plane polls a queue of its own and
+// hosts exactly what that queue carries. Every task type belonging to the work queue stays with
+// the workers, which register all of them.
 func registerDispatch(w registry, dispatcher temporal.CommandDispatcher) {
 	w.RegisterActivityWithOptions(temporal.NewDispatchActivity(dispatcher), activity.RegisterOptions{
 		Name: temporal.DispatchActivityName,
@@ -319,20 +359,36 @@ func registerDispatch(w registry, dispatcher temporal.CommandDispatcher) {
 // standing up a Temporal server.
 type workerFactory func(temporalclient.Client, string, worker.Options) worker.Worker
 
-// startWorker builds the control plane's Temporal worker from cfg and registers the
-// command-dispatch activity on it — and nothing else, because nothing else runs in this process.
-// It polls the configured control-plane queue and not the work queue: Temporal delivers a task to
-// any poller of its queue rather than to one that registered its type, so a control plane on the
-// work queue would be handed the workers' device, snapshot, and rollout tasks and would fail every
-// one of them as an unknown type.
+// startWorker builds the control plane's Temporal worker from cfg: the command-dispatch activity
+// beside the agent hub it dispatches through, and the firmware upload's workflow and steps beside
+// the store binding and the spooled binary they own. It polls the configured control-plane queue
+// and not the work queue: Temporal delivers a task to any poller of its queue rather than to one
+// that registered its type, so a control plane on the work queue would be handed the workers'
+// device, snapshot, and rollout tasks and would fail every one of them as an unknown type.
 func startWorker(
 	build workerFactory, tc temporalclient.Client, cfg config.Config,
-	dispatcher temporal.CommandDispatcher,
+	dispatcher temporal.CommandDispatcher, firmwares firmwareDeps,
 ) worker.Worker {
 	w := build(tc, cfg.Temporal.DispatchTaskQueue,
 		worker.Options{WorkerStopTimeout: shutdownTimeout})
 	registerDispatch(w, dispatcher)
+	registerFirmware(w, firmwares)
 	return w
+}
+
+// sweepSpool removes the spool files an earlier process abandoned, before this one serves a
+// request: a file older than the configured maximum age belongs to an upload nothing is running
+// any more. Age is the criterion rather than presence, because a file another replica is still
+// uploading through is not this replica's to delete.
+func sweepSpool(spool *firmware.Spool, maxAge time.Duration, log *slog.Logger) error {
+	removed, err := spool.Sweep(maxAge)
+	if err != nil {
+		return fmt.Errorf("sweep firmware spool: %w", err)
+	}
+	if removed > 0 {
+		log.Info("swept abandoned firmware uploads", "files", removed, "max_age", maxAge)
+	}
+	return nil
 }
 
 // run serves the liveness/readiness probes on the configured health address and AgentService
@@ -413,20 +469,38 @@ func run(ctx context.Context, cfg config.Config, httpAddr string) error {
 	if err != nil {
 		return err
 	}
+	// The upload's own steps run here, beside the request body that arrives here: the endpoint
+	// spools the body to the configured directory, the workflow drives validation, storage, and
+	// the metadata write as activities on this process's queue, and the spool file is removed
+	// once the upload concluded. Files an earlier process abandoned are swept before this one
+	// serves anything.
+	spool := firmware.NewSpool(cfg.Firmware.SpoolDir)
+	if err := sweepSpool(spool, cfg.Firmware.MaxSpoolAge.Duration, log); err != nil {
+		return err
+	}
+	uploads := firmware.NewWorkflowRegistry(
+		temporal.NewFirmwareUploadStarter(tc, cfg.Temporal.DispatchTaskQueue),
+		temporal.NewFirmwareUploadStates(tc),
+		spool,
+		cfg.Firmware.WaitTimeout.Duration,
+		log,
+	)
 	gatewaySrv := &http.Server{
 		Addr: httpAddr,
 		Handler: gatewayHandler(
-			firmware.NewHandler(firmwareStore, registry, log),
+			firmware.NewHandler(uploads, registry, log),
 			rolloutHandler,
 		),
 	}
 
-	// Activities live beside their side effects: dispatch-command needs the in-process hub, so
-	// it joins this process on the control plane's own task queue. Polling a queue of its own
-	// is what keeps this process from being handed the work queue's device, snapshot, and
-	// rollout tasks, which it does not host; the workflows still start on the work queue,
-	// because that is where the processes running them live.
-	w := startWorker(worker.New, tc, cfg, hub)
+	// Activities live beside their side effects: dispatch-command needs the in-process hub and
+	// the upload's steps need the store binding and the spooled binary, so both join this
+	// process on the control plane's own task queue. Polling a queue of its own is what keeps
+	// this process from being handed the work queue's device, snapshot, and rollout tasks, which
+	// it does not host; the workflows still start on the work queue, because that is where the
+	// processes running them live — the firmware upload's workflow is the exception, because it
+	// runs here.
+	w := startWorker(worker.New, tc, cfg, hub, firmwareDeps{catalog: registry, store: firmwareStore})
 
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() error {
